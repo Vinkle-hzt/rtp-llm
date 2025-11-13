@@ -47,6 +47,16 @@ public:
         batch_stream_processor_ = std::move(processor);
     }
 
+public:
+    static GenerateStreamPtr createMinFakePrefillStream(int                     max_new_tokens,
+                                                        const GptInitParameter& params,
+                                                        const ResourceContext&  resource_context,
+                                                        DeviceBase*             device);
+    static GenerateStreamPtr createMinFakeDecodeStream(int                     max_new_tokens,
+                                                       const GptInitParameter& params,
+                                                       const ResourceContext&  resource_context,
+                                                       DeviceBase*             device);
+
 protected:
     bool isTpRank0() const;
 

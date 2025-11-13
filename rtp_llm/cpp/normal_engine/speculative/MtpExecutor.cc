@@ -216,10 +216,14 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
 
     // target model sample
     if (isTpRank0()) {
-        CHECK_AND_RETURN_REF(sampler_input,
-                             batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
-        sampler_output = std::move(sampler_->forward(sampler_input));
-        batch_stream_processor_->updatePrefillPostDraftModelInput(model_input, model_output, sampler_output);
+        if (stream_groups.isFakeStream()) {
+            model_input.last_hidden_states = model_output.all_hidden_states;
+        } else {
+            CHECK_AND_RETURN_REF(sampler_input,
+                                 batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
+            sampler_output = std::move(sampler_->forward(sampler_input));
+            batch_stream_processor_->updatePrefillPostDraftModelInput(model_input, model_output, sampler_output);
+        }
     }
 
     // draft model prefill
@@ -229,7 +233,7 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         draft_model_output = std::move(draft_model_->forward(model_input));
     }
 
-    if (!isTpRank0() || warm_up_ || streams.size() == 0) {
+    if (!isTpRank0() || warm_up_ || streams.size() == 0 || stream_groups.isFakeStream()) {
         return absl::OkStatus();
     }
 
@@ -409,15 +413,22 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     }
 
     if (isTpRank0()) {
-        // target model sample
-        CHECK_AND_RETURN_REF(sampler_input,
-                             batch_stream_processor_->gatherSpecSamplerInput(stream_groups, model_input, model_output));
-        sampler_output = std::move(sampler_->forward(sampler_input));
-        sampler_output.all_probs->updateShape({batch_size, propose_step_ + 1, vocab_size_});
+        if (stream_groups.isFakeStream()) {
+            BufferPtr accept_tokens = device_->allocateBuffer({DataType::TYPE_INT32, {1, 1}, AllocationType::HOST});
+            *accept_tokens->dataWithOffset<int32_t>(0) = 0;
+            speculative_sampler_output.accept_len      = {1};
+            speculative_sampler_output.accept_tokens   = {std::move(accept_tokens)};
+        } else {
+            // target model sample
+            CHECK_AND_RETURN_REF(
+                sampler_input,
+                batch_stream_processor_->gatherSpecSamplerInput(stream_groups, model_input, model_output));
+            sampler_output = std::move(sampler_->forward(sampler_input));
+            sampler_output.all_probs->updateShape({batch_size, propose_step_ + 1, vocab_size_});
 
-        // rejection sampling
-        speculative_sampler_output = speculative_sampler_->forward(streams, draft_sampler_output, sampler_output);
-
+            // rejection sampling
+            speculative_sampler_output = speculative_sampler_->forward(streams, draft_sampler_output, sampler_output);
+        }
         // update model_input
         batch_stream_processor_->updateDecodePostDraftModelInput(
             model_input, model_output, speculative_sampler_output, batch_size, hidden_states_d_t, total_accept_len);
@@ -428,7 +439,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     maybePrintModelInput(model_input, "decode post draft model");
     draft_prefill_model_output = std::move(draft_model_->forward(model_input));
 
-    if (!isTpRank0() || warm_up_ || streams.size() == 0) {
+    if (!isTpRank0() || warm_up_ || streams.size() == 0 || stream_groups.isFakeStream()) {
         return absl::OkStatus();
     }
 
@@ -470,10 +481,10 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
 
     // prepare streams
     for (auto& stream : streams) {
-        if (stream->isSpDecodeStream()) {
-            decode_streams.push_back(stream);
-        } else {
+        if (stream->isContextStream()) {
             prefill_streams.push_back(stream);
+        } else {
+            decode_streams.push_back(stream);
         }
         stream->setReturnAllProbs(true);
 
@@ -605,6 +616,72 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         model_input.last_hidden_states = nullptr;
     }
     tpSyncModelInputs(model_input, device_);
+}
+
+static std::shared_ptr<GenerateInput> makeFakeInput(int max_new_tokens, DeviceBase* device) {
+    std::shared_ptr<GenerateInput> fake_input = std::make_shared<GenerateInput>();
+    fake_input->input_ids =
+        device->allocateBuffer({rtp_llm::DataType::TYPE_INT32, {(size_t)1}, rtp_llm::AllocationType::HOST});
+    device->bufMemset(*fake_input->input_ids, 0);
+    fake_input->generate_config                 = std::make_shared<GenerateConfig>();
+    fake_input->generate_config->max_new_tokens = max_new_tokens;
+    fake_input->generate_config->top_k          = 1;
+    fake_input->begin_time_us                   = autil::TimeUtility::currentTimeInMicroSeconds();
+    fake_input->fake_query                      = true;
+    return fake_input;
+}
+
+GenerateStreamPtr MtpExecutor::createMinFakePrefillStream(int                     max_new_tokens,
+                                                          const GptInitParameter& params,
+                                                          const ResourceContext&  resource_context,
+                                                          DeviceBase*             device) {
+    auto fake_input = makeFakeInput(max_new_tokens, device);
+    auto fake_stream =
+        std::make_shared<NormalGenerateStream>(fake_input, params, resource_context, nullptr, max_new_tokens);
+    fake_stream->setIsDummyStream(true);
+    fake_stream->setMetricsReporter(nullptr);
+    fake_stream->fakeInitKVBlock();
+
+    return fake_stream;
+}
+
+GenerateStreamPtr MtpExecutor::createMinFakeDecodeStream(int                     max_new_tokens,
+                                                         const GptInitParameter& params,
+                                                         const ResourceContext&  resource_context,
+                                                         DeviceBase*             device) {
+    auto fake_input = makeFakeInput(max_new_tokens, device);
+    auto fake_stream =
+        std::make_shared<NormalGenerateStream>(fake_input, params, resource_context, nullptr, max_new_tokens);
+    fake_stream->setIsDummyStream(true);
+    fake_stream->setMetricsReporter(nullptr);
+    fake_stream->fakeInitKVBlock();
+
+    // init hidden
+    auto fake_hidden_states =
+        device->allocateBuffer({params.data_type_, {1, (size_t)params.hidden_size_}, AllocationType::DEVICE});
+    auto fake_probs =
+        device->allocateBuffer({DataType::TYPE_FP32, {1, (size_t)params.vocab_size_}, AllocationType::DEVICE});
+    device->bufMemset(*fake_hidden_states, 0);
+    device->bufMemset(*fake_probs, 0);
+    std::vector<int> propose_token = {0, 0};
+
+    BufferPtr new_tokens =
+        device->allocateBuffer({rtp_llm::DataType::TYPE_INT32, {1, 1}, rtp_llm::AllocationType::HOST});
+    *new_tokens->dataWithOffset<int32_t>(0) = 0;
+
+    auto sp_buffer          = std::make_shared<SpeculativeExecutorStreamOutput>();
+    sp_buffer->propose_step = max_new_tokens;
+    sp_buffer->all_probs    = fake_probs;
+
+    StreamUpdateInfo update_info{
+        new_tokens, 1, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false};
+
+    fake_stream->update(update_info);
+    fake_stream->setLastHiddenStates(fake_hidden_states);
+    fake_stream->setProposeToken(propose_token);
+    fake_stream->setSPOutputBuffer(sp_buffer);
+    fake_stream->setScoreLen(max_new_tokens + 1);
+    return fake_stream;
 }
 
 }  // namespace rtp_llm
