@@ -13,6 +13,8 @@
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/StringUtil.h"
 #include "rtp_llm/cpp/core/torch_utils/BufferTorchUtils.h"
+#include "rtp_llm/cpp/models/PyWrappedModel.h"
+#include "rtp_llm/cpp/models/NativeDeviceGraphModel.h"
 #include "autil/TimeUtility.h"
 #include <memory>
 #include <thread>
@@ -98,7 +100,16 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                           param
     }
 
     // TODO(yinzhi): support py model for mtp
-    model_.reset(new GptModel(model_init_params));
+    if (!params.py_model.is_none()) {
+        RTP_LLM_LOG_INFO("init executor with python model");
+        model_.reset(new PyWrappedModel(model_init_params, params.py_model));
+    } else if (device_->initParams().hw_kernel_config.enable_native_cuda_graph) {
+        RTP_LLM_LOG_INFO("init legacy c++ gpt model with native cuda graph");
+        model_.reset(new NativeDeviceGraphModel(model_init_params));
+    } else {
+        RTP_LLM_LOG_INFO("init legacy c++ gpt model");
+        model_.reset(new GptModel(model_init_params));
+    }
 
     // when warmup, cache manager maybe nullptr
     const auto& cache_config = cache_manager ? cache_manager->cacheConfig() : CacheConfig();
@@ -117,7 +128,13 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                           param
              mtp_cache_manager ? ((std::optional<KVCacheAllocator::KVCacheBuffer>)mtp_cache_manager->kvCacheBuffer()) :
                                       std::nullopt,
                   mtp_params->model_id});
-        setDraftModel(std::make_unique<MTPModel>(model_params));
+        if (!params.py_sp_model.is_none()) {
+            RTP_LLM_LOG_INFO("[speculative decoding] using py model");
+            draft_model_.reset(new PyWrappedModel(model_params, params.py_sp_model));
+        } else {
+            RTP_LLM_LOG_INFO("[speculative decoding] legacy c++ gpt model");
+            draft_model_.reset(new MTPModel(model_params));
+        }
         break;  // NOTE: only support one mtp model now
     }
 

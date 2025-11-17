@@ -59,7 +59,7 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
         batch_size);
     if (context_batch_size > 0) {
         // Calculate cu_seqlens
-        torch::Tensor cu_seqlens = torch::zeros({device_->initParams().concurrency_config.concurrency_limit + 1},
+        torch::Tensor cu_seqlens    = torch::zeros({device_->initParams().concurrency_config.concurrency_limit + 1},
                                                 torch::TensorOptions(torch::kInt32).device(torch::kCPU));
         torch::Tensor cu_kv_seqlens = torch::zeros({device_->initParams().concurrency_config.concurrency_limit + 1},
                                                    torch::TensorOptions(torch::kInt32).device(torch::kCPU));
@@ -231,7 +231,7 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
 GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
 
     py::gil_scoped_acquire gil;
-    printBufferDataDebug(*inputs.combo_position_ids, "forward inputs.combo_position_ids");
+
     try {
         RTP_LLM_LOG_DEBUG("Calling forward method on Python object instance.");
 
@@ -269,6 +269,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         }
         auto hidden_states_tensor = py_model_outputs.hidden_states;
         auto hidden_states        = torchTensor2Buffer(hidden_states_tensor);
+
+        tensor_holder_.clear();
+        tensor_holder_.emplace_back(std::move(hidden_states_tensor));
 
         RTP_LLM_LOG_DEBUG("Python object instance forward method called successfully.");
 

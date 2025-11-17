@@ -41,6 +41,8 @@ private:
     torch::Tensor v_cache_base_tensor_;
     torch::Tensor k_scale_base_tensor_;
     torch::Tensor v_scale_base_tensor_;
+
+    std::vector<torch::Tensor> tensor_holder_;
 };
 
 // NOTE(wangyin): constructor can not be compiled correctly when placed in cc file.
