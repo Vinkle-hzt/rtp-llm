@@ -251,6 +251,7 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
     }
 
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || stream_groups.isFakeStream()) {
+        device_->syncAndCheck();
         return absl::OkStatus();
     }
 
@@ -457,6 +458,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     draft_prefill_model_output = std::move(draft_model_->forward(model_input));
 
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || stream_groups.isFakeStream()) {
+        device_->syncAndCheck();
         return absl::OkStatus();
     }
 
@@ -509,7 +511,7 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
             auto sp_output_buffer          = std::make_shared<SpeculativeExecutorStreamOutput>();
             sp_output_buffer->propose_step = propose_step_;
             sp_output_buffer->tokens       = device_->allocateBuffer(
-                {rtp_llm::DataType::TYPE_INT32, {1, propose_step_}, rtp_llm::AllocationType::HOST}, {});
+                {rtp_llm::DataType::TYPE_INT32, {1, 2}, rtp_llm::AllocationType::HOST}, {"spec_tokens"});
 
             stream->setSPOutputBuffer(sp_output_buffer);
         }
@@ -579,7 +581,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     auto pre_target_token = device_->allocateBuffer({DataType::TYPE_INT32, {batch_size}, AllocationType::HOST});
     int  batch_idx        = 0;
     for (const auto& stream : stream_groups.allStreams()) {
-        auto& propose_tokens                     = stream->getProposeToken();
+        int* propose_tokens                      = stream->getSPOutputBuffer()->tokens->data<int>();
         pre_target_token->data<int>()[batch_idx] = propose_tokens[0];
         batch_idx++;
     }
@@ -601,7 +603,13 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         auto draft_probs         = torch::softmax(Buffer2torchTensor(*draft_decode_model_output.logits, false), -1);
         auto draft_probs_reshape = draft_probs.reshape({(int)batch_size, 1, -1});
         auto [draft_token_probs, draft_token_ids] = fastTopK(draft_probs, 1, -1);
-        draft_token_ids                           = draft_token_ids.to(torch::kInt32);
+
+        if (stream_groups.isFakeStream()) {
+            draft_token_ids.zero_();
+            device_->bufMemset(*draft_decode_model_output.all_hidden_states, 0);
+        }
+
+        draft_token_ids = draft_token_ids.to(torch::kInt32);
         draft_token_ids_list.push_back(draft_token_ids);
         draft_probs_list.push_back(draft_probs_reshape);
 
@@ -678,24 +686,26 @@ GenerateStreamPtr MtpExecutor::createMinFakeDecodeStream(int                    
         device->allocateBuffer({params.data_type_, {1, (size_t)params.hidden_size_}, AllocationType::DEVICE});
     auto fake_probs =
         device->allocateBuffer({DataType::TYPE_FP32, {1, (size_t)params.vocab_size_}, AllocationType::DEVICE});
+    auto fake_tokens = device->allocateBuffer({DataType::TYPE_INT32, {1, 2}, AllocationType::HOST}, {"spec_tokens"});
+
     device->bufMemset(*fake_hidden_states, 0);
     device->bufMemset(*fake_probs, 0);
-    std::vector<int> propose_token = {0, 0};
+    device->bufMemset(*fake_tokens, 0);
 
     BufferPtr new_tokens =
         device->allocateBuffer({rtp_llm::DataType::TYPE_INT32, {1, 1}, rtp_llm::AllocationType::HOST});
     *new_tokens->dataWithOffset<int32_t>(0) = 0;
 
-    auto sp_buffer          = std::make_shared<SpeculativeExecutorStreamOutput>();
-    sp_buffer->propose_step = max_new_tokens;
-    sp_buffer->all_probs    = fake_probs;
+    auto sp_buffer           = std::make_shared<SpeculativeExecutorStreamOutput>();
+    sp_buffer->propose_step  = max_new_tokens;
+    sp_buffer->all_probs     = fake_probs;
+    sp_buffer->tokens        = fake_tokens;
+    sp_buffer->hidden_states = fake_hidden_states;
 
     StreamUpdateInfo update_info{
         new_tokens, 1, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false};
 
     fake_stream->update(update_info);
-    fake_stream->setLastHiddenStates(fake_hidden_states);
-    fake_stream->setProposeToken(propose_token);
     fake_stream->setSPOutputBuffer(sp_buffer);
     fake_stream->setScoreLen(max_new_tokens + 1);
     return fake_stream;

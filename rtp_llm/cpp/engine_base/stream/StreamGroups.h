@@ -177,6 +177,18 @@ public:
         return debug_string.str();
     }
 
+    void updateStreams(const std::vector<StreamSpecUpdateInfo>& spec_update_infos) const {
+        int stream_idx = 0;
+        for (auto& stream : decode_streams_) {
+            stream->specUpdate(spec_update_infos[stream_idx]);
+            stream_idx++;
+        }
+        for (auto& stream : context_streams_) {
+            stream->specUpdate(spec_update_infos[stream_idx]);
+            stream_idx++;
+        }
+    }
+
 private:
     std::list<GenerateStreamPtr> context_streams_;
     std::list<GenerateStreamPtr> decode_streams_;
