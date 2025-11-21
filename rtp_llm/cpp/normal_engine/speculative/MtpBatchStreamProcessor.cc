@@ -392,7 +392,6 @@ void MtpBatchStreamProcessor::preparePrefillSpecUpdateInfo(const StreamGroups&  
         }
 
         // speculative decoding info
-        stream->setScoreLen(propose_step_ + 1);
         BufferPtr propose_all_probs = draft_sampler_output.all_probs->slice(batch_idx_out, next_batch_size, false);
 
         BufferPtr last_hidden_states = nullptr;

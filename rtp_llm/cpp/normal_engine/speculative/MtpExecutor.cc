@@ -48,7 +48,8 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                           param
     metrics_reporter_(params.metrics_reporter),
     mtp_cache_managers_(mtp_cache_managers),
     speculative_sampler_(new speculative::SpeculativeSampler(device, propose_params->gen_num_per_circle)),
-    warm_up_(warm_up) {
+    warm_up_(warm_up),
+    role_type_(params.gpt_init_parameter.role_type_) {
     propose_step_       = propose_params->gen_num_per_circle;
     vocab_size_         = params.gpt_init_parameter.vocab_size_;
     propose_vocab_size_ = propose_params->getGptInitParameter().vocab_size_;
@@ -364,6 +365,19 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     size_t total_accept_len = 0;
 
+    // clone tensors from grpc
+    for (auto& stream : streams) {
+        auto        sp_output_buffer = stream->getSPOutputBuffer();
+        auto const& tensors_holder   = sp_output_buffer->tensors_holder;
+        if (!tensors_holder.empty()) {
+            auto const& propose_probs   = tensors_holder[0];
+            auto const& propose_hidden  = tensors_holder[1];
+            sp_output_buffer->all_probs = device_->clone({*torchTensor2Buffer(propose_probs), AllocationType::DEVICE});
+            sp_output_buffer->hidden_states =
+                device_->clone({*torchTensor2Buffer(propose_hidden), AllocationType::DEVICE});
+        }
+    }
+
     size_t batch_size = streams.size();
     {
         int64_t start_time_us      = autil::TimeUtility::currentTimeInMicroSeconds();
@@ -489,6 +503,11 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         speculative_sampler_output,
         {std::move(draft_prefill_model_output), std::move(draft_prefill_sampler_output)});
 
+    // clean holder tensors from grpc
+    for (auto& stream : streams) {
+        stream->getSPOutputBuffer()->tensors_holder.clear();
+    }
+
     return result;
 }
 
@@ -503,6 +522,7 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
         if (stream->isContextStream()) {
             prefill_streams.push_back(stream);
         } else {
+            stream->setScoreLen(propose_step_ + 1);
             decode_streams.push_back(stream);
         }
         stream->setReturnAllProbs(true);
@@ -519,8 +539,15 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
 
     // step forward
     int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
-    THROW_IF_STATUS_ERROR(prefillStep(prefill_streams, metrics_collector));
-    THROW_IF_STATUS_ERROR(decodeStep(decode_streams, metrics_collector));
+
+    if (role_type_ == RoleType::PREFILL || role_type_ == RoleType::PDFUSION) {
+        THROW_IF_STATUS_ERROR(prefillStep(prefill_streams, metrics_collector));
+    }
+
+    if (role_type_ == RoleType::DECODE || role_type_ == RoleType::PDFUSION) {
+        THROW_IF_STATUS_ERROR(decodeStep(decode_streams, metrics_collector));
+    }
+
     metrics_collector.sp_engine_collector.step_latency_us =
         autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
 

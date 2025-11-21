@@ -80,6 +80,9 @@ public:
     rtp_llm::BufferPtr loss          = nullptr;
     rtp_llm::BufferPtr all_probs     = nullptr;
     rtp_llm::BufferPtr softmax_probs = nullptr;
+
+    // hold tensors from grpc
+    std::vector<torch::Tensor> tensors_holder;
 };
 using SpeculativeExecutorStreamOutputPtr = std::shared_ptr<SpeculativeExecutorStreamOutput>;
 

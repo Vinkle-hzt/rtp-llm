@@ -97,6 +97,7 @@ private:
     std::vector<std::shared_ptr<CacheManager>>       mtp_cache_managers_;
     std::unique_ptr<speculative::SpeculativeSampler> speculative_sampler_;
 
-    bool warm_up_;
+    bool     warm_up_;
+    RoleType role_type_;
 };
 };  // namespace rtp_llm
