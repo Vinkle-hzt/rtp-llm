@@ -845,14 +845,7 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
     propose_token_         = {target_last_token, update_info.draft_token};
 
     sp_output_buffer_->hidden_states = update_info.draft_hidden_states;
-
-    // NOTE: since probs is from tensor, we need to clone it to device, may remove this in the future
-    if (sp_output_buffer_->all_probs) {
-        device_->copy({*sp_output_buffer_->all_probs, *update_info.draft_token_probs});
-    } else {
-        sp_output_buffer_->all_probs =
-            device_->clone({*update_info.draft_token_probs, rtp_llm::AllocationType::DEVICE});
-    }
+    sp_output_buffer_->all_probs     = update_info.draft_token_probs;
 
     // update normal output buffer
     updateOutput({new_tokens,

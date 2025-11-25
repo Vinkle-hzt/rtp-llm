@@ -87,7 +87,7 @@ absl::StatusOr<SamplerInputs> MtpBatchStreamProcessor::gatherSpecSamplerInput(
         for (int i = 0; i < current_batch_size; ++i) {
             memcpy(sampler_inputs.token_ids->dataWithOffset<int32_t>((batch_idx) * (sampler_inputs.step + 1)),
                    complete_token_ids->dataWithOffset<int32_t>(0),
-                   (seq_len + 1) * sizeof(int));
+                   seq_len * sizeof(int));
             batch_idx += 1;
         }
 
@@ -227,8 +227,12 @@ void MtpBatchStreamProcessor::updateDecodeDraftModelInput(GptModelInputs&       
                                                           const torch::Tensor&   draft_token_ids) {
     int batch_size                 = model_input.combo_tokens->shape()[0];
     model_input.last_hidden_states = model_output.all_hidden_states;
-    model_input.combo_tokens       = torchTensor2Buffer(draft_token_ids.reshape({batch_size}));
 
+    // here combo_tokens is a device buffer
+    model_input.combo_tokens = torchTensor2Buffer(draft_token_ids);
+    model_input.combo_tokens->updateShape({(size_t)batch_size});
+
+    model_input.sequence_lengths = device_->clone({*model_input.sequence_lengths, AllocationType::HOST});
     for (int i = 0; i < batch_size; i++) {
         model_input.sequence_lengths->data<int>()[i]++;
     }
@@ -330,6 +334,7 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
 void MtpBatchStreamProcessor::updateMultiStepDraftSamplerOutput(const StreamGroups&         stream_groups,
                                                                 SamplerOutput&              draft_sampler_output,
                                                                 torch::Tensor&              draft_token_ids_d_t,
+                                                                torch::Tensor&              spec_token_ids_d_t,
                                                                 torch::Tensor&              draft_token_probs_d_t,
                                                                 std::vector<torch::Tensor>& draft_token_probs_list) {
     std::vector<torch::Tensor> prev_draft_token_probs_list;
@@ -345,8 +350,8 @@ void MtpBatchStreamProcessor::updateMultiStepDraftSamplerOutput(const StreamGrou
     draft_sampler_output.all_probs = torchTensor2Buffer(draft_token_probs_d_t);
 
     // draft_token_ids_d_t = draft_token_ids_d_t[:, 1:]
-    draft_token_ids_d_t            = draft_token_ids_d_t.slice(1, 1).contiguous();
-    draft_sampler_output.token_ids = torchTensor2Buffer(draft_token_ids_d_t);
+    spec_token_ids_d_t             = draft_token_ids_d_t.slice(1, 1).contiguous();
+    draft_sampler_output.token_ids = torchTensor2Buffer(spec_token_ids_d_t);
 }
 
 void MtpBatchStreamProcessor::preparePrefillSpecUpdateInfo(const StreamGroups&                stream_groups,
@@ -392,7 +397,8 @@ void MtpBatchStreamProcessor::preparePrefillSpecUpdateInfo(const StreamGroups&  
         }
 
         // speculative decoding info
-        BufferPtr propose_all_probs = draft_sampler_output.all_probs->slice(batch_idx_out, next_batch_size, false);
+        BufferPtr propose_all_probs = device_->clone(
+            {draft_sampler_output.all_probs->view(batch_idx_out, next_batch_size), AllocationType::DEVICE});
 
         BufferPtr last_hidden_states = nullptr;
         if (propose_step_ > 1) {
@@ -429,7 +435,8 @@ void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
         auto next_batch_size = stream->nextBatchSize();
 
         // speculative decoding info
-        BufferPtr propose_all_probs = draft_sampler_output.all_probs->slice(batch_idx_out, next_batch_size, false);
+        BufferPtr propose_all_probs = device_->clone(
+            {draft_sampler_output.all_probs->view(batch_idx_out, next_batch_size), AllocationType::DEVICE});
 
         BufferPtr last_hidden_states = nullptr;
         if (propose_step_ > 1) {

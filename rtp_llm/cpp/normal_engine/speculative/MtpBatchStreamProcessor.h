@@ -51,6 +51,7 @@ public:
     void updateMultiStepDraftSamplerOutput(const StreamGroups&         stream_groups,
                                            SamplerOutput&              draft_sampler_output,
                                            torch::Tensor&              draft_token_ids_d_t,
+                                           torch::Tensor&              spec_token_ids_d_t,
                                            torch::Tensor&              draft_token_probs_d_t,
                                            std::vector<torch::Tensor>& draft_token_probs_list);
 

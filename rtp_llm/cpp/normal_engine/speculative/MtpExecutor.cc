@@ -100,7 +100,6 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                           param
         enable_ffn_disaggregate_ = true;
     }
 
-    // TODO(yinzhi): support py model for mtp
     if (!params.py_model.is_none()) {
         RTP_LLM_LOG_INFO("init executor with python model");
         model_.reset(new PyWrappedModel(model_init_params, params.py_model));
@@ -361,6 +360,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     torch::Tensor              hidden_states_d_t;
     torch::Tensor              draft_probs_t;
     torch::Tensor              draft_token_ids_t;
+    torch::Tensor              spec_token_ids_t;
     std::vector<torch::Tensor> draft_probs_list;
 
     size_t total_accept_len = 0;
@@ -401,7 +401,6 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     // TODO(yinzhi): consider beam search & lora
 
-    // TODO(yinzhi): support multi step MTP
     if (propose_step_ == 1) {
         if (isTpRank0()) {
             batch_stream_processor_->prepareOneStepSpecDecodeModelInput(stream_groups, model_input);
@@ -421,6 +420,9 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         }
 
         draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t);
+
+        // TODO(yinzhi): if no sync here, maybe cause cuda error, need to find a better way to avoid this.
+        device_->syncAndCheck();
     }
 
     maybePrintModelInput(model_input, "decode target model");
@@ -428,12 +430,18 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     // trick: update draft sampler output after spec decode to avoid kernel launch overhead
     if (isTpRank0()) {
-        if (propose_step_ == 1) {
-            batch_stream_processor_->updateOneStepDraftSamplerOutput(
-                stream_groups, draft_sampler_output, draft_token_probs_d_t);
-        } else {
-            batch_stream_processor_->updateMultiStepDraftSamplerOutput(
-                stream_groups, draft_sampler_output, draft_token_ids_t, draft_token_probs_d_t, draft_probs_list);
+        if (!stream_groups.isFakeStream()) {
+            if (propose_step_ == 1) {
+                batch_stream_processor_->updateOneStepDraftSamplerOutput(
+                    stream_groups, draft_sampler_output, draft_token_probs_d_t);
+            } else {
+                batch_stream_processor_->updateMultiStepDraftSamplerOutput(stream_groups,
+                                                                           draft_sampler_output,
+                                                                           draft_token_ids_t,
+                                                                           spec_token_ids_t,
+                                                                           draft_token_probs_d_t,
+                                                                           draft_probs_list);
+            }
         }
     }
 
@@ -450,6 +458,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             *accept_tokens->dataWithOffset<int32_t>(0) = 0;
             speculative_sampler_output.accept_len      = {1};
             speculative_sampler_output.accept_tokens   = {std::move(accept_tokens)};
+            device_->syncAndCheck();
         } else {
             // target model sample
             CHECK_AND_RETURN_REF(
@@ -461,7 +470,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             // rejection sampling
             speculative_sampler_output = speculative_sampler_->forward(streams, draft_sampler_output, sampler_output);
         }
-        // update model_input
+        // NOTE: here will have cuda device sync before update model input
         batch_stream_processor_->updateDecodePostDraftModelInput(
             model_input, model_output, speculative_sampler_output, batch_size, hidden_states_d_t, total_accept_len);
     }
@@ -494,7 +503,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
         sp_engine_collector.total_accepted_token_num = total_accept_len;
         sp_engine_collector.total_stream_num         = stream_groups.size();
-        sp_engine_collector.total_propose_token_num  = stream_groups.size() * (propose_step_ + 1);
+        sp_engine_collector.total_propose_token_num  = stream_groups.size() * propose_step_;
     }
 
     // dispatch
@@ -596,13 +605,18 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
                                    const StreamGroups&         stream_groups,
                                    std::vector<torch::Tensor>& draft_probs_list,
                                    torch::Tensor&              draft_token_ids_t) {
+    // clear host buffers holder
+    buffer_holder_.release();
+
     GptModelOutputs            draft_decode_model_output;
     std::vector<torch::Tensor> draft_token_ids_list;
     BufferPtr                  spec_prefix_lengths;
 
     // update TP > 0 batch_size
-    size_t batch_size      = model_input.combo_tokens->shape()[0];
-    spec_prefix_lengths    = device_->clone({*model_input.sequence_lengths, AllocationType::HOST});
+    size_t batch_size   = model_input.combo_tokens->shape()[0];
+    spec_prefix_lengths = device_->clone({*model_input.sequence_lengths, AllocationType::HOST});
+
+    buffer_holder_.hold(model_input.combo_tokens);
     auto pre_propose_token = device_->clone({*model_input.combo_tokens, AllocationType::DEVICE});
 
     auto pre_target_token = device_->allocateBuffer({DataType::TYPE_INT32, {batch_size}, AllocationType::HOST});
@@ -613,6 +627,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         batch_idx++;
     }
 
+    buffer_holder_.hold(pre_target_token);
     auto pre_target_token_d         = device_->clone({*pre_target_token, AllocationType::DEVICE});
     auto pre_target_token_t         = Buffer2torchTensor(pre_target_token_d, false);
     auto pre_target_token_t_reshape = pre_target_token_t.reshape({(int)batch_size, 1});
@@ -624,6 +639,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
 
     // n-1 steps draft model decode
     for (int i = 0; i < propose_step_ - 1; i++) {
+        buffer_holder_.hold(model_input);
         draft_decode_model_output = std::move(draft_model_->forward(model_input));
 
         // sample
@@ -654,12 +670,16 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
 
         auto lm_output_indexes = device_->allocateBuffer(
             {rtp_llm::DataType::TYPE_INT32, {batch_size * (propose_step_ + 1)}, rtp_llm::AllocationType::HOST}, {});
+        auto input_lengths = device_->allocateBuffer({DataType::TYPE_INT32, {batch_size}, AllocationType::HOST});
+
         for (int i = 0; i < batch_size; i++) {
-            model_input.input_lengths->data<int>()[i] = propose_step_ + 1;
+            input_lengths->data<int>()[i] = propose_step_ + 1;
         }
         for (int i = 0; i < batch_size * (propose_step_ + 1); i++) {
             lm_output_indexes->data<int>()[i] = i;
         }
+
+        model_input.input_lengths     = input_lengths;
         model_input.lm_output_indexes = lm_output_indexes;
         model_input.prefix_lengths    = spec_prefix_lengths;
         model_input.combo_tokens      = torchTensor2Buffer(draft_token_ids_t);
@@ -734,7 +754,6 @@ GenerateStreamPtr MtpExecutor::createMinFakeDecodeStream(int                    
 
     fake_stream->update(update_info);
     fake_stream->setSPOutputBuffer(sp_buffer);
-    fake_stream->setScoreLen(max_new_tokens + 1);
     return fake_stream;
 }
 

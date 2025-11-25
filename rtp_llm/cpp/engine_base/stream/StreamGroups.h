@@ -47,6 +47,8 @@ public:
             adapter_names.push_back(stream->adapterName());
             gen_timeline_ |= stream->genTimeline();
         }
+        RTP_LLM_CHECK_WITH_INFO(
+            !(streams.size() > 1 && is_fake_stream_), "streams.size()[%d] > 1 && is_fake_stream_", streams.size());
     }
 
     size_t totalDecodeBatchSize() const {
