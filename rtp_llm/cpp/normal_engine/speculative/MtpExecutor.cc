@@ -247,6 +247,9 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
     {
         tpSyncModelInputs(model_input, device_);
         maybePrintModelInput(model_input, "prefill post draft model");
+        model_input.k_block_size = mtp_cache_managers_[0]->cacheConfig().k_block_size;
+        model_input.v_block_size = mtp_cache_managers_[0]->cacheConfig().v_block_size;
+
         draft_model_output = std::move(draft_model_->forward(model_input));
     }
 
@@ -478,6 +481,9 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     tpSyncModelInputs(model_input, device_);
 
     maybePrintModelInput(model_input, "decode post draft model");
+    model_input.k_block_size = mtp_cache_managers_[0]->cacheConfig().k_block_size;
+    model_input.v_block_size = mtp_cache_managers_[0]->cacheConfig().v_block_size;
+
     draft_prefill_model_output = std::move(draft_model_->forward(model_input));
 
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || stream_groups.isFakeStream()) {
@@ -608,6 +614,9 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     // clear host buffers holder
     buffer_holder_.release();
 
+    model_input.k_block_size = mtp_cache_managers_[0]->cacheConfig().k_block_size;
+    model_input.v_block_size = mtp_cache_managers_[0]->cacheConfig().v_block_size;
+
     GptModelOutputs            draft_decode_model_output;
     std::vector<torch::Tensor> draft_token_ids_list;
     BufferPtr                  spec_prefix_lengths;
@@ -687,7 +696,10 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         model_input.sequence_lengths   = device_->allocateBuffer({DataType::TYPE_INT32, {0}, AllocationType::HOST});
         model_input.last_hidden_states = nullptr;
     }
+
     tpSyncModelInputs(model_input, device_);
+    model_input.k_block_size = cache_manager_->cacheConfig().k_block_size;
+    model_input.v_block_size = cache_manager_->cacheConfig().v_block_size;
 }
 
 static std::shared_ptr<GenerateInput> makeFakeInput(int max_new_tokens, DeviceBase* device) {
