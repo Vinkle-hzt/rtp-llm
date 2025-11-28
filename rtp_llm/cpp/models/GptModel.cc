@@ -1826,6 +1826,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
     shape_hints_ptr[GptModelInputIndex::skipRun] = inputs.skip_run;
     shape_hints_ptr[GptModelInputIndex::gptModelRequestLength] =
         inputs.request_id.get() ? inputs.request_id->size() : 0;
+    shape_hints_ptr[GptModelInputIndex::isFakeStream] = inputs.is_fake_stream;
 
     device->broadcast({{shape_hints}, 0});
     device->syncCommunication(false);
@@ -1836,6 +1837,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, rtp_llm::DeviceBase* device) {
     int32_t*           mm_features_shape_ptr = nullptr;
     inputs.need_all_logits                   = shape_hints_ptr[GptModelInputIndex::needAllLogits];
     inputs.skip_run                          = shape_hints_ptr[GptModelInputIndex::skipRun];
+    inputs.is_fake_stream                    = shape_hints_ptr[GptModelInputIndex::isFakeStream];
     if (inputs.skip_run) {
         return;
     }

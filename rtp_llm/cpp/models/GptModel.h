@@ -63,6 +63,7 @@ enum GptModelInputIndex : size_t {
     mtpHiddenStatesDtype,
     skipRun,
     gptModelRequestLength,  // length of request id & pd_separation
+    isFakeStream,
     gptModelInputLength,
 };
 

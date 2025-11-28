@@ -218,6 +218,10 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
 
     // TODO(yinzhi): consider beam search & lora
 
+    // release model input before forward
+    model_->releaseBuffers();
+    draft_model_->releaseBuffers();
+
     // target model prefill
     {
         maybePrintModelInput(model_input, "prefill target model");
@@ -233,7 +237,7 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
 
     // target model sample
     if (isTpRank0()) {
-        if (stream_groups.isFakeStream()) {
+        if (model_input.is_fake_stream) {
             model_input.last_hidden_states = model_output.all_hidden_states;
         } else {
             CHECK_AND_RETURN_REF(sampler_input,
@@ -253,8 +257,10 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         draft_model_output = std::move(draft_model_->forward(model_input));
     }
 
-    if (!isTpRank0() || warm_up_ || streams.size() == 0 || stream_groups.isFakeStream()) {
+    if (!isTpRank0() || warm_up_ || streams.size() == 0 || model_input.is_fake_stream) {
         device_->syncAndCheck();
+        model_->releaseBuffers();
+        draft_model_->releaseBuffers();
         return absl::OkStatus();
     }
 
@@ -282,6 +288,10 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
                                                      {std::move(model_output), std::move(sampler_output)},
                                                      {std::move(draft_model_output), std::move(draft_sampler_output)});
         RTP_LLM_LOG_DEBUG("dispatch done");
+
+        model_->releaseBuffers();
+        draft_model_->releaseBuffers();
+
         return result;
     }
 }
@@ -404,24 +414,24 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     // TODO(yinzhi): consider beam search & lora
 
-    if (propose_step_ == 1) {
-        if (isTpRank0()) {
+    if (isTpRank0()) {
+        if (propose_step_ == 1) {
             batch_stream_processor_->prepareOneStepSpecDecodeModelInput(stream_groups, model_input);
-        }
-        tpSyncModelInputs(model_input, device_);
-        if (model_input.skip_run) {
-            return absl::OkStatus();
-        }
-    } else {
-        // prepare draft model input
-        if (isTpRank0()) {
+        } else {
             batch_stream_processor_->prepareDecodeDraftModelInput(stream_groups, model_input);
         }
-        tpSyncModelInputs(model_input, device_);
-        if (model_input.skip_run) {
-            return absl::OkStatus();
-        }
+    }
 
+    tpSyncModelInputs(model_input, device_);
+    if (model_input.skip_run) {
+        return absl::OkStatus();
+    }
+
+    // release hold buffers before draft model forward
+    draft_model_->releaseBuffers();
+    model_->releaseBuffers();
+
+    if (propose_step_ > 1) {
         draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t);
 
         // TODO(yinzhi): if no sync here, maybe cause cuda error, need to find a better way to avoid this.
@@ -433,7 +443,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     // trick: update draft sampler output after spec decode to avoid kernel launch overhead
     if (isTpRank0()) {
-        if (!stream_groups.isFakeStream()) {
+        if (!model_input.is_fake_stream) {
             if (propose_step_ == 1) {
                 batch_stream_processor_->updateOneStepDraftSamplerOutput(
                     stream_groups, draft_sampler_output, draft_token_probs_d_t);
@@ -456,7 +466,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     }
 
     if (isTpRank0()) {
-        if (stream_groups.isFakeStream()) {
+        if (model_input.is_fake_stream) {
             BufferPtr accept_tokens = device_->allocateBuffer({DataType::TYPE_INT32, {1, 1}, AllocationType::HOST});
             *accept_tokens->dataWithOffset<int32_t>(0) = 0;
             speculative_sampler_output.accept_len      = {1};
@@ -486,8 +496,10 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     draft_prefill_model_output = std::move(draft_model_->forward(model_input));
 
-    if (!isTpRank0() || warm_up_ || streams.size() == 0 || stream_groups.isFakeStream()) {
+    if (!isTpRank0() || warm_up_ || streams.size() == 0 || model_input.is_fake_stream) {
         device_->syncAndCheck();
+        draft_model_->releaseBuffers();
+        model_->releaseBuffers();
         return absl::OkStatus();
     }
 
@@ -522,6 +534,9 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     for (auto& stream : streams) {
         stream->getSPOutputBuffer()->tensors_holder.clear();
     }
+
+    draft_model_->releaseBuffers();
+    model_->releaseBuffers();
 
     return result;
 }
@@ -648,7 +663,6 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
 
     // n-1 steps draft model decode
     for (int i = 0; i < propose_step_ - 1; i++) {
-        buffer_holder_.hold(model_input);
         draft_decode_model_output = std::move(draft_model_->forward(model_input));
 
         // sample
@@ -656,7 +670,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         auto draft_probs_reshape = draft_probs.reshape({(int)batch_size, 1, -1});
         auto [draft_token_probs, draft_token_ids] = fastTopK(draft_probs, 1, -1);
 
-        if (stream_groups.isFakeStream()) {
+        if (model_input.is_fake_stream) {
             draft_token_ids.zero_();
             device_->bufMemset(*draft_decode_model_output.all_hidden_states, 0);
         }
