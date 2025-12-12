@@ -415,7 +415,8 @@ bool NormalEngine::isEagle() {
 
 void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
     if (isMTPEagle()) {
-        int propose_step = params_.sp_config.gen_num_per_cycle;
+        int propose_step   = params_.sp_config.gen_num_per_cycle;
+        int mtp_vocab_size = propose_params_->getGptInitParameter().vocab_size_;
         switch (params_.role_type_) {
             case RoleType::PREFILL:
                 if (streams.empty()) {
@@ -425,8 +426,8 @@ void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
                 break;
             case RoleType::DECODE:
                 if (streams.empty()) {
-                    streams.emplace_back(
-                        MtpExecutor::createMinFakeDecodeStream(propose_step, params_, resource_context_, device_));
+                    streams.emplace_back(MtpExecutor::createMinFakeDecodeStream(
+                        propose_step, params_, resource_context_, mtp_vocab_size, device_));
                 }
                 break;
             case RoleType::PDFUSION: {
@@ -444,8 +445,8 @@ void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
                         MtpExecutor::createMinFakePrefillStream(propose_step, params_, resource_context_, device_));
                 }
                 if (!has_decode) {
-                    streams.emplace_back(
-                        MtpExecutor::createMinFakeDecodeStream(propose_step, params_, resource_context_, device_));
+                    streams.emplace_back(MtpExecutor::createMinFakeDecodeStream(
+                        propose_step, params_, resource_context_, mtp_vocab_size, device_));
                 }
                 break;
             }

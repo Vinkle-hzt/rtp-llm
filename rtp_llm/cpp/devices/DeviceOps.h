@@ -81,6 +81,8 @@ public:
     virtual ReduceScatterLoraLinearOutput loraLinearReduceScatter(const LoraLinearReduceScatterParams& params);
     virtual AllGatherLoraLinearOutput     allGatherloraLinear(const AllGatherLoraLinearParams& params);
     virtual void                          chainSpeculativeSampling(const SpeculativeSamplingParams& params);
+    virtual void                          rejectionSampling(const RejectionSamplingParams& params);
+    virtual void                          mappingDraft2Target(const MappingDraft2TargetParams& params);
 
     // for sampler
     virtual GreedyOutput     sampleGreedy(const GreedyParams& params);

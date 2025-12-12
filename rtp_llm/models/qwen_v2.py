@@ -429,7 +429,13 @@ class QWenV2Embedding(QWenV2):
 
 class QwenV2MTPWeight(QWenV2Weight):
     def __init__(self, config: GptInitModelParameters, tp_size: int, tp_rank: int):
+        self.vocab_prune = False
         super().__init__(config, tp_size, tp_rank)
+
+    def _process_meta(self, meta_dicts: Any, weight_keys: List[str]):
+        super()._process_meta(meta_dicts, weight_keys)
+        if "model.d2t" in weight_keys:
+            self.vocab_prune = True
 
     def _get_weight_info(self):
         weights = [
@@ -444,6 +450,25 @@ class QwenV2MTPWeight(QWenV2Weight):
                 identity,
             ),
         ]
+
+        if self.vocab_prune:
+            weights.extend(
+                [
+                    AtomicWeight(
+                        W.multi_tokens_predict_d2t_map,
+                        [CkptWeightInfo(self.prefix + "model.d2t", identity)],
+                        identity,
+                        data_type=torch.int64,
+                    ),
+                    AtomicWeight(
+                        W.multi_tokens_predict_t2d_map,
+                        [CkptWeightInfo(self.prefix + "model.t2d", identity)],
+                        identity,
+                        data_type=torch.int64,
+                    ),
+                ]
+            )
+
         layer_weights: List[List[AtomicWeight]] = []
         for layer in range(self._num_layers):
             w = self._get_hf_layer_weight_info(layer)

@@ -176,7 +176,7 @@ inline torch::Tensor Buffer2torchTensor(const Buffer& buf, bool copyData = true)
 
 inline torch::Tensor Buffer2torchTensor(const ConstBufferPtr& buf, bool copyData = true) {
     if (buf == nullptr) {
-        throw std::runtime_error("buf is nullptr");
+        return torch::Tensor();
     }
     if (buf->size() == 0) {
         auto option = torch::dtype(dataTypeToTorchType(buf->type()))
