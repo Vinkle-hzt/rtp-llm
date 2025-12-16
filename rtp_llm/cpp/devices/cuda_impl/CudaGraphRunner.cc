@@ -332,6 +332,10 @@ void CudaGraphRunner::initCapture() {
         PyModelInputs inputs;
         // input_ids [tokens_nums] = [batch_size * num_tokens_per_bs]
         inputs.input_ids = torch::zeros({max_num_token_}, options_cuda_int32_);
+
+        // TODO(huzetao.hzt): input_hiddens should be set to the real input hidden states dtype.
+        inputs.input_hiddens = torch::zeros({max_num_token_, hidden_size_}, options_cuda_int32_);
+
         // input_lengths [batch_size, int32] (decode only)
         // Setup attention inputs using the extracted function
         initCaptureAttentionInputs(inputs, max_bs_, num_tokens_per_bs_);
