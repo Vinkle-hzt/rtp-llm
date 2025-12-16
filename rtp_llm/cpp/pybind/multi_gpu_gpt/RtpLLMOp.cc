@@ -98,7 +98,9 @@ void RtpLLMOp::init(py::object model,
     EngineInitParams params = initModel(model);
 
     if (!propose_model.is_none()) {
-        params.py_sp_model = propose_model.attr("model").attr("py_model");
+        if (!propose_model.attr("model").is_none()) {
+            params.py_sp_model = propose_model.attr("model").attr("py_model");
+        }
     }
 
     RTP_LLM_LOG_INFO("init engine params success");
