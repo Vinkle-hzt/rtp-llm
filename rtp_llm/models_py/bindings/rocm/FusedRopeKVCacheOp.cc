@@ -52,6 +52,8 @@ CKAttnPtr FusedRopeKVCachePrefillOp::prepare(torch_ext::PyAttentionInputs attn_i
     attn_params->cu_seqlens     = cu_seqlens;
     attn_params->cu_kv_seqlens  = cu_kv_seqlens;
     attn_params->attn_type      = torchDTypeToDataType(attn_inputs.dtype);
+    attn_params->cu_seqlens     = attn_inputs.cu_seqlens;
+    attn_params->cu_kv_seqlens  = attn_inputs.cu_kv_seqlens;
     attn_params->max_seq_len    = attn_inputs.input_lengths.max().item<int32_t>();
     attn_params->padding_offset = attn_inputs.padding_offset;
 
@@ -331,8 +333,9 @@ CKAttnPtr FusedRopeKVCacheDecodeOp::prepare(torch_ext::PyAttentionInputs attn_in
 
     attn_params                            = CKAttnPtr(params, (CKAttn*)params.get());
     attn_params->decode_plan               = true;
-    attn_params->cu_seqlens                = cu_seqlens;
-    attn_params->cu_kv_seqlens             = cu_kv_seqlens;
+    attn_params->attn_type                 = torchDTypeToDataType(attn_inputs.dtype);
+    attn_params->cu_seqlens                = attn_inputs.cu_seqlens;
+    attn_params->cu_kv_seqlens             = attn_inputs.cu_kv_seqlens;
     attn_params->sequence_lengths          = attn_inputs.sequence_lengths;
     attn_params->kv_block_array.cache_type = attn_configs_.kv_cache_dtype;
     attn_params->input_lengths             = attn_inputs.input_lengths;

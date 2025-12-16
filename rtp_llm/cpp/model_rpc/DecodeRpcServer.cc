@@ -88,9 +88,9 @@ void DecodeRpcServer::allocateResource(DecodeGenerateContext& decode_context) {
     auto generate_stream              = engine_->makeStream(input);
     decode_context.request_timeout_ms = generate_stream->getTimeoutMs();
 
-    auto cache_manager = engine_->resourceContext().cache_manager;
-    auto reserve_block_num =
-        maga_init_params_.gpt_init_parameter.fifo_scheduler_config.scheduler_reserve_resource_ratio * cache_manager->totalBlocks() / 100;
+    auto cache_manager     = engine_->resourceContext().cache_manager;
+    auto reserve_block_num = maga_init_params_.gpt_init_parameter.fifo_scheduler_config.scheduler_reserve_resource_ratio
+                             * cache_manager->totalBlocks() / 100;
     auto current_blocks = cache_manager->availableBlockNums();
     if (current_blocks < reserve_block_num) {
         string error_msg = "request: [" + decode_context.request_key + "] malloc kv cache block failed at decode node, "
@@ -190,7 +190,24 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
         std::vector<int> propose_tokens;
         propose_tokens.assign(generate_request.propose_token_ids().begin(), generate_request.propose_token_ids().end());
         generate_stream->setProposeToken(propose_tokens);
+
+        auto device           = engine_->getDevice();
+        auto sp_output_buffer = std::make_shared<SpeculativeExecutorStreamOutput>();
+        auto propose_token =
+            device->allocateBuffer({DataType::TYPE_INT32, {1, propose_tokens.size()}, AllocationType::HOST});
+        memcpy(propose_token->data<int>(), propose_tokens.data(), propose_tokens.size() * sizeof(int));
+        sp_output_buffer->tokens = propose_token;
+
+        auto propose_probs_t  = QueryConverter::transTensor(generate_request.propose_probs());
+        auto propose_hidden_t = QueryConverter::transTensor(generate_request.propose_hidden());
+
+        auto& tensors_holder = sp_output_buffer->tensors_holder;
+        tensors_holder.emplace_back(std::move(propose_probs_t));
+        tensors_holder.emplace_back(std::move(propose_hidden_t));
+
+        generate_stream->setSPOutputBuffer(sp_output_buffer);
     }
+
     generate_stream->resetBeginTime(currentTimeUs());
     RTP_LLM_LOG_DEBUG(
         "decode init stream[%d]: %s", generate_stream->streamId(), generate_stream->debugString().c_str());

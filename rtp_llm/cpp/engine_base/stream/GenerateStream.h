@@ -35,6 +35,19 @@ struct StreamUpdateInfo {
     bool                     update_remote_generate = true;
     bool                     force_update_info      = false;
 };
+
+struct StreamSpecUpdateInfo {
+    const rtp_llm::BufferPtr new_tokens;
+    int                      num_new_tokens;
+
+    int                      draft_token;
+    const rtp_llm::BufferPtr draft_hidden_states;
+    const rtp_llm::BufferPtr draft_token_probs;
+
+    bool update_remote_generate = true;
+    bool force_update_info      = false;
+};
+
 struct SpeculativeExecutorStreamOutput {
 public:
     std::string debugString() const {
@@ -67,6 +80,9 @@ public:
     rtp_llm::BufferPtr loss          = nullptr;
     rtp_llm::BufferPtr all_probs     = nullptr;
     rtp_llm::BufferPtr softmax_probs = nullptr;
+
+    // hold tensors from grpc
+    std::vector<torch::Tensor> tensors_holder;
 };
 using SpeculativeExecutorStreamOutputPtr = std::shared_ptr<SpeculativeExecutorStreamOutput>;
 
@@ -89,11 +105,11 @@ public:
 
 public:
     void setIsDummyStream(bool is_dummy) {
-        is_dummy_stream = is_dummy;
+        is_dummy_stream_ = is_dummy;
     }
 
     bool isDummyStream() const {
-        return is_dummy_stream;
+        return is_dummy_stream_;
     }
 
     // Exported to python world.
@@ -106,10 +122,15 @@ public:
 
     virtual void updateOutput(const StreamUpdateInfo& update_info) = 0;
     void         update(const StreamUpdateInfo& update_info);
+    void         specUpdate(const StreamSpecUpdateInfo& update_info);
     bool         updateKvCacheBlocks(const rtp_llm::BufferPtr& src_batch_indices);
 
     virtual size_t scoreLen() const {
-        return 1;
+        return score_len_ == 0 ? 1 : score_len_;
+    }
+
+    void setScoreLen(size_t score_len) {
+        score_len_ = score_len;
     }
 
     // Only used in C++ world.
@@ -258,6 +279,9 @@ public:
     rtp_llm::BufferPtr   getSoftmaxProbs();
     StreamCacheResource& streamCacheResource();
     void                 setPerfTest(bool perf_test_);
+    bool                 isPerfTest() const {
+        return perf_test_;
+    }
 
     absl::Status releaseSequenceKVCache(size_t total_seq_len, size_t release_seq_len) {
         return stream_cache_resource_->releaseSequenceKVCache(total_seq_len, release_seq_len);
@@ -363,7 +387,7 @@ public:
         sp_edit_first_time_ = sp_edit_first_time;
     }
 
-    void setProposeToken(std::vector<int>& propose_token) {
+    void setProposeToken(const std::vector<int>& propose_token) {
         propose_token_ = propose_token;
     }
 
@@ -584,7 +608,7 @@ protected:
     // just for bool test
     bool perf_test_ = false;
     friend class StreamCacheResource;
-    bool is_dummy_stream = false;
+    bool is_dummy_stream_ = false;
 };
 
 typedef std::shared_ptr<GenerateStream> GenerateStreamPtr;
