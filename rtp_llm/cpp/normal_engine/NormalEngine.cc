@@ -383,7 +383,7 @@ absl::Status NormalEngine::step() {
         gen_timeline   = profiler_step_ > 0;
     }
     if (gen_timeline && nullptr == profiler_) {
-        auto stream_group = StreamGroups(streams);
+        auto stream_group = StreamGroups(streams, true);
         auto world_rank   = device_->getDeviceProperties().dp_rank * device_->getDeviceProperties().tp_size
                           + device_->getDeviceProperties().tp_rank;
         auto profiler_prefix = autil::StringUtil::formatString("normal_profiler_wr%d_b%d_s%d_prefill%d_",

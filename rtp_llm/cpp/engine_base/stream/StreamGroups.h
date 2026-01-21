@@ -13,7 +13,7 @@ namespace rtp_llm {
 
 struct StreamGroups {
 public:
-    StreamGroups(const std::list<GenerateStreamPtr>& streams) {
+    StreamGroups(const std::list<GenerateStreamPtr>& streams, bool skip_check = false) {
         for (auto& stream : streams) {
             auto cur_batch_size  = stream->currentBatchSize();
             auto next_batch_size = stream->nextBatchSize();
@@ -47,8 +47,11 @@ public:
             adapter_names.push_back(stream->adapterName());
             gen_timeline_ |= stream->genTimeline();
         }
-        RTP_LLM_CHECK_WITH_INFO(
-            !(streams.size() > 1 && is_fake_stream_), "streams.size()[%d] > 1 && is_fake_stream_", streams.size());
+
+        if (!skip_check) {
+            RTP_LLM_CHECK_WITH_INFO(
+                !(streams.size() > 1 && is_fake_stream_), "streams.size()[%d] > 1 && is_fake_stream_", streams.size());
+        }
     }
 
     size_t totalDecodeBatchSize() const {
