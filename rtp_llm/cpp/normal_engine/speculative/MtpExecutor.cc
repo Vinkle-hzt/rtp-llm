@@ -518,6 +518,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     if (propose_step_ > 1) {
         draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t);
+
+        device_->syncAndCheck();
     }
 
     maybePrintModelInput(model_input, "decode target model");
