@@ -12,39 +12,9 @@
 #include "rtp_llm/cpp/normal_engine/speculative/MtpBatchStreamProcessor.h"
 #include "rtp_llm/cpp/engine_base/ProposeModelEngineInitParams.h"
 #include "rtp_llm/cpp/normal_engine/speculative/SpeculativeSampler.h"
+#include "rtp_llm/cpp/normal_engine/speculative/SpeculativeUtil.h"
 
 namespace rtp_llm {
-
-struct MtpMetricsCollector {
-    RtpLLMExecutorMetricsCollector          executor_collector;
-    RtpLLMTokenPSMetricsCollector           tps_collector;
-    RtpLLMSpeculativeEngineMetricsCollector sp_engine_collector;
-
-    bool not_skip = false;
-};
-
-class MtpBufferHolder {
-public:
-    void hold(const GptModelInputs& model_input) {
-        host_buffers_holder_.push_back(model_input.combo_tokens);
-        host_buffers_holder_.push_back(model_input.input_lengths);
-        host_buffers_holder_.push_back(model_input.sequence_lengths);
-        host_buffers_holder_.push_back(model_input.lm_output_indexes);
-        host_buffers_holder_.push_back(model_input.prefix_lengths);
-    }
-
-    void hold(const BufferPtr& buffer) {
-        host_buffers_holder_.push_back(buffer);
-    }
-
-    void release() {
-        host_buffers_holder_.clear();
-    }
-
-private:
-    std::vector<BufferPtr> host_buffers_holder_;
-};
-
 class MtpExecutor: public Executor {
 public:
     explicit MtpExecutor(const EngineInitParams&                        params,
@@ -99,9 +69,9 @@ protected:
 
     void maybePrintModelInput(const GptModelInputs& model_input, const std::string& prefix) const;
 
-    absl::Status prefillStep(const std::list<GenerateStreamPtr>& streams, MtpMetricsCollector& metrics_collector);
+    absl::Status prefillStep(const std::list<GenerateStreamPtr>& streams, SpecMetricsCollectors& metrics_collector);
 
-    absl::Status decodeStep(const std::list<GenerateStreamPtr>& streams, MtpMetricsCollector& metrics_collector);
+    absl::Status decodeStep(const std::list<GenerateStreamPtr>& streams, SpecMetricsCollectors& metrics_collector);
 
     void draftModelDecode(GptModelInputs&             model_input,
                           const StreamGroups&         stream_groups,
@@ -134,7 +104,7 @@ private:
     std::unique_ptr<speculative::FastTopKSampler>    fast_topk_sampler_;
 
     // holder for host buffers to avoid early free before H2D copy kernel execution
-    MtpBufferHolder buffer_holder_;
+    ModelBufferHolder buffer_holder_;
 
     bool     warm_up_;
     RoleType role_type_;

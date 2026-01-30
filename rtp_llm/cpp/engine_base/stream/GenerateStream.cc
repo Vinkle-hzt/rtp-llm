@@ -791,11 +791,15 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
     }
 
     // update speculative output buffer
-    int  target_last_token = new_tokens->data<int>()[num_new_tokens - 1];
-    int* spec_tokens       = sp_output_buffer_->tokens->data<int>();
-    spec_tokens[0]         = target_last_token;
-    spec_tokens[1]         = update_info.draft_token;
-    propose_token_         = {target_last_token, update_info.draft_token};
+    if (update_info.draft_token != -1) {
+        int  target_last_token = new_tokens->data<int>()[num_new_tokens - 1];
+        int* spec_tokens       = sp_output_buffer_->tokens->data<int>();
+        spec_tokens[0]         = target_last_token;
+        spec_tokens[1]         = update_info.draft_token;
+        propose_token_         = {target_last_token, update_info.draft_token};
+    } else {
+        propose_token_ = {};
+    }
 
     sp_output_buffer_->hidden_states = update_info.draft_hidden_states;
     sp_output_buffer_->all_probs     = update_info.draft_token_probs;

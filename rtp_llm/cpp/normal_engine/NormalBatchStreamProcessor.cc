@@ -383,7 +383,7 @@ void NormalBatchStreamProcessor::setCommonSamplerInputs(SamplerInputs&          
     int32_t*  no_repeat_ngram_size = sampler_inputs.no_repeat_ngram_size->data<int32_t>();
     bool*     do_sample            = sampler_inputs.do_sample->data<bool>();
 
-    int  batch_idx       = 0;
+    int batch_idx = 0;
     for (auto& stream : all_streams) {
         int sampler_batch_size;
         if (score_batch) {
@@ -393,6 +393,11 @@ void NormalBatchStreamProcessor::setCommonSamplerInputs(SamplerInputs&          
         } else {
             sampler_batch_size = stream->currentBatchSize();
         }
+        int propose_step = 0;
+        if (stream->getSPOutputBuffer()) {
+            propose_step = stream->getSPOutputBuffer()->propose_step;
+        }
+
         if (sampler_inputs.cum_log_probs) {
             const auto& cum_log_probs = stream->cumLogProbs();
             memcpy(sampler_inputs.cum_log_probs->dataWithOffset<float>(batch_idx),
@@ -416,7 +421,7 @@ void NormalBatchStreamProcessor::setCommonSamplerInputs(SamplerInputs&          
                 top_p[batch_idx]       = 1;
                 temperature[batch_idx] = 1;
             }
-            no_repeat_ngram_size[batch_idx] = stream->generateConfig()->no_repeat_ngram_size.value_or(0);
+            no_repeat_ngram_size[batch_idx]     = stream->generateConfig()->no_repeat_ngram_size.value_or(0);
             sampler_inputs.generator[batch_idx] = stream->getGenerator();
             batch_idx += 1;
         }

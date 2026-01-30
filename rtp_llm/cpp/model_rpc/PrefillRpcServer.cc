@@ -285,29 +285,25 @@ void PrefillRpcServer::remoteGenerate(PrefillGenerateContext& prefill_context) {
             {context_position_ids->data<int32_t>(),
              context_position_ids->data<int32_t>() + context_position_ids->size()});
     }
-    if (engine_->isMTPEagle()) {
-        RTP_LLM_CHECK_WITH_INFO(stream->getProposeToken().size() > 0,
-                                "mtp remote generate propose token should not be empty");
-    }
+
     generate_request.mutable_propose_token_ids()->CopyFrom(
         {stream->getProposeToken().begin(), stream->getProposeToken().end()});
 
     auto sp_output_buffer = stream->getSPOutputBuffer();
 
     if (sp_output_buffer) {
-        if (sp_output_buffer->all_probs->where() == rtp_llm::MemoryType::MEMORY_GPU) {
-            sp_output_buffer->all_probs =
-                engine_->getDevice()->clone({*sp_output_buffer->all_probs, rtp_llm::AllocationType::HOST});
-        }
-        if (!sp_output_buffer->hidden_states) {
-            // dummy hidden states, so datatype is not important
-            sp_output_buffer->hidden_states = engine_->getDevice()->allocateBuffer(
-                {rtp_llm::DataType::TYPE_FP16, {0}, rtp_llm::AllocationType::HOST});
-        }
-        if (sp_output_buffer->hidden_states->where() == rtp_llm::MemoryType::MEMORY_GPU) {
-            sp_output_buffer->hidden_states =
-                engine_->getDevice()->clone({*sp_output_buffer->hidden_states, rtp_llm::AllocationType::HOST});
-        }
+        auto prepare_buffer = [](BufferPtr& buffer, DeviceBase* device) {
+            if (!buffer) {
+                buffer = device->allocateBuffer({rtp_llm::DataType::TYPE_FP16, {0}, rtp_llm::AllocationType::HOST});
+            }
+            if (buffer->where() == rtp_llm::MemoryType::MEMORY_GPU) {
+                buffer = device->clone({*buffer, rtp_llm::AllocationType::HOST});
+            }
+        };
+
+        prepare_buffer(sp_output_buffer->all_probs, engine_->getDevice());
+        prepare_buffer(sp_output_buffer->hidden_states, engine_->getDevice());
+
         QueryConverter::transTensorPB(generate_request.mutable_propose_probs(), sp_output_buffer->all_probs.get());
         QueryConverter::transTensorPB(generate_request.mutable_propose_hidden(), sp_output_buffer->hidden_states.get());
     }

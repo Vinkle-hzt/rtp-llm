@@ -908,28 +908,13 @@ void CudaDevice::chainSpeculativeSampling(const SpeculativeSamplingParams& param
 }
 
 void CudaDevice::rejectionSampling(const RejectionSamplingParams& params) {
-    RTP_LLM_CHECK(params.draft_probs_d.is_cuda());
-    RTP_LLM_CHECK(params.draft_token_ids_d.is_cuda());
     RTP_LLM_CHECK(params.target_probs_d.is_cuda());
 
-    RTP_LLM_CHECK(params.draft_probs_d.dtype() == torch::kFloat32);
-    RTP_LLM_CHECK(params.draft_token_ids_d.dtype() == torch::kInt32);
     RTP_LLM_CHECK(params.target_probs_d.dtype() == torch::kFloat32);
 
-    RTP_LLM_CHECK(params.draft_probs_d.dim() == 3);
-    RTP_LLM_CHECK(params.draft_token_ids_d.dim() == 2);
-    RTP_LLM_CHECK(params.target_probs_d.dim() == 3);
-
-    int batch_size             = params.draft_probs_d.size(0);
-    int num_speculative_tokens = params.draft_probs_d.size(1);
-    int target_vocab_size      = params.target_probs_d.size(2);
-    int target_token_stride    = params.target_token_ids_d.size(1);
-
-    RTP_LLM_CHECK(params.draft_token_ids_d.size(0) == batch_size);
-    RTP_LLM_CHECK(params.draft_token_ids_d.size(1) == num_speculative_tokens);
-    RTP_LLM_CHECK(params.target_probs_d.size(0) == batch_size);
-    RTP_LLM_CHECK(params.target_probs_d.size(1) == num_speculative_tokens + 1);
-    RTP_LLM_CHECK(params.draft_probs_d.size(2) == target_vocab_size);
+    int batch_size          = params.do_sample_d.size(0);
+    int target_vocab_size   = params.target_probs_d.size(-1);
+    int target_token_stride = params.target_token_ids_d.size(1);
 
     check_cuda_value(invokeRejectionSampling(params.draft_probs_d.data_ptr<float>(),
                                              params.draft_token_ids_d.data_ptr<int32_t>(),
@@ -941,7 +926,7 @@ void CudaDevice::rejectionSampling(const RejectionSamplingParams& params) {
                                              params.output_accepted_token_num_d.data_ptr<int32_t>(),
                                              params.do_sample_d.data_ptr<bool>(),
                                              batch_size,
-                                             num_speculative_tokens,
+                                             params.cu_num_spec_tokens_d.data_ptr<int32_t>(),
                                              target_vocab_size,
                                              stream_));
 }

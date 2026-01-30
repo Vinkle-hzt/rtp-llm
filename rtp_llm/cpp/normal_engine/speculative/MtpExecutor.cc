@@ -265,7 +265,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
  * @return absl::Status
  */
 absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& streams,
-                                      MtpMetricsCollector&                metrics_collector) {
+                                      SpecMetricsCollectors&              metrics_collector) {
     RtpLLMExecutorMetricsCollector& executor_collector = metrics_collector.executor_collector;
     RtpLLMTokenPSMetricsCollector&  tps_collector      = metrics_collector.tps_collector;
 
@@ -441,7 +441,7 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
 */
 
 absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams,
-                                     MtpMetricsCollector&                metrics_collector) {
+                                     SpecMetricsCollectors&              metrics_collector) {
     RtpLLMExecutorMetricsCollector&          executor_collector  = metrics_collector.executor_collector;
     RtpLLMTokenPSMetricsCollector&           tps_collector       = metrics_collector.tps_collector;
     RtpLLMSpeculativeEngineMetricsCollector& sp_engine_collector = metrics_collector.sp_engine_collector;
@@ -559,6 +559,14 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             speculative_sampler_output.accept_tokens   = {std::move(accept_tokens)};
             device_->syncAndCheck();
         } else {
+            // prepare cu_num_spec_tokens_host
+            BufferPtr cu_num_spec_tokens_host =
+                device_->allocateBuffer({DataType::TYPE_INT32, {batch_size + 1}, AllocationType::HOST});
+            for (int i = 0; i < batch_size + 1; i++) {
+                cu_num_spec_tokens_host->data<int32_t>()[i] = propose_step_ * i;
+            }
+            buffer_holder_.hold(cu_num_spec_tokens_host);
+
             // target model sample
             CHECK_AND_RETURN_REF(
                 sampler_input,
@@ -567,7 +575,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             sampler_output.all_probs->updateShape({batch_size, propose_step_ + 1, vocab_size_});
 
             // rejection sampling
-            speculative_sampler_output = speculative_sampler_->forward(streams, draft_sampler_output, sampler_output);
+            speculative_sampler_output =
+                speculative_sampler_->forward(streams, draft_sampler_output, sampler_output, cu_num_spec_tokens_host);
         }
         // NOTE: here will have cuda device sync before update model input
         batch_stream_processor_->updateDecodePostDraftModelInput(
@@ -661,7 +670,7 @@ void MtpExecutor::prepareStreams(const std::list<GenerateStreamPtr>& streams,
 }
 
 absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
-    MtpMetricsCollector metrics_collector;
+    SpecMetricsCollectors metrics_collector;
 
     std::list<GenerateStreamPtr> prefill_streams;
     std::list<GenerateStreamPtr> decode_streams;

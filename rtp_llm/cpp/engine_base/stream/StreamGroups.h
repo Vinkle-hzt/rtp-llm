@@ -97,6 +97,17 @@ public:
         return total_score_batch_size_;
     }
 
+    size_t totalProposeTokens() const {
+        size_t total_propose_tokens = 0;
+        for (auto& stream : allStreams()) {
+            auto sp_output_buffer = stream->getSPOutputBuffer();
+            if (sp_output_buffer) {
+                total_propose_tokens += sp_output_buffer->propose_step;
+            }
+        }
+        return total_propose_tokens;
+    }
+
     bool empty() const {
         return context_streams_.empty() && decode_streams_.empty();
     }

@@ -230,7 +230,7 @@ __global__ void rejection_sampling_kernel(DType*  draft_probs,
                                           IdType* output_accepted_token_num,
                                           bool*   do_sample,
                                           int     batch_size,
-                                          int     num_speculative_tokens,
+                                          int*    cu_num_spec_tokens,
                                           int     target_vocab_size) {
     const uint32_t bx = blockIdx.x, tx = threadIdx.x;
     const uint32_t row_idx = bx;
@@ -244,21 +244,25 @@ __global__ void rejection_sampling_kernel(DType*  draft_probs,
         return;
     }
 
-    bool all_same_token = true;
-    int  pos            = num_speculative_tokens;
-    for (int i = 0; i < num_speculative_tokens; ++i) {
-        IdType draft_id  = draft_token_ids[row_idx * num_speculative_tokens + i];
-        IdType target_id = target_token_ids[(row_idx * (num_speculative_tokens + 1) + i) * target_token_stride
-                                            + target_token_stride - 1];
+    bool all_same_token         = true;
+    int  num_speculative_tokens = cu_num_spec_tokens[row_idx + 1] - cu_num_spec_tokens[row_idx];
+    int  pos                    = num_speculative_tokens;
 
-        float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * target_vocab_size + draft_id],
-              p = draft_probs[(row_idx * num_speculative_tokens + i) * target_vocab_size + draft_id];
-        DType u = uniform_samples[row_idx * (num_speculative_tokens + 1) + i];
+    int draft_offset  = cu_num_spec_tokens[row_idx];
+    int target_offset = draft_offset + row_idx;
+
+    for (int i = 0; i < num_speculative_tokens; ++i) {
+        IdType draft_id  = draft_token_ids[draft_offset + i];
+        IdType target_id = target_token_ids[(target_offset + i) * target_token_stride + target_token_stride - 1];
+
+        float q = target_probs[(target_offset + i) * target_vocab_size + draft_id],
+              p = draft_probs[(draft_offset + i) * target_vocab_size + draft_id];
+        DType u = uniform_samples[target_offset + i];
 
         bool same_token = target_id == draft_id;
         if (same_token || (do_sample[row_idx] && u * p < q)) {
-            output_token_ids[row_idx * (num_speculative_tokens + 1) + i] = draft_id;
-            all_same_token                                               = all_same_token && same_token;
+            output_token_ids[target_offset + i] = draft_id;
+            all_same_token                      = all_same_token && same_token;
         } else {
             pos = i;
             break;
@@ -270,9 +274,8 @@ __global__ void rejection_sampling_kernel(DType*  draft_probs,
     }
 
     if (all_same_token) {
-        IdType bonus_token_id = target_token_ids[(row_idx * (num_speculative_tokens + 1) + pos) * target_token_stride
-                                                 + target_token_stride - 1];
-        output_token_ids[row_idx * (num_speculative_tokens + 1) + pos] = bonus_token_id;
+        IdType bonus_token_id = target_token_ids[(target_offset + pos) * target_token_stride + target_token_stride - 1];
+        output_token_ids[target_offset + pos] = bonus_token_id;
         return;
     }
 
@@ -284,12 +287,12 @@ __global__ void rejection_sampling_kernel(DType*  draft_probs,
         q_vec.fill(DType(0));
         p_vec.fill(DType(0));
         if ((i * BLOCK_THREADS + tx) * VEC_SIZE < target_vocab_size) {
-            q_vec.load(target_probs + (row_idx * (num_speculative_tokens + 1) + pos) * target_vocab_size
-                       + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+            q_vec.load(target_probs + (target_offset + pos) * target_vocab_size + i * BLOCK_THREADS * VEC_SIZE
+                       + tx * VEC_SIZE);
             if (pos != num_speculative_tokens) {
                 // there is no draft_probs for the bonus token
-                p_vec.load(draft_probs + (row_idx * num_speculative_tokens + pos) * target_vocab_size
-                           + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+                p_vec.load(draft_probs + (draft_offset + pos) * target_vocab_size + i * BLOCK_THREADS * VEC_SIZE
+                           + tx * VEC_SIZE);
             }
         }
 #pragma unroll
@@ -307,20 +310,19 @@ __global__ void rejection_sampling_kernel(DType*  draft_probs,
     temp_storage.sampled_id = target_vocab_size - 1;
     __syncthreads();
     sum_relu_q_minus_p = temp_storage.block_aggregate.value;
-    DType u            = uniform_samples[row_idx * (num_speculative_tokens + 1) + min(pos + 1, num_speculative_tokens)]
-              * sum_relu_q_minus_p;
+    DType u            = uniform_samples[target_offset + min(pos + 1, num_speculative_tokens)] * sum_relu_q_minus_p;
 
     DType aggregate_relu_q_minus_p(0);
     for (uint32_t i = 0; i < flashinfer::ceil_div(target_vocab_size, BLOCK_THREADS * VEC_SIZE); ++i) {
         q_vec.fill(DType(0));
         p_vec.fill(DType(0));
         if ((i * BLOCK_THREADS + tx) * VEC_SIZE < target_vocab_size) {
-            q_vec.load(target_probs + (row_idx * (num_speculative_tokens + 1) + pos) * target_vocab_size
-                       + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+            q_vec.load(target_probs + (target_offset + pos) * target_vocab_size + i * BLOCK_THREADS * VEC_SIZE
+                       + tx * VEC_SIZE);
             if (pos != num_speculative_tokens) {
                 // there is no draft_probs for the bonus token
-                p_vec.load(draft_probs + (row_idx * num_speculative_tokens + pos) * target_vocab_size
-                           + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+                p_vec.load(draft_probs + (draft_offset + pos) * target_vocab_size + i * BLOCK_THREADS * VEC_SIZE
+                           + tx * VEC_SIZE);
             }
         }
 
@@ -344,13 +346,13 @@ __global__ void rejection_sampling_kernel(DType*  draft_probs,
     }
     __syncthreads();
     // set the first rejected token
-    output_token_ids[row_idx * (num_speculative_tokens + 1) + pos] = temp_storage.sampled_id;
+    output_token_ids[target_offset + pos] = temp_storage.sampled_id;
     // move to the next token
     pos++;
 
     // pad remaining tokens with -1
     for (; pos < num_speculative_tokens + 1; ++pos) {
-        output_token_ids[row_idx * (num_speculative_tokens + 1) + pos] = -1;
+        output_token_ids[target_offset + pos] = -1;
     }
 }
 
@@ -365,7 +367,7 @@ cudaError_t invokeRejectionSampling(DType*       draft_probs,
                                     IdType*      output_accepted_token_num,
                                     bool*        do_sample,
                                     int          batch_size,
-                                    int          num_speculative_tokens,
+                                    int*         cu_num_spec_tokens,
                                     int          target_vocab_size,
                                     cudaStream_t stream) {
     if (batch_size == 0) {
@@ -389,7 +391,7 @@ cudaError_t invokeRejectionSampling(DType*       draft_probs,
                     &output_accepted_token_num,
                     &do_sample,
                     &batch_size,
-                    &num_speculative_tokens,
+                    &cu_num_spec_tokens,
                     &target_vocab_size};
 
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
@@ -412,7 +414,7 @@ cudaError_t invokeRejectionSampling(DType*       draft_probs,
                                                  IdType*      output_accepted_token_num,                               \
                                                  bool*        do_sample,                                               \
                                                  int          batch_size,                                              \
-                                                 int          num_speculative_tokens,                                  \
+                                                 int*         num_speculative_tokens,                                  \
                                                  int          target_vocab_size,                                       \
                                                  cudaStream_t stream);
 

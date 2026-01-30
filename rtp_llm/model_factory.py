@@ -359,13 +359,17 @@ class ModelFactory:
             return None
 
         if sp_config.use_new_sp_engine:
-            # only support mtp and eagle
-            if sp_config.type not in [SpeculativeType.MTP, SpeculativeType.EAGLE]:
+            # only support mtp/eagle/deterministic
+            if sp_config.type not in [
+                SpeculativeType.MTP,
+                SpeculativeType.EAGLE,
+                SpeculativeType.DETERMINISTIC,
+            ]:
                 logging.error(
-                    f"use_new_sp_engine only support mtp and eagle, but got {sp_config.type.name}"
+                    f"use_new_sp_engine only support mtp/eagle/deterministic, but got {sp_config.type.name}"
                 )
                 raise ValueError(
-                    f"use_new_sp_engine only support mtp and eagle, but got {sp_config.type.name}"
+                    f"use_new_sp_engine only support mtp/eagle/deterministic, but got {sp_config.type.name}"
                 )
 
         # Create ModelArgs for propose model (reuse main model args, but override ckpt_path)

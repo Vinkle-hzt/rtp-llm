@@ -1,34 +1,23 @@
-#include <memory>
-#include <vector>
-
-#include "rtp_llm/cpp/speculative_engine/propose_executor/DeterministicExecutor.h"
-#include "rtp_llm/cpp/speculative_engine/propose_executor/ProposeStream.h"
-#include "rtp_llm/cpp/core/torch_utils/BufferTorchUtils.h"
+#include "rtp_llm/cpp/normal_engine/speculative/LookaheadProposer.h"
 
 namespace rtp_llm {
+void LookaheadProposer::forward(const std::list<GenerateStreamPtr>& streams,
+                                GptModelInputs&                     model_input,
+                                SpecMetricsCollectors&              metrics_collector) {
+    buffer_holder_.release();
 
-absl::Status DeterministicExecutor::propose(const std::list<GenerateStreamPtr>& streams, bool skip_check) {
-    for (auto& stream : streams) {
-        if (!skip_check) {
-            if (stream->finishedWithoutLock() || stream->stoppedWithoutLock()) {
-                continue;
-            }
-        }
-
-        if (!stream->containProposeStream()) {
-            GenerateStreamPtr propose_stream = std::make_shared<ProposeStream>(*stream, 0);
-            stream->setProposeStream(propose_stream);
-        }
+    // select tokens for each stream
+    for (const auto& stream : streams) {
+        // TODO(huzetao.hzt): can use multi thread to speed up
         ruleBasedTokenSelector(stream);
     }
-    return absl::OkStatus();
 }
 
-void DeterministicExecutor::ruleBasedTokenSelector(const GenerateStreamPtr& stream) {
+void LookaheadProposer::ruleBasedTokenSelector(const GenerateStreamPtr& stream) {
     auto& config               = stream->generateConfig();
     bool  use_sp_advice_prompt = config->sp_advice_prompt_token_ids.size() > 0;
 
-    SpeculativeExecutorStreamOutputPtr stream_output = stream->getProposeStream()->getSPOutputBuffer();
+    SpeculativeExecutorStreamOutputPtr stream_output = stream->getSPOutputBuffer();
     stream_output->propose_step                      = 0;
     stream_output->tokens                            = nullptr;
     stream_output->all_probs                         = nullptr;
@@ -43,11 +32,13 @@ void DeterministicExecutor::ruleBasedTokenSelector(const GenerateStreamPtr& stre
     if (stream_output->tokens == nullptr && use_sp_advice_prompt) {
         PromptLookUpTokenSelector(stream, stream_output, false);
     }
+
+    postProcess(stream, stream_output);
 }
 
-void DeterministicExecutor::SpEditTokenSelector(const GenerateStreamPtr&            stream,
-                                                SpeculativeExecutorStreamOutputPtr& stream_output,
-                                                bool                                use_sp_advice_prompt) {
+void LookaheadProposer::SpEditTokenSelector(const GenerateStreamPtr&            stream,
+                                            SpeculativeExecutorStreamOutputPtr& stream_output,
+                                            bool                                use_sp_advice_prompt) {
     auto&  config           = stream->generateConfig();
     size_t advice_token_num = 0;
     int*   advice_token_ids = nullptr;
@@ -71,7 +62,6 @@ void DeterministicExecutor::SpEditTokenSelector(const GenerateStreamPtr&        
                                                                   advice_token_ids + begin_propose_offset);
         stream->setSpEditFirstTime(false);
         stream->setSpEditRun(true);
-        postProcess(stream, stream_output);
     } else if (min_token_match_len_ <= seq_len) {
         size_t begin_match_len = std::min(max_token_match_len_, seq_len);
 
@@ -96,7 +86,6 @@ void DeterministicExecutor::SpEditTokenSelector(const GenerateStreamPtr&        
                                                                               std::vector{1, propose_len},
                                                                               advice_token_ids + start_propose_index);
                     stream->setSpEditRun(true);
-                    postProcess(stream, stream_output);
                     return;
                 }
             }
@@ -104,9 +93,9 @@ void DeterministicExecutor::SpEditTokenSelector(const GenerateStreamPtr&        
     }
 }
 
-void DeterministicExecutor::PromptLookUpTokenSelector(const GenerateStreamPtr&            stream,
-                                                      SpeculativeExecutorStreamOutputPtr& stream_output,
-                                                      bool                                use_sp_advice_prompt) {
+void LookaheadProposer::PromptLookUpTokenSelector(const GenerateStreamPtr&            stream,
+                                                  SpeculativeExecutorStreamOutputPtr& stream_output,
+                                                  bool                                use_sp_advice_prompt) {
     auto&  config           = stream->generateConfig();
     size_t advice_token_num = 0;
     int*   advice_token_ids = nullptr;
@@ -142,7 +131,6 @@ void DeterministicExecutor::PromptLookUpTokenSelector(const GenerateStreamPtr&  
                                                                               rtp_llm::DataType::TYPE_INT32,
                                                                               std::vector{1, propose_len},
                                                                               advice_token_ids + start_propose_index);
-                    postProcess(stream, stream_output);
                     return;
                 }
             }
@@ -150,15 +138,17 @@ void DeterministicExecutor::PromptLookUpTokenSelector(const GenerateStreamPtr&  
     }
 }
 
-void DeterministicExecutor::postProcess(const GenerateStreamPtr&            stream,
-                                        SpeculativeExecutorStreamOutputPtr& stream_output) {
-    RTP_LLM_LOG_DEBUG("RuleBasedTokenSelector select tokens %d num",
-                      stream_output->tokens == nullptr ? 0 : stream_output->tokens->size());
+void LookaheadProposer::postProcess(const GenerateStreamPtr&            stream,
+                                    SpeculativeExecutorStreamOutputPtr& stream_output) {
+    size_t propose_step = stream_output->tokens ? stream_output->tokens->size() : 0;
+    stream->setScoreLen(propose_step + 1);
+
+    RTP_LLM_LOG_DEBUG("RuleBasedTokenSelector select tokens %d num", propose_step);
+
     if (!stream_output->tokens) {
         return;
     }
 
-    size_t propose_step         = stream_output->tokens->size();
     stream_output->propose_step = propose_step;
     size_t vocab_size           = stream->vocabSize();
     auto   all_probs            = device_->allocateBuffer(
@@ -167,7 +157,9 @@ void DeterministicExecutor::postProcess(const GenerateStreamPtr&            stre
     for (size_t i = 0; i < propose_step; i++) {
         *(all_probs->view(i, 1).dataWithOffset<float>(*stream_output->tokens->dataWithOffset<int32_t>(i))) = 1.0;
     }
+
+    buffer_holder_.hold(all_probs);
     stream_output->all_probs = device_->clone({*all_probs, rtp_llm::AllocationType::DEVICE, {"all_probs"}});
 }
 
-};  // namespace rtp_llm
+}  // namespace rtp_llm

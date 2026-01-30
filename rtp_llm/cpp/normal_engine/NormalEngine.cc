@@ -14,6 +14,7 @@
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "autil/TimeUtility.h"
 #include "rtp_llm/cpp/normal_engine/speculative/MtpExecutor.h"
+#include "rtp_llm/cpp/normal_engine/speculative/LookaheadExecutor.h"
 #include <memory>
 #include <thread>
 #include <random>
@@ -75,8 +76,21 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
 void NormalEngine::initExecutor(const EngineInitParams&                        params,
                                 std::unique_ptr<ProposeModelEngineInitParams>& propose_params) {
     if (propose_params_) {
-        executor_.reset(
-            new MtpExecutor(params, propose_params, resource_context_.cache_manager, device_, getLoraManager()));
+        switch (propose_params_->sp_type) {
+            case SP_TYPE_MTP:
+            case SP_TYPE_EAGLE:
+                executor_.reset(new MtpExecutor(
+                    params, propose_params, resource_context_.cache_manager, device_, getLoraManager()));
+                break;
+            case SP_TYPE_DETERMINISTIC:
+                executor_.reset(new LookaheadExecutor(
+                    params, propose_params, resource_context_.cache_manager, device_, getLoraManager()));
+                break;
+            default:
+                RTP_LLM_FAIL("invalid sp_type: %s",
+                             SpeculativeExecutionConfig::to_string(propose_params_->sp_type).c_str());
+                break;
+        }
     } else {
         executor_.reset(new NormalExecutor(params, resource_context_.cache_manager, device_, getLoraManager()));
     }

@@ -40,13 +40,15 @@ public:
 
     virtual SpeculativeSamplerOutput forward(const std::list<GenerateStreamPtr>& streams,
                                              SamplerOutput&                      draft_sampler_output,
-                                             SamplerOutput&                      target_sampler_output);
+                                             SamplerOutput&                      target_sampler_output,
+                                             BufferPtr                           cu_num_spec_tokens_host);
 
 private:
     void batchSample(SpeculativeSamplerOutput&           sample_output,
                      const std::list<GenerateStreamPtr>& streams,
                      SamplerOutput&                      draft_sampler_output,
-                     SamplerOutput&                      target_sampler_output) const;
+                     SamplerOutput&                      target_sampler_output,
+                     BufferPtr                           cu_num_spec_tokens_host) const;
     void streamSample(SpeculativeSamplerOutput&           sample_output,
                       const std::list<GenerateStreamPtr>& streams,
                       SamplerOutput&                      draft_sampler_output,
