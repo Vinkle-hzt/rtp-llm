@@ -318,6 +318,13 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
             model_input.kv_cache_layer_to_group->slice(model_input.kv_cache_layer_to_group->shape()[0] - 1, 1, false);
     }
 
+    if (isTpRank0()) {
+        std::cout << "draft_kv_cache_layer_to_group = " << Buffer2torchTensor(model_input.kv_cache_layer_to_group)
+                  << "\n"
+                  << "target_kv_cache_group_types = " << Buffer2torchTensor(model_input.kv_cache_group_types) << "\n"
+                  << "block_ids = " << Buffer2torchTensor(model_input.kv_cache_block_id) << std::endl;
+    }
+
     // target model prefill
     {
         maybePrintModelInput(model_input, "prefill target model");
@@ -545,13 +552,28 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     if (propose_step_ > 1) {
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
+
+        if (isTpRank0()) {
+            std::cout << "draft_kv_cache_layer_to_group = " << Buffer2torchTensor(model_input.kv_cache_layer_to_group)
+                      << "\n"
+                      << "target_kv_cache_group_types = " << Buffer2torchTensor(model_input.kv_cache_group_types)
+                      << "\n"
+                      << "block_ids = " << Buffer2torchTensor(model_input.kv_cache_block_id) << std::endl;
+        }
+
         draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t);
         model_input.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
     }
 
     maybePrintModelInput(model_input, "decode target model");
 
-    model_input.is_target_verify        = true;
+    model_input.is_target_verify = true;
+    if (isTpRank0()) {
+        std::cout << "draft_kv_cache_layer_to_group = " << Buffer2torchTensor(model_input.kv_cache_layer_to_group)
+                  << "\n"
+                  << "target_kv_cache_group_types = " << Buffer2torchTensor(model_input.kv_cache_group_types) << "\n"
+                  << "block_ids = " << Buffer2torchTensor(model_input.kv_cache_block_id) << std::endl;
+    }
     model_output                        = std::move(model_->forward(model_input));
     model_input.is_target_verify        = false;
     model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;

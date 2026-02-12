@@ -616,6 +616,12 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
             auto        block_num = block_ids.size();
             size_t      model_id  = maga_init_params_.model_id;
 
+            std::stringstream ss;
+            for (size_t block_id : block_ids) {
+                ss << block_id << " ";
+            }
+            std::cout << "layer_id = " << layer_id << ", group_id = " << gid << "block_ids = " << ss.str() << std::endl;
+
             // Hybrid cache: Linear group only needs the last block; Full group needs all blocks.
             std::vector<size_t> block_pos_list;
             block_pos_list.reserve(block_num);
@@ -654,6 +660,7 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                     RTP_LLM_CHECK_WITH_INFO(block.addr != nullptr, "null block addr for key=%s", key.c_str());
                     RTP_LLM_CHECK_WITH_INFO(block.size_bytes > 0, "zero block size for key=%s", key.c_str());
                     std::shared_ptr<void> addr(block.addr, [](void*) {});
+                    std::cout << "DecodeRpcServer::loadCache: addBufBlock key = " << key << std::endl;
                     load_layer_cache->addBlock(key, addr, static_cast<uint32_t>(block.size_bytes), true, true);
                 };
 
@@ -706,6 +713,7 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
 
                     for (size_t layer_id = 0; layer_id < layer_num; layer_id++) {
                         auto request_key = std::to_string(load_context.request_id) + "-" + std::to_string(layer_id);
+                        std::cout << "DecodeRpcServer::loadCache: request_key = " << request_key << std::endl;
                         auto load_layer_cache =
                             std::make_shared<RequestBlockBuffer>(std::to_string(load_context.request_id), request_key);
                         size_t     gid            = 0;
@@ -759,6 +767,7 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                         for (size_t block_pos : block_pos_list) {
                             auto cache_key =
                                 makeCacheKey(model_id, std::to_string(load_context.cache_keys[block_pos]), layer_id);
+                            std::cout << "DecodeRpcServer::loadCache: mtp cache_key = " << cache_key << std::endl;
                             auto       block_id       = block_ids[block_pos];
                             const bool mtp_use_mla    = mtp_cache_cfg.use_mla;
                             const int  local_part_cnt = peer_cnt;
@@ -771,10 +780,14 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                                     block.addr != nullptr, "null block addr for key=%s", key.c_str());
                                 RTP_LLM_CHECK_WITH_INFO(
                                     block.size_bytes > 0, "zero block size for key=%s", key.c_str());
+                                std::cout << "DecodeRpcServer::loadCache: addBufBlock key = " << key << std::endl;
                                 std::shared_ptr<void> addr(block.addr, [](void*) {});
                                 load_layer_cache->addBlock(
                                     key, addr, static_cast<uint32_t>(block.size_bytes), true, true);
                             };
+
+                            std::cout << "mtp_use_mla = " << mtp_use_mla << ", mtp_use_hybrid = " << mtp_use_hybrid
+                                      << std::endl;
 
                             if (mtp_use_mla || mtp_use_hybrid) {
                                 RTP_LLM_CHECK_WITH_INFO(parts.size() == 1 || parts.size() == 2,

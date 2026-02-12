@@ -295,22 +295,12 @@ bool CudaGraphRunner::canRun(PyModelInputs& inputs) {
     // 1. prefix_lengths is not empty
     // 2. all values in input_lengths are the same
     // this is for 2.2.1
-    if (!is_prefill_cuda_graph_mode_ && inputs.attention_inputs.prefix_lengths.defined()
-        && inputs.attention_inputs.prefix_lengths.numel() > 0
-        && inputs.attention_inputs.prefix_lengths.data_ptr<int>()[0] > 0) {
-        // Check if all input_lengths are the same (input_lengths is pin memory)
-        auto input_lengths_cpu = inputs.attention_inputs.input_lengths;
-        int  valid_value       = num_tokens_per_bs_;
-        bool all_same          = true;
-        for (int i = 0; i < input_lengths_cpu.size(0); i++) {
-            if (input_lengths_cpu[i].item<int>() != valid_value) {
-                all_same = false;
-                break;
-            }
-        }
-        if (all_same && num_tokens_per_bs_ > 1) {
+    if (use_speculative_decoding_) {
+        if (inputs.attention_inputs.is_target_verify) {
             tryGetRealGraphDecodeBatchSize(inputs);
             return true;
+        } else {
+            return false;
         }
     }
 
@@ -367,6 +357,8 @@ int CudaGraphRunner::getCurrentRealGraphBs() {
 }
 
 void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_bs, int num_tokens_per_bs) {
+    inputs.attention_inputs.is_target_verify = use_speculative_decoding_;
+
     // input_ids [tokens_nums] = [batch_size * num_tokens_per_bs]
     inputs.input_ids = torch::zeros({max_num_token_}, options_cuda_int32_);
     // input_lengths [batch_size, int32] (decode only)
@@ -378,7 +370,7 @@ void CudaGraphRunner::initCaptureAttentionInputs(PyModelInputs& inputs, int max_
     inputs.attention_inputs.sequence_lengths = inputs.attention_inputs.sequence_lengths.pin_memory();
 
     const int64_t max_blocks =
-        static_cast<int64_t>(((max_seq_len_ + seq_size_per_block_ - 1) / seq_size_per_block_) + 1);
+        static_cast<int64_t>(((max_seq_len_ + seq_size_per_block_ - 1) / seq_size_per_block_) + num_tokens_per_bs_ - 1);
     // kv_cache_block_id_device [batch_size, block_num]
     inputs.attention_inputs.kv_cache_block_id_device = torch::zeros({int(max_bs_), max_blocks}, options_cuda_int32_);
 

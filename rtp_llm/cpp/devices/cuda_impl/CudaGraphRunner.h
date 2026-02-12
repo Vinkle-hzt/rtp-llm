@@ -18,7 +18,8 @@ public:
                     py::object              py_instance,
                     c10::ScalarType         model_data_type,
                     int                     num_tokens_per_bs,
-                    bool                    is_prefill_cuda_graph_mode = false):
+                    bool                    is_prefill_cuda_graph_mode = false,
+                    bool                    use_speculative_decoding   = false):
         GraphBase(std::move(py_instance)),
         enable_cuda_graph_(params.hw_kernel_config.enable_cuda_graph),
         is_prefill_cuda_graph_mode_(is_prefill_cuda_graph_mode),
@@ -32,7 +33,8 @@ public:
         decode_capture_batch_sizes_(params.hw_kernel_config.decode_capture_batch_sizes),
         model_data_type_(model_data_type),
         kv_cache_layer_to_group_(params.kv_cache_layer_to_group),
-        kv_cache_group_num_(params.kv_cache_group_num) {
+        kv_cache_group_num_(params.kv_cache_group_num),
+        use_speculative_decoding_(use_speculative_decoding) {
         py::gil_scoped_acquire gil;
         if (!py_instance_ || py_instance_.is_none()) {
             throw std::runtime_error("CudaGraphRunner constructor: Python instance is null or none.");
@@ -49,7 +51,7 @@ public:
         options_cuda_float_   = torch::TensorOptions().dtype(model_data_type).device(torch::kCUDA).requires_grad(false);
         RTP_LLM_LOG_INFO("Initialize CudaGraphRunner with parameters below: \n \
             enable_cuda_graph_: %d, max_bs_: %d, enable_cuda_graph_debug_mode_: %d, max_seq_len_: %d, seq_size_per_block_: %d, \
-            hidden_size_: %d, num_tokens_per_bs_: %d, is_prefill_cuda_graph_mode_: %d",
+            hidden_size_: %d, num_tokens_per_bs_: %d, is_prefill_cuda_graph_mode_: %d, use_speculative_decoding_: %d",
                          enable_cuda_graph_,
                          max_bs_,
                          enable_cuda_graph_debug_mode_,
@@ -57,7 +59,8 @@ public:
                          seq_size_per_block_,
                          hidden_size_,
                          num_tokens_per_bs_,
-                         is_prefill_cuda_graph_mode_);
+                         is_prefill_cuda_graph_mode_,
+                         use_speculative_decoding_);
     }
 
     ~CudaGraphRunner() {
@@ -135,6 +138,8 @@ private:
 
     std::vector<int32_t> kv_cache_layer_to_group_;
     int32_t              kv_cache_group_num_ = 0;
+
+    bool use_speculative_decoding_{false};
 
     // event to record forward done
     torch::Event forward_event_ = torch::Event(torch::kCUDA);
