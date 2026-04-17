@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/normal_engine/speculative/SpeculativeSampler.h"
 #include "rtp_llm/cpp/core/ExecOps.h"
 #include "rtp_llm/cpp/utils/DebugUtils.h"
+#include "rtp_llm/cpp/utils/ProfilingScope.h"
 
 namespace rtp_llm {
 namespace speculative {
@@ -18,6 +19,9 @@ FastTopKSamplerOutput FastTopKSampler::forward(const torch::Tensor& logits, int 
 
     output.token_ids = std::get<1>(sample_res);
 
+    int batch_size = output.token_ids.size(0);
+    execMappingDraft2Target({output.token_ids, d2t_map_, batch_size, 0, 1});
+
     return output;
 }
 
@@ -34,6 +38,7 @@ void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&           sample_
                                      const std::list<GenerateStreamPtr>& streams,
                                      SamplerOutput&                      draft_sampler_output,
                                      SamplerOutput&                      target_sampler_output) const {
+    RTP_LLM_PROFILE_SCOPE("speculative_sampler.batchSample");
     torch::Device target_device = getTorchCudaDevice();
     torch::Device host_device   = torch::Device(torch::kCPU);
 
@@ -53,10 +58,21 @@ void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&           sample_
     auto draft_token_probs  = draft_sampler_output.all_probs;
     auto target_token_probs = target_sampler_output.all_probs;
 
-    // prepare data for chain speculative sampling
-    auto          draft_token_ids_d_t    = draft_token_ids.to(target_device).clone();
-    auto          draft_token_probs_d_t  = draft_token_probs;
-    auto          target_token_probs_d_t = target_token_probs;
+    auto draft_token_ids_d_t = draft_token_ids.to(target_device, true);
+
+    auto target_token_ids_d_t = target_sampler_output.token_ids;
+    if (!target_token_ids_d_t.is_cuda()) {
+        target_token_ids_d_t = target_token_ids_d_t.to(target_device, true);
+    }
+
+    torch::Tensor do_sample  = torch::zeros({(long)batch_size}, torch::TensorOptions().dtype(torch::kBool));
+    int           stream_idx = 0;
+    for (const GenerateStreamPtr& stream : streams) {
+        do_sample[stream_idx] = !stream->generateConfig()->top1();
+        stream_idx++;
+    }
+    auto do_sample_d = do_sample.to(target_device, true);
+
     auto          rand_options           = torch::TensorOptions().device(target_device).dtype(torch::kFloat);
     torch::Tensor uniform_samples_d      = torch::rand({(long)batch_size, (long)propose_step_ + 1}, rand_options);
 
@@ -72,59 +88,80 @@ void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&           sample_
             idx++;
         }
     }
-    torch::Tensor output_token_ids_d     = torch::zeros({(long)batch_size, (long)propose_step_ + 1},
-                                                    torch::TensorOptions().device(target_device).dtype(torch::kInt32));
-    torch::Tensor output_accepted_token_num_d =
-        torch::zeros({(long)batch_size}, torch::TensorOptions().device(target_device).dtype(torch::kInt32));
-    torch::Tensor output_emitted_token_num_d =
-        torch::zeros({(long)batch_size}, torch::TensorOptions().device(target_device).dtype(torch::kInt32));
 
-    execChainSpeculativeSampling({draft_token_probs_d_t,
-                                  draft_token_ids_d_t,
-                                  uniform_samples_d,
-                                  target_token_probs_d_t,
-                                  output_token_ids_d,
-                                  output_accepted_token_num_d,
-                                  output_emitted_token_num_d});
+    auto          draft_token_probs_d_t  = draft_token_probs;
+    auto          target_token_probs_d_t = target_token_probs;
+    torch::Tensor output_token_ids_d =
+        torch::zeros({(long)batch_size, (long)propose_step_ + 1},
+                     torch::TensorOptions().device(target_device).dtype(torch::kInt32).requires_grad(false));
+    torch::Tensor output_accepted_token_num_d = torch::zeros(
+        {(long)batch_size}, torch::TensorOptions().device(target_device).dtype(torch::kInt32).requires_grad(false));
 
-    // back to host
-    torch::Tensor output_token_ids_h         = output_token_ids_d.to(host_device, true);
-    torch::Tensor output_emitted_token_num_h = output_emitted_token_num_d.to(host_device);  // implicit sync here
-
-    torch::Tensor draft_token_ids_h;
-    for (const GenerateStreamPtr& stream : streams) {
-        if (stream->forceSpAccept()) {
-            draft_token_ids_h = draft_token_ids.cpu().clone();
-            break;
-        }
+    if (draft_token_probs_d_t.size(2) != target_token_probs_d_t.size(2)) {
+        auto draft_probs_padding =
+            torch::zeros({(long)batch_size, draft_token_probs_d_t.size(1), target_token_probs_d_t.size(2)},
+                         draft_token_probs_d_t.options());
+        draft_probs_padding.index_put_({torch::indexing::Slice(), torch::indexing::Slice(), d2t_map_},
+                                       draft_token_probs_d_t);
+        draft_token_probs_d_t = draft_probs_padding;
     }
 
-    int stream_idx = 0;
-    for (const GenerateStreamPtr& stream : streams) {
-        torch::Tensor accept_tokens;
-        size_t        accept_len = 0;
+    {
+        RTP_LLM_PROFILE_SCOPE("speculative_sampler.batchSample.execRejectionSampling");
+        execRejectionSampling({
+            draft_token_probs_d_t,
+            draft_token_ids_d_t,
+            uniform_samples_d,
+            target_token_probs_d_t,
+            target_token_ids_d_t,
+            output_token_ids_d,
+            output_accepted_token_num_d,
+            do_sample_d,
+        });
+    }
 
-        if (stream->forceSpAccept()) {
-            accept_len    = propose_step_ + 1;
-            accept_tokens = torch::empty({1, (int64_t)accept_len}, torch::TensorOptions().dtype(torch::kInt32));
-            memcpy(accept_tokens.data_ptr<int>(),
-                   draft_token_ids_h.data_ptr<int32_t>() + stream_idx * propose_step_,
-                   sizeof(int32_t) * propose_step_);
-        } else {
-            accept_len    = output_emitted_token_num_h[stream_idx].item<int32_t>();
-            accept_tokens = torch::empty({1, (int64_t)accept_len}, torch::TensorOptions().dtype(torch::kInt32));
-            memcpy(accept_tokens.data_ptr<int>(),
-                   output_token_ids_h[stream_idx].data_ptr<int32_t>(),
-                   sizeof(int32_t) * accept_len);
+    {
+        RTP_LLM_PROFILE_SCOPE("speculative_sampler.batchSample.post_rejection_sampling");
+        // back to host
+        torch::Tensor output_token_ids_h = output_token_ids_d.to(host_device, true);
+
+        // sync here
+        torch::Tensor output_accepted_token_num_h = output_accepted_token_num_d.to(host_device, false);
+
+        torch::Tensor draft_token_ids_h;
+        for (const GenerateStreamPtr& stream : streams) {
+            if (stream->forceSpAccept()) {
+                draft_token_ids_h = draft_token_ids.cpu();
+                break;
+            }
         }
 
-        // always use target token as the last token
-        accept_tokens.data_ptr<int>()[accept_len - 1] =
-            new_all_token_ids[(stream_idx * (propose_step_ + 1) + accept_len - 1) * token_stride + token_stride - 1];
+        stream_idx = 0;
+        for (const GenerateStreamPtr& stream : streams) {
+            torch::Tensor accept_tokens;
+            size_t        accept_len = 0;
 
-        sample_output.accept_tokens.push_back(std::move(accept_tokens));
-        sample_output.accept_len.push_back(accept_len);
-        stream_idx++;
+            if (stream->forceSpAccept()) {
+                accept_len    = propose_step_ + 1;
+                accept_tokens = torch::empty({1, (int64_t)accept_len}, torch::TensorOptions().dtype(torch::kInt32));
+                memcpy(accept_tokens.data_ptr<int>(),
+                       draft_token_ids_h.data_ptr<int32_t>() + stream_idx * propose_step_,
+                       sizeof(int32_t) * propose_step_);
+                accept_tokens.data_ptr<int32_t>()[accept_len - 1] =
+                    new_all_token_ids[(stream_idx * (propose_step_ + 1) + accept_len - 1) * token_stride + token_stride
+                                      - 1];
+            } else {
+                accept_len    = output_accepted_token_num_h[stream_idx].item<int32_t>();
+                accept_tokens = torch::empty({1, (int64_t)accept_len}, torch::TensorOptions().dtype(torch::kInt32));
+                memcpy(accept_tokens.data_ptr<int>(),
+                       output_token_ids_h[stream_idx].data_ptr<int32_t>(),
+                       sizeof(int32_t) * accept_len);
+            }
+
+            sample_output.accept_tokens.push_back(accept_tokens);
+            sample_output.accept_len.push_back(accept_len);
+            stream_idx++;
+        }
     }
 }
 
@@ -132,5 +169,6 @@ void SpeculativeSampler::streamSample(SpeculativeSamplerOutput&           sample
                                       const std::list<GenerateStreamPtr>& streams,
                                       SamplerOutput&                      draft_sampler_output,
                                       SamplerOutput&                      target_sampler_output) const {}
+
 }  // namespace speculative
 }  // namespace rtp_llm

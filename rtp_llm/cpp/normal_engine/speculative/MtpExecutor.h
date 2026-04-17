@@ -84,7 +84,8 @@ public:
     static GenerateStreamPtr createMinFakeDecodeStream(int                    max_new_tokens,
                                                        const ModelConfig&     model_config,
                                                        const RuntimeConfig&   runtime_config,
-                                                       const ResourceContext& resource_context);
+                                                       const ResourceContext& resource_context,
+                                                       int                    vocab_size);
 
 protected:
     bool isTpRank0() const;
@@ -121,7 +122,7 @@ private:
     DataType                                         data_type_;
     size_t                                           hidden_size_;
     size_t                                           propose_step_;
-    size_t                                           propose_vocab_size_;
+    size_t                                           draft_vocab_size_;
     std::shared_ptr<ModelBase>                       draft_model_;
     std::shared_ptr<ModelBase>                       sp_prefill_draft_model_;
     std::unique_ptr<speculative::SpeculativeSampler> speculative_sampler_;
@@ -136,5 +137,7 @@ private:
     // group id tensors
     torch::Tensor target_kv_cache_layer_to_group;
     torch::Tensor draft_kv_cache_layer_to_group;
+
+    torch::Tensor d2t_map_;
 };
 };  // namespace rtp_llm
