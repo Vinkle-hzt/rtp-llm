@@ -45,6 +45,10 @@ struct StreamSpecUpdateInfo {
     int                 draft_token;
     const torch::Tensor draft_hidden_states;
     const torch::Tensor draft_token_probs;
+    // Phase 3.1: GPU tensor of propose tokens for the next step.
+    // shape: [propose_step] (the per-stream slice). When defined, PDFUSION
+    // path will skip D2H and consume this GPU tensor directly.
+    torch::Tensor draft_token_gpu;
 
     bool update_remote_generate = true;
     bool force_update_info      = false;
@@ -70,7 +74,13 @@ public:
 
 public:
     size_t        propose_step = 0;
-    torch::Tensor tokens;  // selected tokens
+    torch::Tensor tokens;  // selected tokens (CPU, preserved for PD-disaggregate / RPC / tests)
+    // Phase 3.1: GPU mirror of the next-step propose tokens. shape [propose_step].
+    // Populated only on the PDFUSION fast path (via specUpdate). When defined,
+    // PDFUSION readers (prepareDecodeDraftModelInput / prepareOneStepSpecDecodeModelInput
+    // / updateOneStepDraftSamplerOutput / MtpExecutor::prefillStep) consume this
+    // GPU tensor directly and avoid the D2H + CPU loop + H2D round trip.
+    torch::Tensor propose_tokens_gpu;
     torch::Tensor hidden_states;
     torch::Tensor all_probs;
 
