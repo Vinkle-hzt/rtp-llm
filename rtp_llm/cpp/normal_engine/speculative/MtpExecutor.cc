@@ -632,6 +632,26 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode end");
     }
 
+    // Phase 3.4: launch the draft-prefill prepareAttentionInputs *before* the
+    // target verify forward so it overlaps with the target verify GPU work
+    // instead of running serially after it. The runner uses an independent
+    // cudaStream + thread (AsyncRunner), and operates on a value-captured copy
+    // of model_input, so subsequent in-place mutations of the main-stream
+    // model_input (rejection sampling, updateDecodePostDraftModelInput, ...)
+    // don't affect what the runner sees. Sync still happens at the same place
+    // (just before draft_model_forward) so the consumer order is preserved.
+    {
+        auto* prefill_model    = sp_prefill_draft_model_ ? sp_prefill_draft_model_.get() : draft_model_.get();
+        auto  model_input_copy = model_input;
+        model_input_copy.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
+        model_input_copy.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
+        model_input_copy.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
+        draft_prefill_prepare_runner_.launch([prefill_model, model_input_copy = std::move(model_input_copy)]() mutable {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_draft_prefill_input)");
+            prefill_model->prepareAttentionInputs(model_input_copy);
+        });
+    }
+
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_model_verify)");
         maybePrintModelInput(model_input, "decode target model");
@@ -646,18 +666,6 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         model_output = std::move(model_->forward(model_input));
         RTP_LLM_LOG_DEBUG("[MTP decode] target model verify forward end");
         model_input.is_target_verify = false;
-    }
-
-    {
-        auto* prefill_model    = sp_prefill_draft_model_ ? sp_prefill_draft_model_.get() : draft_model_.get();
-        auto  model_input_copy = model_input;
-        model_input_copy.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
-        model_input_copy.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
-        model_input_copy.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
-        draft_prefill_prepare_runner_.launch([prefill_model, model_input_copy = std::move(model_input_copy)]() mutable {
-            RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_draft_prefill_input)");
-            prefill_model->prepareAttentionInputs(model_input_copy);
-        });
     }
 
     // trick: update draft sampler output after spec decode to avoid kernel launch overhead
