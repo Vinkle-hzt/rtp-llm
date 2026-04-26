@@ -2,8 +2,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <thread>
 #include "absl/status/status.h"
 #include "kmonitor/client/MetricsReporter.h"
@@ -15,6 +18,7 @@
 #include "rtp_llm/cpp/cache/WarmUpResult.h"
 #include "rtp_llm/cpp/engine_base/Executor.h"
 #include "rtp_llm/cpp/models/ModelTypes.h"
+#include "rtp_llm/cpp/normal_engine/BatchFuture.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
 #include "rtp_llm/cpp/engine_base/schedulers/SchedulerBase.h"
 #include "rtp_llm/cpp/engine_base/system_prompt/SystemPrompt.h"
@@ -37,6 +41,13 @@ public:
 
     KVCacheInfo  getCacheStatusInfo(int64_t latest_version, bool need_cache_keys) override;
     absl::Status step();
+    // Phase 3.2: async-scheduling entry point. When use_async_scheduling_ is
+    // false (the default), this delegates to step() to preserve the current
+    // synchronous behaviour bit-for-bit. When enabled, the main thread will
+    // schedule + launch a batch and hand a BatchFuture to the result thread
+    // for bookkeeping (specUpdate / KV release / output dispatch), letting
+    // the next schedule + launch overlap with the previous batch's GPU work.
+    absl::Status asyncStep();
     absl::Status startLoop();
     int64_t      getLastScheduleTime() override;
     void         reportMetrics(RtpLLMEngineMetricsCollector collector) {
@@ -68,9 +79,30 @@ private:
     bool isEagle() override;
 
 private:
-    autil::ThreadPtr                              loop_thread_;
-    std::atomic<bool>                             running_{false};
-    std::unique_ptr<Executor>                     executor_;
+    // Phase 3.2: drives the result-thread bookkeeping loop. Started lazily
+    // when async scheduling is enabled; otherwise the synchronous path
+    // never touches it.
+    void resultLoop();
+    // Wait for any outstanding BatchFuture to finish bookkeeping so the
+    // next scheduler call sees the post-update stream state. Returns the
+    // bookkeeping status so the caller can short-circuit on error.
+    absl::Status awaitLastBookkeeping();
+
+private:
+    autil::ThreadPtr          loop_thread_;
+    std::atomic<bool>         running_{false};
+    std::unique_ptr<Executor> executor_;
+    // Phase 3.2 async scheduling state. All scaffolding; the synchronous
+    // path leaves these untouched. Toggle via env RTP_LLM_ASYNC_SCHEDULING
+    // (or, in a follow-up, RuntimeConfig::use_async_scheduling) once the
+    // result-thread executor split lands.
+    bool                                          use_async_scheduling_ = false;
+    std::thread                                   result_thread_;
+    std::mutex                                    result_mutex_;
+    std::condition_variable                       result_cv_;
+    std::queue<BatchFuturePtr>                    result_queue_;
+    BatchFuturePtr                                last_future_;
+    std::atomic<bool>                             result_thread_stop_{false};
     ModelConfig                                   model_config_;
     ParallelismConfig                             parallelism_config;
     RuntimeConfig                                 runtime_config;
