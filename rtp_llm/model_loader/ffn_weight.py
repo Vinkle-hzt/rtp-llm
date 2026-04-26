@@ -303,6 +303,12 @@ class MoeAtomicWeight(AtomicWeight):
     ):
         self.config = config
         self.stacked_ckpt_keys = stacked_ckpt_keys
+        # Pre-resolve function name for GPU preallocate path dispatch.
+        # functools.partial objects have .func instead of __name__.
+        if isinstance(process_fun, functools.partial):
+            self._process_fun_name = process_fun.func.__name__
+        else:
+            self._process_fun_name = process_fun.__name__
         super().__init__(name, weights, process_fun, data_type, *args, **kwargs)
 
     def _expert_key_pattern(self, idx: int) -> str:
@@ -356,14 +362,41 @@ class MoeAtomicWeight(AtomicWeight):
             self._get_expert_weights() if self.stacked_ckpt_keys else self.weights
         )
 
-        before_merge_tensors = []
         convert_type = (
             self.data_type if self.data_type is not None else load_config.compute_dtype
         )
-        for ckpt_weight in ckpt_weights:
-            selected_experts = load_config.get_selected_experts(
-                layer_id, self.config.expert_num
+        selected_experts = load_config.get_selected_experts(
+            layer_id, self.config.expert_num
+        )
+        num_experts = len(selected_experts)
+        num_ckpt_weights = len(ckpt_weights)
+
+        # Try GPU pre-allocate + direct copy path for large MoE weights
+        # Only when CUDA is available and target device is GPU
+        target_device = (
+            device if isinstance(device, torch.device) else torch.device(device)
+        )
+        if (
+            num_experts > 1
+            and torch.cuda.is_available()
+            and target_device.type == "cuda"
+            and self._process_fun_name in ("stack_moe_w1", "stack_", "stack_moe_w1_s2")
+        ):
+            result = self._load_raw_tensor_gpu_preallocate(
+                tensor_source,
+                layer_id,
+                device,
+                load_config,
+                ckpt_weights,
+                selected_experts,
+                convert_type,
             )
+            if result is not None:
+                return result
+
+        # Fallback: original serial path
+        before_merge_tensors = []
+        for ckpt_weight in ckpt_weights:
             for expert_id in selected_experts:
                 name = ckpt_weight.name.format(
                     i=str(layer_id), i_1=str(layer_id + 1), expert_id=str(expert_id)
@@ -385,6 +418,139 @@ class MoeAtomicWeight(AtomicWeight):
 
         after_merge_tensor = self.process_fun(before_merge_tensors).to(convert_type)
         return {self.name: after_merge_tensor}
+
+    def _load_expert_tensor(
+        self,
+        ckpt_weight,
+        layer_id,
+        expert_id,
+        tensor_source,
+        convert_type,
+        first_name=None,
+        first_tensor=None,
+    ):
+        """Load a single expert tensor with error handling."""
+        name = ckpt_weight.name.format(
+            i=str(layer_id),
+            i_1=str(layer_id + 1),
+            expert_id=str(expert_id),
+        )
+        if first_name is not None and name == first_name:
+            return name, first_tensor
+        try:
+            t = ckpt_weight.merge_fun(tensor_source.load_tensor(name, convert_type))
+            return name, t
+        except Exception as e:
+            logging.error(f"加载 {name} 失败，完整堆栈:\n{traceback.format_exc()}")
+            raise e
+
+    def _load_raw_tensor_gpu_preallocate(
+        self,
+        tensor_source,
+        layer_id,
+        device,
+        load_config,
+        ckpt_weights,
+        selected_experts,
+        convert_type,
+    ):
+        """Pre-allocate output tensor on GPU and copy each expert directly into position.
+        Avoids expensive CPU stack of thousands of small tensors."""
+        num_experts = len(selected_experts)
+        num_ckpt_weights = len(ckpt_weights)
+        gpu_device = (
+            device if isinstance(device, torch.device) else torch.device(device)
+        )
+
+        # Peek at first tensor to get shape
+        first_name, first_tensor = self._load_expert_tensor(
+            ckpt_weights[0],
+            layer_id,
+            selected_experts[0],
+            tensor_source,
+            convert_type,
+        )
+        expert_shape = first_tensor.shape  # e.g., [intermediate, hidden] for fp8
+
+        is_w1 = self._process_fun_name == "stack_moe_w1"
+        is_w1_s2 = self._process_fun_name == "stack_moe_w1_s2"
+
+        if is_w1:
+            # stack_moe_w1: gate[512] + up[512] → [512, 2*intermediate, hidden]
+            # For non-2D tensors (e.g. per-tensor quant scales), fall back to
+            # the normal serial path which handles all shapes.
+            if len(expert_shape) != 2:
+                return None
+            assert num_ckpt_weights == 2
+            dim0, dim1 = expert_shape
+            out = torch.empty(
+                [num_experts, dim0 * 2, dim1],
+                dtype=convert_type,
+                device=gpu_device,
+            )
+            for cw_idx, ckpt_weight in enumerate(ckpt_weights):
+                row_offset = cw_idx * dim0
+                for local_idx, expert_id in enumerate(selected_experts):
+                    _, t = self._load_expert_tensor(
+                        ckpt_weight,
+                        layer_id,
+                        expert_id,
+                        tensor_source,
+                        convert_type,
+                        first_name,
+                        first_tensor,
+                    )
+                    out[local_idx, row_offset : row_offset + dim0, :].copy_(t)
+        elif is_w1_s2:
+            # stack_moe_w1_s2: scale (max of gate/up scales per expert)
+            assert num_ckpt_weights == 2
+            out = torch.empty(
+                [num_experts] + list(expert_shape),
+                dtype=convert_type,
+                device=gpu_device,
+            )
+            gate_scales = []
+            up_scales = []
+            for cw_idx, ckpt_weight in enumerate(ckpt_weights):
+                target = gate_scales if cw_idx == 0 else up_scales
+                for expert_id in selected_experts:
+                    _, t = self._load_expert_tensor(
+                        ckpt_weight,
+                        layer_id,
+                        expert_id,
+                        tensor_source,
+                        convert_type,
+                        first_name,
+                        first_tensor,
+                    )
+                    target.append(t)
+            for i in range(num_experts):
+                out[i].copy_(torch.max(gate_scales[i], up_scales[i]))
+            return {self.name: out}
+        else:
+            # stack_: simple stack → [num_experts, *expert_shape]
+            assert (
+                num_ckpt_weights == 1
+            ), f"stack_ fast path expects 1 ckpt_weight, got {num_ckpt_weights}"
+            out = torch.empty(
+                [num_experts] + list(expert_shape),
+                dtype=convert_type,
+                device=gpu_device,
+            )
+            ckpt_weight = ckpt_weights[0]
+            for local_idx, expert_id in enumerate(selected_experts):
+                _, t = self._load_expert_tensor(
+                    ckpt_weight,
+                    layer_id,
+                    expert_id,
+                    tensor_source,
+                    convert_type,
+                    first_name,
+                    first_tensor,
+                )
+                out[local_idx].copy_(t)
+
+        return {self.name: out}
 
     def get_tensor_names(
         self, layer_id: Optional[int], load_config: LoadConfig
