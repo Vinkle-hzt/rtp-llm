@@ -119,7 +119,9 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     cache_manager_(cache_manager),
     metrics_reporter_(params.metrics_reporter),
     warm_up_(warm_up),
-    role_type_(params.pd_sep_config.role_type) {
+    role_type_(params.pd_sep_config.role_type),
+    target_verify_prepare_runner_(cuda_graph::graphGetStreamFromPool(true)),
+    draft_prefill_prepare_runner_(cuda_graph::graphGetStreamFromPool(true)) {
     data_type_        = params.model_config_.data_type;
     hidden_size_      = params.model_config_.hidden_size;
     propose_step_     = propose_params->gen_num_per_circle;
@@ -510,6 +512,9 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     size_t total_accept_len = 0;
 
+    const auto& cache_cfg     = cache_manager_->cacheConfig();
+    const auto& mtp_cache_cfg = cache_manager_->getMTPModuleCacheConfig(0);
+
     // clone tensors from grpc
     {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(clone_sp_tensors,stream_count=%zu)", streams.size());
@@ -570,6 +575,31 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     model_->releaseBuffers();
 
     if (propose_step_ > 1) {
+        {
+            auto model_input_copy                    = model_input;
+            model_input_copy.kv_block_stride_bytes   = cache_cfg.kv_block_stride_bytes;
+            model_input_copy.kv_scale_stride_bytes   = cache_cfg.kv_scale_stride_bytes;
+            model_input_copy.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
+            model_input_copy.input_lengths =
+                torch::full({(long)batch_size},
+                            (long)(propose_step_ + 1),
+                            torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+            model_input_copy.lm_output_indexes =
+                torch::arange(0,
+                              batch_size * (propose_step_ + 1),
+                              propose_step_ + 1,
+                              torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+            model_input_copy.prefix_lengths     = model_input.sequence_lengths.clone().pin_memory();
+            model_input_copy.last_hidden_states = torch::Tensor();
+            model_input_copy.sequence_lengths   = torch::empty({0}, torch::kInt32);
+            model_input_copy.is_target_verify   = true;
+
+            target_verify_prepare_runner_.launch([this, model_input_copy = std::move(model_input_copy)]() mutable {
+                RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_verify_prepare_attention_inputs)");
+                model_->prepareAttentionInputs(model_input_copy);
+            });
+        }
+
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode start");
         draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t);
@@ -586,9 +616,22 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             model_input.input_lengths.size(0),
             model_input.prefix_lengths.size(0),
             model_input.sequence_lengths.size(0));
+        target_verify_prepare_runner_.sync(cuda_graph::graphGetCurrentStream());
         model_output = std::move(model_->forward(model_input));
         RTP_LLM_LOG_DEBUG("[MTP decode] target model verify forward end");
         model_input.is_target_verify = false;
+    }
+
+    {
+        auto* prefill_model    = sp_prefill_draft_model_ ? sp_prefill_draft_model_.get() : draft_model_.get();
+        auto  model_input_copy = model_input;
+        model_input_copy.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
+        model_input_copy.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
+        model_input_copy.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
+        draft_prefill_prepare_runner_.launch([prefill_model, model_input_copy = std::move(model_input_copy)]() mutable {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_draft_prefill_input)");
+            prefill_model->prepareAttentionInputs(model_input_copy);
+        });
     }
 
     // trick: update draft sampler output after spec decode to avoid kernel launch overhead
@@ -621,9 +664,10 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(rejection_sampling)");
 
         if (model_input.is_fake_stream) {
-            auto accept_tokens                       = torch::zeros({1, 1}, torch::kInt32);
-            speculative_sampler_output.accept_len    = {1};
-            speculative_sampler_output.accept_tokens = {std::move(accept_tokens)};
+            speculative_sampler_output.accept_len =
+                torch::ones({1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+            speculative_sampler_output.accept_tokens =
+                torch::zeros({1, 1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
             cudaSyncAndCheck();
         } else {
             // target model sample
@@ -640,24 +684,27 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         // NOTE: here will have cuda device sync before update model input
         batch_stream_processor_->updateDecodePostDraftModelInput(
             model_input, model_output, speculative_sampler_output, batch_size, hidden_states_d_t, total_accept_len);
+    } else {
+        model_input.lm_output_indexes =
+            torch::empty({(int64_t)batch_size}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+        model_input.last_hidden_states = model_output.all_hidden_states;
     }
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(tp_sync_post_rejection)");
-        tpSyncModelInputs(model_input, parallelism_config_);
-    }
-
-    {
-        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_draft_prefill_input)");
-        maybePrintModelInput(model_input, "decode post draft model");
-        const auto& mtp_cache_cfg           = cache_manager_->getMTPModuleCacheConfig(0);
+        execBroadcast({{model_input.combo_tokens}, 0});
+        execBroadcast({{model_input.last_hidden_states}, 0});
+        execBroadcast({{model_input.lm_output_indexes}, 0});
         model_input.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
         model_input.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
     }
 
+    draft_prefill_prepare_runner_.sync(cuda_graph::graphGetCurrentStream());
+
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(draft_model_forward)");
+        maybePrintModelInput(model_input, "decode post draft model");
         // Use sp_prefill_draft_model_ if CUDA graph is enabled, otherwise use draft_model_
         if (sp_prefill_draft_model_) {
             draft_prefill_model_output = std::move(sp_prefill_draft_model_->forward(model_input));
