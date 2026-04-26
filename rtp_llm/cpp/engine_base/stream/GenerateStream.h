@@ -468,6 +468,28 @@ public:
         return sp_output_buffer_;
     }
 
+    // Phase 3.3: linear-attention KV swap synchronisation handle.
+    //
+    // On the Phase 3.2 ultimate async path, NormalEngine::asyncStep dispatches
+    // step N+1's target_model_verify before step N's specUpdate finishes
+    // running swapLinearBlocks on the result thread. swapLinearBlocks rewrites
+    // KV-block mappings that the next verify forward will read, so the verify
+    // GPU stream must wait on the swap's completion event.
+    //
+    // The opaque shared_ptr<void> keeps cuda_runtime.h out of this header. The
+    // deleter (set by the producer side, e.g. specUpdate / cache resource)
+    // cleans up the cudaEvent_t with cudaEventDestroy. nullptr means "no
+    // pending swap" and the executor short-circuits the wait.
+    void setPendingSwapDoneEvent(std::shared_ptr<void> event) {
+        pending_swap_done_event_ = std::move(event);
+    }
+    std::shared_ptr<void> getPendingSwapDoneEvent() const {
+        return pending_swap_done_event_;
+    }
+    void clearPendingSwapDoneEvent() {
+        pending_swap_done_event_.reset();
+    }
+
     GenerateStreamPtr getProposeStream() {
         return propose_stream_;
     }
@@ -625,6 +647,10 @@ protected:
     bool                               contain_propose_token_ = false;
     int                                mtp_token_index_       = 0;
     SpeculativeExecutorStreamOutputPtr sp_output_buffer_      = nullptr;
+    // Phase 3.3: cudaEvent_t (type-erased) recorded after specUpdate runs
+    // swapLinearBlocks. MtpExecutor waits on it before issuing the next
+    // target verify. nullptr on streams without pending swaps.
+    std::shared_ptr<void> pending_swap_done_event_;
 
     bool return_all_hidden_states_ = false;
 

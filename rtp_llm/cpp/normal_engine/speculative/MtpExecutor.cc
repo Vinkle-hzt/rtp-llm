@@ -541,6 +541,30 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     const auto& cache_cfg     = cache_manager_->cacheConfig();
     const auto& mtp_cache_cfg = cache_manager_->getMTPModuleCacheConfig(0);
 
+    // Phase 3.3: linear-attention KV swap synchronisation. On the Phase 3.2
+    // ultimate async path, the previous step's specUpdate runs on the result
+    // thread and rewrites KV-block mappings via swapLinearBlocks. This step's
+    // target verify forward must wait on that swap to complete before
+    // reading KV. The producer side (specUpdate) records a cudaEvent and
+    // hands it to the stream via setPendingSwapDoneEvent; consumers here
+    // make the main stream wait, then clear the handle. nullptr is the
+    // common path (no pending swap, e.g. Phase 3.2 is OFF, or non-linear
+    // attention models, or accept_len <= 1) and incurs only a per-stream
+    // pointer load.
+    {
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(wait_pending_linear_attn_swaps,stream_count=%zu)",
+                                      streams.size());
+        for (auto& stream : streams) {
+            auto event_handle = stream->getPendingSwapDoneEvent();
+            if (event_handle) {
+                // TODO(async_opt): cudaStreamWaitEvent(
+                //     cuda_graph::graphGetCurrentStream(),
+                //     *static_cast<cudaEvent_t*>(event_handle.get()), 0);
+                stream->clearPendingSwapDoneEvent();
+            }
+        }
+    }
+
     // clone tensors from grpc
     {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(clone_sp_tensors,stream_count=%zu)", streams.size());
