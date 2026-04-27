@@ -182,7 +182,7 @@ void MtpBatchStreamProcessor::updateProposeTokens(const StreamGroups&           
 // threshold higher trades MTP latency for safety; 4 keeps the small-batch
 // (interactive) path on the legacy CPU loop while opening the door for big
 // batch wins. Negative threshold disables the GPU path entirely; zero forces it.
-static constexpr int64_t kPhase31MinBatchForGpu = 4;
+static constexpr int64_t kPhase31MinBatchForGpu = -1;
 
 void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& stream_groups,
                                                            GptModelInputs&     model_input) {

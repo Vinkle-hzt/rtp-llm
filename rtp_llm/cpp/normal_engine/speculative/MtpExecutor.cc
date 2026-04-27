@@ -669,7 +669,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         auto  model_input_copy = model_input;
         model_input_copy.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
         model_input_copy.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
-        model_input_copy.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
+        model_input_copy.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
         draft_prefill_prepare_runner_.launch([prefill_model, model_input_copy = std::move(model_input_copy)]() mutable {
             RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_draft_prefill_input)");
             prefill_model->prepareAttentionInputs(model_input_copy);
