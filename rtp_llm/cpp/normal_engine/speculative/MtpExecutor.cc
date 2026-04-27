@@ -544,25 +544,54 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     const auto& cache_cfg     = cache_manager_->cacheConfig();
     const auto& mtp_cache_cfg = cache_manager_->getMTPModuleCacheConfig(0);
 
+    // Phase 3.2 lite (stream-async): 1-step bookkeeping buffer. Cap outstanding
+    // worker tasks at 1 step by blocking CPU here on the previous step's
+    // worker (specUpdate + KV release + GPU swapLinearBlocks). Without this,
+    // step N+2 would launch while step N's bookkeeping is still in flight,
+    // leading to KV exhaustion (conservative reservation never released) and
+    // race-y reads of stream state.
+    //
+    // Ordering guarantee: this sync runs BEFORE wait_pending_linear_attn_swaps
+    // and gatherDecodeModelInput so:
+    //  - the swap-done event has been recorded by the worker (no race on
+    //    pending_swap_done_event_ shared_ptr read);
+    //  - gatherDecodeModelInput's host-side block-id read sees the post-swap
+    //    KV block mapping (target verify will then operate on the correct
+    //    blocks).
+    //
+    // No-op when stream-async is off (useStreamAsync() == false today;
+    // Commit 5 will gate this on RTP_LLM_MTP_STREAM_ASYNC). AsyncRunner.sync
+    // is also a no-op on the very first decodeStep (task_done_ starts true).
+    if (useStreamAsync()) {
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(wait_prev_bookkeeping,stream_count=%zu)",
+                                      streams.size());
+        spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+    }
+
     // Phase 3.3: linear-attention KV swap synchronisation. On the Phase 3.2
     // ultimate async path, the previous step's specUpdate runs on the result
     // thread and rewrites KV-block mappings via swapLinearBlocks. This step's
     // target verify forward must wait on that swap to complete before
-    // reading KV. The producer side (specUpdate) records a cudaEvent and
-    // hands it to the stream via setPendingSwapDoneEvent; consumers here
-    // make the main stream wait, then clear the handle. nullptr is the
-    // common path (no pending swap, e.g. Phase 3.2 is OFF, or non-linear
-    // attention models, or accept_len <= 1) and incurs only a per-stream
-    // pointer load.
+    // reading KV. The producer side records a torch::Event on the worker
+    // stream after dispatchDecode (see MtpExecutor::dispatchDecodeAsync) and
+    // hands it to the stream via setPendingSwapDoneEvent. Consumers here
+    // make the main stream wait via cudaStreamWaitEvent (= torch::Event::block),
+    // then clear the handle. nullptr is the common path (no pending swap;
+    // e.g., stream-async is OFF) and incurs only a per-stream pointer load.
+    //
+    // After Commit 4's wait_prev_bookkeeping above, the event is already
+    // signalled by the time we get here (worker has CPU-synced its stream),
+    // so this is effectively a no-op stream dependency. Kept as a separate
+    // step so future Phase 3.3 ultimate (where wait_prev_bookkeeping moves
+    // off the hot path) keeps the verify-side correctness guarantee.
     {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(wait_pending_linear_attn_swaps,stream_count=%zu)",
                                       streams.size());
         for (auto& stream : streams) {
             auto event_handle = stream->getPendingSwapDoneEvent();
             if (event_handle) {
-                // TODO(async_opt): cudaStreamWaitEvent(
-                //     cuda_graph::graphGetCurrentStream(),
-                //     *static_cast<cudaEvent_t*>(event_handle.get()), 0);
+                auto event = std::static_pointer_cast<torch::Event>(event_handle);
+                event->block(cuda_graph::graphGetCurrentStream());
                 stream->clearPendingSwapDoneEvent();
             }
         }
@@ -1151,10 +1180,27 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
             RTP_LLM_LOG_ERROR("[stream-async] dispatchDecode (worker) failed: %s", status.ToString().c_str());
         }
 
-        // TODO(phase32 Commit 4): record swap done event for linear-attn
-        // streams here and call setPendingSwapDoneEvent so the next step's
-        // verify forward can wait via cudaStreamWaitEvent (the consumer side
-        // is already scaffolded at MtpExecutor.cc:560-563).
+        // Phase 3.2 lite (Commit 4): record swap done event per stream and
+        // attach so the next step's verify can wait via cudaStreamWaitEvent.
+        //
+        // Why all streams (not just linear-attn): GenerateStream::specUpdate
+        // unconditionally calls swapLinearBlocks when accept_token_num > 1
+        // and stream_cache_resource_ is set. For MTP with propose_step >= 2
+        // and typical accept_len 3-4, the swap fires on every step. Recording
+        // an event for every stream costs one cudaEventRecord (~1us) and
+        // makes the consumer side a no-op (event already signalled) for
+        // streams that didn't actually swap.
+        //
+        // With Commit 4's decodeStep-entry sync, the event is fully drained
+        // before the consumer reads pending_swap_done_event_; the per-stream
+        // event remains as scaffolding for the Phase 3.3 ultimate async path
+        // (where the entry sync moves off the hot path and per-stream events
+        // become the only guard).
+        for (auto& stream : worker_streams) {
+            auto event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+            event->record(cuda_graph::graphGetCurrentStream());
+            stream->setPendingSwapDoneEvent(std::static_pointer_cast<void>(event));
+        }
     });
 
     // Main thread returns immediately. The next step can be dispatched while
