@@ -11,6 +11,7 @@
 #include "rtp_llm/cpp/models/eplb/ExpertBalancer.h"
 #include "rtp_llm/cpp/normal_engine/speculative/MtpBatchStreamProcessor.h"
 #include "rtp_llm/cpp/engine_base/ProposeModelEngineInitParams.h"
+#include "rtp_llm/cpp/normal_engine/AsyncRunner.h"
 #include "rtp_llm/cpp/normal_engine/speculative/SpeculativeSampler.h"
 
 namespace rtp_llm {
@@ -141,5 +142,8 @@ private:
     torch::Tensor draft_kv_cache_layer_to_group;
 
     torch::Tensor d2t_map_;
+
+    AsyncRunner target_verify_prepare_runner_;
+    AsyncRunner draft_prefill_prepare_runner_;
 };
 };  // namespace rtp_llm
