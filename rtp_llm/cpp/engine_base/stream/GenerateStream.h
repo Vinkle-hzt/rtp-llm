@@ -490,6 +490,37 @@ public:
         pending_swap_done_event_.reset();
     }
 
+    // Stream-async (Phase 3.2 lite): per-stream device-resident handles to the
+    // current step's rejection_sampling output and the projected next-step
+    // sequence length. Populated by MtpExecutor::dispatchDecode at the moment
+    // the bookkeeping worker is forked, consumed by the next-step prepare
+    // (prepareDecodeDraftModelInput / prepareOneStepSpecDecodeModelInput) so
+    // model_input.combo_tokens / sequence_lengths can be assembled fully on
+    // GPU without waiting for the host bookkeeping (D2H + specUpdate + KV
+    // release) to land. CUDA stream ordering keeps next-step GPU work behind
+    // the current step's rejection_sampling kernel.
+    void setSpecDecodeDeviceState(torch::Tensor accept_len_gpu,
+                                  torch::Tensor accept_tokens_gpu,
+                                  torch::Tensor next_seq_len_gpu) {
+        accept_len_gpu_    = std::move(accept_len_gpu);
+        accept_tokens_gpu_ = std::move(accept_tokens_gpu);
+        next_seq_len_gpu_  = std::move(next_seq_len_gpu);
+    }
+    const torch::Tensor& getAcceptLenGpu() const {
+        return accept_len_gpu_;
+    }
+    const torch::Tensor& getAcceptTokensGpu() const {
+        return accept_tokens_gpu_;
+    }
+    const torch::Tensor& getNextSeqLenGpu() const {
+        return next_seq_len_gpu_;
+    }
+    void clearSpecDecodeDeviceState() {
+        accept_len_gpu_    = torch::Tensor();
+        accept_tokens_gpu_ = torch::Tensor();
+        next_seq_len_gpu_  = torch::Tensor();
+    }
+
     GenerateStreamPtr getProposeStream() {
         return propose_stream_;
     }
@@ -651,6 +682,14 @@ protected:
     // swapLinearBlocks. MtpExecutor waits on it before issuing the next
     // target verify. nullptr on streams without pending swaps.
     std::shared_ptr<void> pending_swap_done_event_;
+
+    // Stream-async device-resident state for the next decode step's prepare.
+    // See setSpecDecodeDeviceState() for the contract; fields stay default
+    // (undefined Tensor) on the synchronous path so existing callers see no
+    // behaviour change.
+    torch::Tensor accept_len_gpu_;
+    torch::Tensor accept_tokens_gpu_;
+    torch::Tensor next_seq_len_gpu_;
 
     bool return_all_hidden_states_ = false;
 
