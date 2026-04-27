@@ -113,17 +113,25 @@ protected:
     // the body with the RTP_LLM_MTP_STREAM_ASYNC env switch.
     bool useStreamAsync() const;
 
-    // Stream-async (Phase 3.2 lite) dispatch. Records the rejection_sampling
-    // event on the main stream, attaches device-resident accept_len /
-    // accept_tokens / next_seq_len handles to each stream so the next step's
-    // prepare can run fully on GPU, conservatively bumps host seqLength to
-    // propose_step + 1 so the scheduler reserves enough KV, then forks a
-    // bookkeeping worker that waits the event and runs the host-side
-    // specUpdate / KV release. Main thread returns immediately so the next
-    // step can be dispatched while this step's GPU work is still in flight.
+    // Stream-async (Phase 3.2 lite) dispatch. Caller records two events on
+    // the main stream BEFORE calling: rejection_event right after the
+    // rejection_sampling kernel launch (earliest signal that
+    // accept_len/accept_tokens are produced on device), and draft_event
+    // right after draft_model_sample (signals that all_probs is ready for
+    // the worker's clone). This function attaches device-resident
+    // accept_len/accept_tokens/next_seq_len/propose_tokens handles to each
+    // stream so the next step's prepare runs fully on GPU, conservatively
+    // bumps host seqLength to propose_step + 1 so the scheduler reserves
+    // enough KV, then forks a bookkeeping worker. The worker stream waits
+    // on both events via cudaStreamWaitEvent (no CPU wait on main), then
+    // issues D2H of accept_*/specUpdate/KV release on its own stream and
+    // worker thread. Main thread returns immediately so the next step can
+    // be dispatched while this step's GPU work is still in flight.
     absl::Status dispatchDecodeAsync(const StreamGroups&                          stream_groups,
                                      const speculative::SpeculativeSamplerOutput& spec_decode_output,
-                                     MergedOutput                                 draft_prefill_output);
+                                     MergedOutput                                 draft_prefill_output,
+                                     std::shared_ptr<torch::Event>                rejection_event,
+                                     std::shared_ptr<torch::Event>                draft_event);
 
 private:
     std::unique_ptr<ModelBase>               model_;

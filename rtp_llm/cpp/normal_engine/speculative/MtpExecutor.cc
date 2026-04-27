@@ -541,6 +541,19 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     size_t total_accept_len = 0;
 
+    // Stream-async (Commit 5): events recorded on the main stream at the
+    // earliest point each downstream consumer needs. The bookkeeping worker
+    // stream cudaStreamWaitEvent's both before reading the corresponding
+    // tensors. Recording early (not at the end of decodeStep) shaves the
+    // worker's GPU wait by avoiding queue tail (broadcast / draft_forward /
+    // draft_sample). They stay null when stream-async is off.
+    //   - rejection_event: signals after speculative_sampler_->forward, so
+    //     accept_len/accept_tokens are valid for the worker's D2H.
+    //   - draft_event: signals after draft_model_sample, so all_probs is
+    //     valid for prepareDecodeSpecUpdateInfo's clone.
+    std::shared_ptr<torch::Event> rejection_event;
+    std::shared_ptr<torch::Event> draft_event;
+
     const auto& cache_cfg     = cache_manager_->cacheConfig();
     const auto& mtp_cache_cfg = cache_manager_->getMTPModuleCacheConfig(0);
 
@@ -780,6 +793,17 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         model_input.last_hidden_states = model_output.all_hidden_states;
     }
 
+    // Stream-async (Commit 5): record rejection event on the main stream.
+    // Earliest valid point — accept_len/accept_tokens have already been
+    // produced by speculative_sampler_->forward above (and consumed by
+    // updateDecodePostDraftModelInput, which only adds derivative ops). The
+    // worker stream waits on this so it can issue D2H of accept_* without
+    // blocking on later kernels (broadcast, draft forward/sample).
+    if (useStreamAsync()) {
+        rejection_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+        rejection_event->record(cuda_graph::graphGetCurrentStream());
+    }
+
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(tp_sync_post_rejection)");
         execBroadcast({{model_input.combo_tokens}, 0});
@@ -818,6 +842,16 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         draft_prefill_sampler_output.token_ids = fast_topk_sampler_output.token_ids;
     }
 
+    // Stream-async (Commit 5): record draft event on the main stream after
+    // draft_model_sample so the bookkeeping worker can wait on it before
+    // cloning all_probs / reading token_ids inside prepareDecodeSpecUpdateInfo.
+    // Recorded here (not at the end of the function) so the worker doesn't
+    // also wait for metrics collection / dispatch_output's per-stream slicing.
+    if (useStreamAsync()) {
+        draft_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+        draft_event->record(cuda_graph::graphGetCurrentStream());
+    }
+
     // collect metrics
     if (metrics_reporter_) {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(collect_metrics)");
@@ -842,13 +876,17 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(dispatch_output)");
         absl::Status result;
         if (useStreamAsync()) {
-            // Stream-async path: forks a bookkeeping worker and returns
-            // immediately. Disabled in Commit 2-4 (useStreamAsync() == false);
-            // the env switch lands in Commit 5.
+            // Stream-async path (Commit 5): hand off to the bookkeeping
+            // worker with the rejection/draft events recorded earlier on
+            // the main stream. The worker stream waits via
+            // cudaStreamWaitEvent (no main-thread CPU sync); main thread
+            // returns immediately.
             result =
                 dispatchDecodeAsync(stream_groups,
                                     speculative_sampler_output,
-                                    {std::move(draft_prefill_model_output), std::move(draft_prefill_sampler_output)});
+                                    {std::move(draft_prefill_model_output), std::move(draft_prefill_sampler_output)},
+                                    std::move(rejection_event),
+                                    std::move(draft_event));
         } else {
             result = batch_stream_processor_->dispatchDecode(
                 stream_groups,
@@ -1054,14 +1092,28 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
 }
 
 bool MtpExecutor::useStreamAsync() const {
-    // Commit 2-4: hard-wired off. Commit 5 replaces this with the
-    // RTP_LLM_MTP_STREAM_ASYNC env switch.
-    return false;
+    // Commit 5: env-gated stream-async. Read once and cache. Default off so
+    // production behaviour is unchanged unless RTP_LLM_MTP_STREAM_ASYNC=1
+    // is exported on server start. Worth recording: per-instance state isn't
+    // needed since the flag is process-wide and the AsyncRunner objects (and
+    // the underlying CUDA streams / worker threads) are eagerly constructed
+    // in the MtpExecutor ctor whether or not the path is taken.
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_MTP_STREAM_ASYNC");
+        bool        on  = (env != nullptr && std::string(env) == "1");
+        RTP_LLM_LOG_INFO("[stream-async] RTP_LLM_MTP_STREAM_ASYNC=%s -> useStreamAsync=%d",
+                         env ? env : "(unset)",
+                         static_cast<int>(on));
+        return on;
+    }();
+    return enabled;
 }
 
 absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&                          stream_groups,
                                               const speculative::SpeculativeSamplerOutput& spec_decode_output,
-                                              MergedOutput                                 draft_prefill_output) {
+                                              MergedOutput                                 draft_prefill_output,
+                                              std::shared_ptr<torch::Event>                rejection_event,
+                                              std::shared_ptr<torch::Event>                draft_event) {
     RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(dispatch_output_async)");
 
     const auto& accept_len_gpu_all    = spec_decode_output.accept_len;
@@ -1085,15 +1137,10 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         old_seq_lens.push_back(stream->seqLength());
     }
 
-    // Step 1: record the rejection_sampling done event on the main stream.
-    // Worker stream will wait on this before issuing D2H, ensuring main-stream
-    // GPU work (verify forward, sampling) drains first.
-    //
-    // Wrapped in shared_ptr because torch::Event (= c10::Event) is non-copyable
-    // but std::function (AsyncRunner::launch's signature) requires its callable
-    // to be CopyConstructible.
-    auto main_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
-    main_event->record(cuda_graph::graphGetCurrentStream());
+    // (events are recorded by the caller in decodeStep — see the
+    // rejection_event/draft_event recording sites above. Recording in the
+    // caller lets us hit the earliest point each tensor becomes valid on
+    // the main stream, instead of waiting for the queue tail at this point.)
 
     // Step 2: compute per-stream device-resident state and attach via setter.
     // accept_len has shape [batch_size]; accept_tokens has shape [batch_size,
@@ -1153,13 +1200,32 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
                                      stream_groups_copy = std::move(stream_groups_copy),
                                      spec_decode_copy   = std::move(spec_decode_copy),
                                      draft_prefill_copy = std::move(draft_prefill_copy),
-                                     main_event,
+                                     rejection_event,
+                                     draft_event,
                                      old_seq_lens = std::move(old_seq_lens)]() mutable {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_bookkeeping_worker)");
 
-        // Wait for main stream's rejection_sampling kernels to finish before
-        // touching any tensor produced on it.
-        main_event->block(cuda_graph::graphGetCurrentStream());
+        // Wait via cudaStreamWaitEvent (NOT cudaEventSynchronize) — the
+        // worker stream queues a wait, the worker thread continues to issue
+        // more work without blocking. The .cpu() inside
+        // prepareDecodeSpecUpdateInfo will eventually CPU-sync the worker
+        // stream, which is the only intended block point on this thread.
+        //
+        //   - rejection_event: produced after speculative_sampler_->forward
+        //     on the main stream → guards accept_len/accept_tokens.
+        //   - draft_event: produced after draft_model_sample on the main
+        //     stream → guards draft_prefill_output.sampler_output.all_probs
+        //     (cloned in prepareDecodeSpecUpdateInfo).
+        //
+        // Both being null is legal (caller skipped recording when stream-
+        // async is off; this lambda only runs when useStreamAsync() == true,
+        // but defensive null-check keeps the path obviously safe).
+        if (rejection_event) {
+            rejection_event->block(cuda_graph::graphGetCurrentStream());
+        }
+        if (draft_event) {
+            draft_event->block(cuda_graph::graphGetCurrentStream());
+        }
 
         // Roll back the conservative seqLength bump and clear device-resident
         // handles. specUpdate (called from updateStreams below) will
