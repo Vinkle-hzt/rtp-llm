@@ -490,21 +490,30 @@ public:
         pending_swap_done_event_.reset();
     }
 
-    // Stream-async (Phase 3.2 lite): per-stream device-resident handles to the
-    // current step's rejection_sampling output and the projected next-step
-    // sequence length. Populated by MtpExecutor::dispatchDecode at the moment
-    // the bookkeeping worker is forked, consumed by the next-step prepare
+    // Stream-async (Phase 3.2 lite): per-stream device-resident handles to
+    // the current step's rejection_sampling output, the projected next-step
+    // sequence length, and the next-step propose tokens. Populated by
+    // MtpExecutor::dispatchDecodeAsync at the moment the bookkeeping worker
+    // is forked, consumed by the next-step prepare
     // (prepareDecodeDraftModelInput / prepareOneStepSpecDecodeModelInput) so
     // model_input.combo_tokens / sequence_lengths can be assembled fully on
     // GPU without waiting for the host bookkeeping (D2H + specUpdate + KV
     // release) to land. CUDA stream ordering keeps next-step GPU work behind
     // the current step's rejection_sampling kernel.
+    //
+    // Shapes (per stream slice):
+    //   accept_len_gpu     : [1] int32          number of accepted tokens
+    //   accept_tokens_gpu  : [1, propose+1]     accepted token ids; first accept_len cols valid
+    //   next_seq_len_gpu   : [1] int32          old_seq_len + accept_len (committed seq len)
+    //   propose_tokens_gpu : [1, token_stride]  draft sampler output for next-step propose
     void setSpecDecodeDeviceState(torch::Tensor accept_len_gpu,
                                   torch::Tensor accept_tokens_gpu,
-                                  torch::Tensor next_seq_len_gpu) {
-        accept_len_gpu_    = std::move(accept_len_gpu);
-        accept_tokens_gpu_ = std::move(accept_tokens_gpu);
-        next_seq_len_gpu_  = std::move(next_seq_len_gpu);
+                                  torch::Tensor next_seq_len_gpu,
+                                  torch::Tensor propose_tokens_gpu = torch::Tensor()) {
+        accept_len_gpu_     = std::move(accept_len_gpu);
+        accept_tokens_gpu_  = std::move(accept_tokens_gpu);
+        next_seq_len_gpu_   = std::move(next_seq_len_gpu);
+        propose_tokens_gpu_ = std::move(propose_tokens_gpu);
     }
     const torch::Tensor& getAcceptLenGpu() const {
         return accept_len_gpu_;
@@ -515,10 +524,14 @@ public:
     const torch::Tensor& getNextSeqLenGpu() const {
         return next_seq_len_gpu_;
     }
+    const torch::Tensor& getProposeTokensGpu() const {
+        return propose_tokens_gpu_;
+    }
     void clearSpecDecodeDeviceState() {
-        accept_len_gpu_    = torch::Tensor();
-        accept_tokens_gpu_ = torch::Tensor();
-        next_seq_len_gpu_  = torch::Tensor();
+        accept_len_gpu_     = torch::Tensor();
+        accept_tokens_gpu_  = torch::Tensor();
+        next_seq_len_gpu_   = torch::Tensor();
+        propose_tokens_gpu_ = torch::Tensor();
     }
 
     GenerateStreamPtr getProposeStream() {
@@ -690,6 +703,7 @@ protected:
     torch::Tensor accept_len_gpu_;
     torch::Tensor accept_tokens_gpu_;
     torch::Tensor next_seq_len_gpu_;
+    torch::Tensor propose_tokens_gpu_;
 
     bool return_all_hidden_states_ = false;
 

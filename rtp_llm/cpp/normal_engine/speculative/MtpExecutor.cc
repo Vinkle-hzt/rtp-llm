@@ -1037,6 +1037,12 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
 
     const auto& accept_len_gpu_all    = spec_decode_output.accept_len;
     const auto& accept_tokens_gpu_all = spec_decode_output.accept_tokens;
+    // draft_prefill_output.sampler_output.token_ids is the per-stream propose
+    // token output of this step's draft model sample. Shape [batch_size,
+    // token_stride] on CUDA. Attached per-stream so the next step's prepare
+    // can build combo_tokens without waiting for the worker's specUpdate to
+    // populate sp_output_buffer->propose_tokens_gpu.
+    const auto& propose_tokens_gpu_all = draft_prefill_output.sampler_output.token_ids;
 
     auto all_streams = stream_groups.allStreams();
 
@@ -1071,6 +1077,8 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
             accept_len_gpu_all.defined() ? accept_len_gpu_all.narrow(0, idx, 1) : torch::Tensor();
         torch::Tensor accept_tokens_slice =
             accept_tokens_gpu_all.defined() ? accept_tokens_gpu_all.narrow(0, idx, 1) : torch::Tensor();
+        torch::Tensor propose_tokens_slice =
+            propose_tokens_gpu_all.defined() ? propose_tokens_gpu_all.narrow(0, idx, 1) : torch::Tensor();
 
         torch::Tensor next_seq_len_gpu;
         if (accept_len_slice.defined()) {
@@ -1079,8 +1087,10 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
                                              torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
             next_seq_len_gpu   = (cur_seq_len_t + accept_len_slice).to(torch::kInt32);
         }
-        stream->setSpecDecodeDeviceState(
-            std::move(accept_len_slice), std::move(accept_tokens_slice), std::move(next_seq_len_gpu));
+        stream->setSpecDecodeDeviceState(std::move(accept_len_slice),
+                                         std::move(accept_tokens_slice),
+                                         std::move(next_seq_len_gpu),
+                                         std::move(propose_tokens_slice));
         ++idx;
     }
 
