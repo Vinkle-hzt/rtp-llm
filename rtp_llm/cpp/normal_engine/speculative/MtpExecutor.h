@@ -26,6 +26,10 @@ struct MtpMetricsCollector {
 
 class MtpBufferHolder {
 public:
+    void hold(const torch::Tensor& tensor) {
+        tensor_holder_.push_back(tensor);
+    }
+
     void hold(const GptModelInputs& model_input) {
         tensor_holder_.push_back(model_input.combo_tokens);
         tensor_holder_.push_back(model_input.input_lengths);
@@ -103,6 +107,11 @@ protected:
                           const StreamGroups&         stream_groups,
                           std::vector<torch::Tensor>& draft_probs_list,
                           torch::Tensor&              draft_token_ids_t);
+
+    bool useMtpDeviceInput() const;
+    bool checkMtpDeviceInput() const;
+    void ensureMtpModelInputsOnCuda(GptModelInputs& model_input, const char* tag);
+    void checkMtpModelInputsOnCuda(const GptModelInputs& model_input, const char* tag) const;
 
     void prepareStreams(const std::list<GenerateStreamPtr>& streams,
                         std::list<GenerateStreamPtr>&       prefill_streams,
