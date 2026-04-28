@@ -385,6 +385,31 @@ def _register_process_groups_to_cpp():
         f"Registered C++ comm ops callbacks (modes: {list(mode_to_group.keys())})"
     )
 
+    # Bootstrap the UDS-backed intra-node TP broadcaster used by tpSyncModelInputs
+    # to bypass the cudaSync stall . Lazy-init in C++ races: rank 1
+    # can reach tpSyncModelInputs before rank 0 binds. Calling here guarantees
+    # both TP siblings invoke initialize() in the same window; they have just
+    # finished `new_group` together. Cross-node TP keeps the NCCL fallback.
+    if (
+        _parallelism_config is not None
+        and _parallelism_config.tp_size > 1
+        and _parallelism_config.tp_size <= _parallelism_config.local_world_size
+        and hasattr(librtp_compute_ops, "init_cpu_tp_broadcaster")
+    ):
+        # Parent PID is shared across all TP siblings spawned from the same
+        # multi_rank_start manager — peers agree on the UDS path with no env
+        # plumbing. dp_rank disambiguates DP groups on the same node.
+        base_path = f"/tmp/rtp_llm_tp_{os.getppid()}_dp{_parallelism_config.dp_rank}"
+        librtp_compute_ops.init_cpu_tp_broadcaster(
+            _parallelism_config.tp_rank,
+            _parallelism_config.tp_size,
+            base_path,
+        )
+        logging.info(
+            f"Initialized CpuTpBroadcaster (tp_rank={_parallelism_config.tp_rank}, "
+            f"tp_size={_parallelism_config.tp_size}, base_path={base_path})"
+        )
+
 
 def distributed_environment_initialized() -> bool:
     """Check if distributed environment is initialized.
