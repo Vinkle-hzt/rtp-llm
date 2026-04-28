@@ -108,6 +108,31 @@ protected:
                         std::list<GenerateStreamPtr>&       prefill_streams,
                         std::list<GenerateStreamPtr>&       decode_streams);
 
+    // Stream-async (Phase 3.2 lite) gate. Commit 2 keeps this hard-wired to
+    // false so the new dispatchDecodeAsync path stays dead; Commit 5 replaces
+    // the body with the RTP_LLM_MTP_STREAM_ASYNC env switch.
+    bool useStreamAsync() const;
+
+    // Stream-async (Phase 3.2 lite) dispatch. Caller records two events on
+    // the main stream BEFORE calling: rejection_event right after the
+    // rejection_sampling kernel launch (earliest signal that
+    // accept_len/accept_tokens are produced on device), and draft_event
+    // right after draft_model_sample (signals that all_probs is ready for
+    // the worker's clone). This function attaches device-resident
+    // accept_len/accept_tokens/next_seq_len/propose_tokens handles to each
+    // stream so the next step's prepare runs fully on GPU, conservatively
+    // bumps host seqLength to propose_step + 1 so the scheduler reserves
+    // enough KV, then forks a bookkeeping worker. The worker stream waits
+    // on both events via cudaStreamWaitEvent (no CPU wait on main), then
+    // issues D2H of accept_*/specUpdate/KV release on its own stream and
+    // worker thread. Main thread returns immediately so the next step can
+    // be dispatched while this step's GPU work is still in flight.
+    absl::Status dispatchDecodeAsync(const StreamGroups&                          stream_groups,
+                                     const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                     MergedOutput                                 draft_prefill_output,
+                                     std::shared_ptr<torch::Event>                rejection_event,
+                                     std::shared_ptr<torch::Event>                draft_event);
+
 private:
     std::unique_ptr<ModelBase>               model_;
     std::unique_ptr<Sampler>                 sampler_;
@@ -147,5 +172,12 @@ private:
 
     AsyncRunner target_verify_prepare_runner_;
     AsyncRunner draft_prefill_prepare_runner_;
+
+    // Phase 3.2 lite: bookkeeping worker for stream-async decode dispatch.
+    // Owns its own CUDA stream + thread (constructed in the .cc init list).
+    // Idle until useStreamAsync() returns true (Commit 5 env switch); the
+    // launched task waits on a main-stream event before doing D2H + specUpdate
+    // + KV release so the main thread is free to dispatch the next step.
+    AsyncRunner spec_bookkeeping_runner_;
 };
 };  // namespace rtp_llm
