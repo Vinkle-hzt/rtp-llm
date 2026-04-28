@@ -310,9 +310,8 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
     }
 
     if (gpu_packed.defined()) {
+        // gpu no need to sync communication
         execBroadcast({{gpu_packed}, 0});
-        execSyncCommunication(false);
-        cudaSyncAndCheck();
     }
 
     // Unpack from packed buffers back to each tensor's original storage.

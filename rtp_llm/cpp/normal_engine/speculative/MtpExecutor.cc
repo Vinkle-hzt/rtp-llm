@@ -732,8 +732,6 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             execBroadcast({{model_input.combo_tokens}, 0});
             execBroadcast({{model_input.last_hidden_states}, 0});
             execBroadcast({{model_input.lm_output_indexes}, 0});
-            execSyncCommunication(false);
-            cudaSyncAndCheck();
         }
         model_input.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
         model_input.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
