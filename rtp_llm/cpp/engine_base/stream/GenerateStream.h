@@ -534,6 +534,49 @@ public:
         propose_tokens_gpu_ = torch::Tensor();
     }
 
+    // Full-async (Commit 10): host-side optimistic projections written by
+    // MtpExecutor::dispatchDecodeAsync at dispatch time, consumed by the
+    // next step's GPU correction kernel + scheduler (Commit 11+).
+    //
+    // optimistic_seq_len_     : projected seq_length AFTER this step assuming
+    //                           worst-case acceptance (= old_seq_len + propose+1).
+    //                           Mirrors the conservative setSeqLength() bump so
+    //                           the scheduler can read this value safely without
+    //                           racing the bookkeeping worker's rollback.
+    // prev_batch_index_       : this stream's slot in this step's batch. The
+    //                           next-step's GPU correction kernel uses this as
+    //                           a gather index into the prev step's
+    //                           accept_len_gpu / num_accepted_tokens.gpu.
+    //                           Stays -1 for streams that did not participate
+    //                           in the previous step (new arrivals or after a
+    //                           preempt+resume).
+    // prev_num_draft_tokens_  : optimistic accept count this step assumed
+    //                           (= propose+1). Used by the GPU correction
+    //                           kernel to compute the (real - optimistic) delta.
+    void setOptimisticSeqLen(int v) {
+        optimistic_seq_len_ = v;
+    }
+    int optimisticSeqLen() const {
+        return optimistic_seq_len_;
+    }
+    void setPrevBatchIndex(int v) {
+        prev_batch_index_ = v;
+    }
+    int prevBatchIndex() const {
+        return prev_batch_index_;
+    }
+    void setPrevNumDraftTokens(int v) {
+        prev_num_draft_tokens_ = v;
+    }
+    int prevNumDraftTokens() const {
+        return prev_num_draft_tokens_;
+    }
+    void clearOptimisticState() {
+        optimistic_seq_len_    = 0;
+        prev_batch_index_      = -1;
+        prev_num_draft_tokens_ = 0;
+    }
+
     GenerateStreamPtr getProposeStream() {
         return propose_stream_;
     }
@@ -704,6 +747,14 @@ protected:
     torch::Tensor accept_tokens_gpu_;
     torch::Tensor next_seq_len_gpu_;
     torch::Tensor propose_tokens_gpu_;
+
+    // Full-async (Commit 10): host-side optimistic projections; see
+    // setOptimisticSeqLen() / setPrevBatchIndex() / setPrevNumDraftTokens().
+    // Default values (0 / -1 / 0) signal "no prior dispatch" and let the
+    // GPU correction kernel fall back to the new-arrival branch.
+    int optimistic_seq_len_    = 0;
+    int prev_batch_index_      = -1;
+    int prev_num_draft_tokens_ = 0;
 
     bool return_all_hidden_states_ = false;
 

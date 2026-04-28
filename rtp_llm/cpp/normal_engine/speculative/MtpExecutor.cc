@@ -1184,7 +1184,19 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
     // cannot fire.
     idx = 0;
     for (auto& stream : all_streams) {
-        stream->setSeqLength(old_seq_lens[idx] + static_cast<int>(propose_step_) + 1);
+        const int optimistic_seq_len = old_seq_lens[idx] + static_cast<int>(propose_step_) + 1;
+        stream->setSeqLength(optimistic_seq_len);
+        // Full-async (Commit 10): record the optimistic projection in a
+        // dedicated field so the next-step scheduler / GPU correction
+        // kernel (Commit 11+) can read it without racing the bookkeeping
+        // worker's setSeqLength() rollback. prev_batch_index = idx lets
+        // the next step's gather kernel index back into this step's
+        // accept_len_gpu / num_accepted_tokens.gpu slices.
+        // Dead path until Commit 11 wires the consumers; getters not yet
+        // called by anyone.
+        stream->setOptimisticSeqLen(optimistic_seq_len);
+        stream->setPrevBatchIndex(static_cast<int>(idx));
+        stream->setPrevNumDraftTokens(static_cast<int>(propose_step_) + 1);
         ++idx;
     }
 
