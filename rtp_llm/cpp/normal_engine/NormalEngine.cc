@@ -417,7 +417,7 @@ void NormalEngine::loop() {
         RTP_LLM_LOG_INFO("async scheduling scaffold enabled (legacy=%d, real=%d, bookkeeping_timeout_ms=%d)",
                          static_cast<int>(legacy_async_scaffold),
                          static_cast<int>(use_async_scheduling_real_),
-                         autil::EnvUtil::getEnv("RTP_LLM_ASYNC_BOOKKEEPING_TIMEOUT_MS", 1000));
+                         autil::EnvUtil::getEnv("RTP_LLM_ASYNC_BOOKKEEPING_TIMEOUT_MS", 0));
         result_thread_ = std::thread(&NormalEngine::resultLoop, this);
     }
     while (running_) {
@@ -435,7 +435,7 @@ absl::Status NormalEngine::awaitLastBookkeeping() {
     }
     auto    future           = last_future_;
     int64_t start_time_us    = autil::TimeUtility::currentTimeInMicroSeconds();
-    int64_t timeout_ms       = autil::EnvUtil::getEnv("RTP_LLM_ASYNC_BOOKKEEPING_TIMEOUT_MS", 1000);
+    int64_t timeout_ms       = autil::EnvUtil::getEnv("RTP_LLM_ASYNC_BOOKKEEPING_TIMEOUT_MS", 0);
     int64_t last_log_time_us = start_time_us;
     // Spin briefly when the result thread is keeping up; otherwise yield.
     // Once the executor processAsync/processResults split lands, this turns
@@ -539,8 +539,12 @@ absl::Status NormalEngine::asyncStep() {
     if (future->streams.empty()) {
         future->streams = streams;
     }
-    future->debug_label     = "normal_engine_process_async";
-    future->launch_time_us  = launch_time_us;
+    if (future->debug_label.empty() || future->debug_label == "normal_engine_batch") {
+        future->debug_label = "normal_engine_process_async";
+    }
+    if (future->launch_time_us == 0) {
+        future->launch_time_us = launch_time_us;
+    }
     future->enqueue_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
     future->stage.store(BatchFutureStage::Enqueued, std::memory_order_release);
     {

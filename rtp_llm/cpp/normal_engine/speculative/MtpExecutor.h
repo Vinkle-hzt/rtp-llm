@@ -56,8 +56,10 @@ public:
                          const std::vector<int32_t>&                    kv_cache_layer_to_group = {},
                          bool                                           warm_up                 = false);
 
-    absl::Status process(const std::list<GenerateStreamPtr>& streams) override;
-    bool         updateEplbConfig(const EPLBConfig& config) override;
+    absl::Status                   process(const std::list<GenerateStreamPtr>& streams) override;
+    absl::StatusOr<BatchFuturePtr> processAsync(const std::list<GenerateStreamPtr>& streams) override;
+    absl::Status                   processResults(const BatchFuturePtr& future) override;
+    bool                           updateEplbConfig(const EPLBConfig& config) override;
 
     void setTargetModel(std::unique_ptr<ModelBase> model) {
         model_ = std::move(model);
@@ -183,5 +185,12 @@ private:
     // launched task waits on a main-stream event before doing D2H + specUpdate
     // + KV release so the main thread is free to dispatch the next step.
     AsyncRunner spec_bookkeeping_runner_;
+
+    // F4 processAsync/processResults bridge. Set only while processAsync()
+    // calls the existing process()/decodeStep() path; dispatchDecodeAsync()
+    // then packages decode bookkeeping into a BatchFuture instead of
+    // launching the worker immediately.
+    bool           capture_decode_future_ = false;
+    BatchFuturePtr captured_decode_future_;
 };
 };  // namespace rtp_llm

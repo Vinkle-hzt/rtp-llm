@@ -27,6 +27,8 @@ enum class BatchFutureStage : int {
 // executor return a future that owns any stream/tensor/event state crossing
 // that step boundary; the result thread consumes it and marks bookkeeping_done.
 struct BatchFuture {
+    virtual ~BatchFuture() = default;
+
     std::string debug_label = "normal_engine_batch";
 
     // Streams that participated in this batch. Owned references are kept

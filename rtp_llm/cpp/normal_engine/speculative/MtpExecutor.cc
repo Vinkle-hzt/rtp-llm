@@ -25,6 +25,23 @@
 
 namespace rtp_llm {
 
+namespace {
+
+struct MtpDecodeBatchFuture: public BatchFuture {
+    StreamGroups                          stream_groups;
+    speculative::SpeculativeSamplerOutput spec_decode_output;
+    MergedOutput                          draft_prefill_output;
+    std::shared_ptr<torch::Event>         rejection_event;
+    std::shared_ptr<torch::Event>         draft_event;
+    std::vector<int>                      old_seq_lens;
+
+    explicit MtpDecodeBatchFuture(const StreamGroups& stream_groups): stream_groups(stream_groups) {
+        debug_label = "mtp_decode_bookkeeping";
+    }
+};
+
+}  // namespace
+
 bool MtpExecutor::isTpRank0() const {
     return tp_rank_ == 0;
 }
@@ -998,6 +1015,90 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
     return absl::OkStatus();
 }
 
+absl::StatusOr<BatchFuturePtr> MtpExecutor::processAsync(const std::list<GenerateStreamPtr>& streams) {
+    RTP_LLM_PROFILE_SCOPE_DYNAMIC(
+        "executor.mtp.process_async(stream_size=%zu,mtp_step=%zu)", streams.size(), propose_step_);
+
+    struct CaptureGuard {
+        MtpExecutor*   executor;
+        bool           old_capture;
+        BatchFuturePtr old_future;
+        ~CaptureGuard() {
+            executor->capture_decode_future_  = old_capture;
+            executor->captured_decode_future_ = std::move(old_future);
+        }
+    } guard{this, capture_decode_future_, std::move(captured_decode_future_)};
+
+    capture_decode_future_ = true;
+    captured_decode_future_.reset();
+
+    auto status = process(streams);
+    if (!status.ok()) {
+        return status;
+    }
+
+    auto future = captured_decode_future_;
+    if (!future) {
+        future              = std::make_shared<BatchFuture>();
+        future->debug_label = "mtp_process_async_no_decode_bookkeeping";
+        future->streams     = streams;
+    }
+    return future;
+}
+
+absl::Status MtpExecutor::processResults(const BatchFuturePtr& future) {
+    if (!future) {
+        return absl::InvalidArgumentError("MtpExecutor::processResults got null BatchFuture");
+    }
+
+    auto decode_future = std::dynamic_pointer_cast<MtpDecodeBatchFuture>(future);
+    if (!decode_future) {
+        return Executor::processResults(future);
+    }
+
+    RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.process_results(stream_size=%zu)", decode_future->streams.size());
+
+    spec_bookkeeping_runner_.launch([processor          = batch_stream_processor_.get(),
+                                     stream_groups_copy = decode_future->stream_groups,
+                                     spec_decode_copy   = decode_future->spec_decode_output,
+                                     draft_prefill_copy = std::move(decode_future->draft_prefill_output),
+                                     rejection_event    = decode_future->rejection_event,
+                                     draft_event        = decode_future->draft_event,
+                                     old_seq_lens       = decode_future->old_seq_lens,
+                                     decode_future]() mutable {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_bookkeeping_worker)");
+
+        if (rejection_event) {
+            rejection_event->block(cuda_graph::graphGetCurrentStream());
+        }
+        if (draft_event) {
+            draft_event->block(cuda_graph::graphGetCurrentStream());
+        }
+
+        auto worker_streams = stream_groups_copy.allStreams();
+        int  i              = 0;
+        for (auto& stream : worker_streams) {
+            stream->setSeqLength(old_seq_lens[i]);
+            stream->clearSpecDecodeDeviceState();
+            ++i;
+        }
+
+        auto status = processor->dispatchDecode(stream_groups_copy, spec_decode_copy, draft_prefill_copy);
+        if (!status.ok()) {
+            RTP_LLM_LOG_ERROR("[stream-async] dispatchDecode (result thread) failed: %s", status.ToString().c_str());
+        }
+        decode_future->bookkeeping_status = status;
+
+        for (auto& stream : worker_streams) {
+            auto event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+            event->record(cuda_graph::graphGetCurrentStream());
+            stream->setPendingSwapDoneEvent(std::static_pointer_cast<void>(event));
+        }
+    });
+    spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+    return decode_future->bookkeeping_status;
+}
+
 bool MtpExecutor::updateEplbConfig(const EPLBConfig& config) {
     if (expert_balancer_) {
         return expert_balancer_->updateEplbConfig(config);
@@ -1210,38 +1311,39 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         ++idx;
     }
 
-    // Step 4: fork the bookkeeping worker. The worker's stream guard switches
-    // the current torch stream to the worker stream, so .cpu() inside
-    // prepareDecodeSpecUpdateInfo issues its D2H on the worker stream and
-    // only blocks the worker thread.
-    auto* processor          = batch_stream_processor_.get();
-    auto  spec_decode_copy   = spec_decode_output;
-    auto  draft_prefill_copy = std::move(draft_prefill_output);
-    auto  stream_groups_copy = stream_groups;
+    // Step 4: package decode bookkeeping. In the legacy stream-async path
+    // this still launches the local AsyncRunner immediately. When called from
+    // processAsync(), NormalEngine's result thread receives the future and
+    // invokes processResults() to run the same worker-side bookkeeping.
+    auto decode_future                  = std::make_shared<MtpDecodeBatchFuture>(stream_groups);
+    decode_future->streams              = all_streams;
+    decode_future->spec_decode_output   = spec_decode_output;
+    decode_future->draft_prefill_output = std::move(draft_prefill_output);
+    decode_future->rejection_event      = std::move(rejection_event);
+    decode_future->draft_event          = std::move(draft_event);
+    decode_future->old_seq_lens         = std::move(old_seq_lens);
+
+    if (capture_decode_future_) {
+        captured_decode_future_ = decode_future;
+        return absl::OkStatus();
+    }
+
+    auto* processor = batch_stream_processor_.get();
     spec_bookkeeping_runner_.launch([processor,
-                                     stream_groups_copy = std::move(stream_groups_copy),
-                                     spec_decode_copy   = std::move(spec_decode_copy),
-                                     draft_prefill_copy = std::move(draft_prefill_copy),
-                                     rejection_event,
-                                     draft_event,
-                                     old_seq_lens = std::move(old_seq_lens)]() mutable {
+                                     stream_groups_copy = decode_future->stream_groups,
+                                     spec_decode_copy   = decode_future->spec_decode_output,
+                                     draft_prefill_copy = std::move(decode_future->draft_prefill_output),
+                                     rejection_event    = decode_future->rejection_event,
+                                     draft_event        = decode_future->draft_event,
+                                     old_seq_lens       = decode_future->old_seq_lens,
+                                     decode_future]() mutable {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_bookkeeping_worker)");
 
-        // Wait via cudaStreamWaitEvent (NOT cudaEventSynchronize) — the
+        // Wait via cudaStreamWaitEvent (NOT cudaEventSynchronize) - the
         // worker stream queues a wait, the worker thread continues to issue
         // more work without blocking. The .cpu() inside
         // prepareDecodeSpecUpdateInfo will eventually CPU-sync the worker
         // stream, which is the only intended block point on this thread.
-        //
-        //   - rejection_event: produced after speculative_sampler_->forward
-        //     on the main stream → guards accept_len/accept_tokens.
-        //   - draft_event: produced after draft_model_sample on the main
-        //     stream → guards draft_prefill_output.sampler_output.all_probs
-        //     (cloned in prepareDecodeSpecUpdateInfo).
-        //
-        // Both being null is legal (caller skipped recording when stream-
-        // async is off; this lambda only runs when useStreamAsync() == true,
-        // but defensive null-check keeps the path obviously safe).
         if (rejection_event) {
             rejection_event->block(cuda_graph::graphGetCurrentStream());
         }
@@ -1260,30 +1362,12 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
             ++i;
         }
 
-        // Reuse the original synchronous dispatch logic. .cpu() inside
-        // prepareDecodeSpecUpdateInfo lands on the worker stream (current
-        // stream guard is set by AsyncRunner::workerLoop).
         auto status = processor->dispatchDecode(stream_groups_copy, spec_decode_copy, draft_prefill_copy);
         if (!status.ok()) {
             RTP_LLM_LOG_ERROR("[stream-async] dispatchDecode (worker) failed: %s", status.ToString().c_str());
         }
+        decode_future->bookkeeping_status = status;
 
-        // Phase 3.2 lite (Commit 4): record swap done event per stream and
-        // attach so the next step's verify can wait via cudaStreamWaitEvent.
-        //
-        // Why all streams (not just linear-attn): GenerateStream::specUpdate
-        // unconditionally calls swapLinearBlocks when accept_token_num > 1
-        // and stream_cache_resource_ is set. For MTP with propose_step >= 2
-        // and typical accept_len 3-4, the swap fires on every step. Recording
-        // an event for every stream costs one cudaEventRecord (~1us) and
-        // makes the consumer side a no-op (event already signalled) for
-        // streams that didn't actually swap.
-        //
-        // With Commit 4's decodeStep-entry sync, the event is fully drained
-        // before the consumer reads pending_swap_done_event_; the per-stream
-        // event remains as scaffolding for the Phase 3.3 ultimate async path
-        // (where the entry sync moves off the hot path and per-stream events
-        // become the only guard).
         for (auto& stream : worker_streams) {
             auto event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
             event->record(cuda_graph::graphGetCurrentStream());
