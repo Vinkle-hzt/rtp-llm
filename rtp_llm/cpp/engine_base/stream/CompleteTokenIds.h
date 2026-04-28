@@ -37,12 +37,16 @@ public:
                 int&                 error_token_id);
     void copyTokensTo(int batch_id, void* dst, int offset, size_t token_num);
 
-    int  seqLength() const;
-    int  totalSeqLength() const;
-    int  commonSeqLength() const;
-    void setSeqLength(int seq_length);
-    void setReserveStep(int reserve_step);
-    int  getReserveStep() const;
+    int      seqLength() const;
+    int      seqLengthForKVReserve() const;
+    int      totalSeqLength() const;
+    int      totalSeqLengthForKVReserve() const;
+    int      commonSeqLength() const;
+    void     setSeqLength(int seq_length);
+    uint64_t setSeqLengthForKVReserve(int seq_length);
+    bool     clearSeqLengthForKVReserve(uint64_t expected_epoch);
+    void     setReserveStep(int reserve_step);
+    int      getReserveStep() const;
 
     torch::Tensor completeTokenIds();
 
@@ -66,12 +70,14 @@ private:
     int max_seq_len_;
     int seq_size_per_block_;
 
-    int     seq_length_;
-    int     common_len_;
-    int     start_check_seq_length_;
-    int     reserve_step_           = 0;
-    int64_t first_token_time_us_    = 0;
-    int64_t first_token_latency_us_ = 0;
+    int      seq_length_;
+    int      common_len_;
+    int      start_check_seq_length_;
+    int      kv_reserve_seq_length_  = -1;
+    uint64_t kv_reserve_epoch_       = 0;
+    int      reserve_step_           = 0;
+    int64_t  first_token_time_us_    = 0;
+    int64_t  first_token_latency_us_ = 0;
 
     torch::Tensor complete_token_ids_;
 };

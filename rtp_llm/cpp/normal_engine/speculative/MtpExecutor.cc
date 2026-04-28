@@ -34,7 +34,8 @@ struct MtpDecodeBatchFuture: public BatchFuture {
     MergedOutput                          draft_prefill_output;
     std::shared_ptr<torch::Event>         rejection_event;
     std::shared_ptr<torch::Event>         draft_event;
-    std::vector<int>                      old_seq_lens;
+    std::vector<uint64_t>                 device_state_epochs;
+    std::vector<uint64_t>                 kv_reserve_epochs;
 
     explicit MtpDecodeBatchFuture(const StreamGroups& stream_groups): stream_groups(stream_groups) {
         debug_label = "mtp_decode_bookkeeping";
@@ -1073,7 +1074,8 @@ absl::Status MtpExecutor::processResults(const BatchFuturePtr& future) {
                                      draft_prefill_copy = std::move(decode_future->draft_prefill_output),
                                      rejection_event    = decode_future->rejection_event,
                                      draft_event        = decode_future->draft_event,
-                                     old_seq_lens       = decode_future->old_seq_lens,
+                                     device_epochs      = decode_future->device_state_epochs,
+                                     reserve_epochs     = decode_future->kv_reserve_epochs,
                                      decode_future]() mutable {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_bookkeeping_worker)");
 
@@ -1091,12 +1093,6 @@ absl::Status MtpExecutor::processResults(const BatchFuturePtr& future) {
         }
 
         auto worker_streams = stream_groups_copy.allStreams();
-        int  i              = 0;
-        for (auto& stream : worker_streams) {
-            stream->setSeqLength(old_seq_lens[i]);
-            stream->clearSpecDecodeDeviceState();
-            ++i;
-        }
 
         auto status = processor->dispatchDecode(stream_groups_copy, spec_decode_copy, draft_prefill_copy);
         if (!status.ok()) {
@@ -1104,10 +1100,18 @@ absl::Status MtpExecutor::processResults(const BatchFuturePtr& future) {
         }
         decode_future->bookkeeping_status = status;
 
+        size_t i = 0;
         for (auto& stream : worker_streams) {
+            if (i < device_epochs.size()) {
+                stream->clearSpecDecodeDeviceState(device_epochs[i]);
+            }
+            if (i < reserve_epochs.size()) {
+                stream->clearKVReserveSeqLength(reserve_epochs[i]);
+            }
             auto event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
             event->record(cuda_graph::graphGetCurrentStream());
             stream->setPendingSwapDoneEvent(std::static_pointer_cast<void>(event));
+            ++i;
         }
     });
     spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
@@ -1265,16 +1269,6 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
 
     auto all_streams = stream_groups.allStreams();
 
-    // Snapshot host-side seqLength per stream BEFORE the conservative bump.
-    // The bookkeeping worker rolls back to this value before specUpdate so
-    // GenerateStream::specUpdate (which increments seqLength by num_new_tokens)
-    // lands on the correct base.
-    std::vector<int> old_seq_lens;
-    old_seq_lens.reserve(all_streams.size());
-    for (const auto& stream : all_streams) {
-        old_seq_lens.push_back(stream->seqLength());
-    }
-
     // (events are recorded by the caller in decodeStep — see the
     // rejection_event/draft_event recording sites above. Recording in the
     // caller lets us hit the earliest point each tensor becomes valid on
@@ -1282,9 +1276,14 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
 
     // Step 2: compute per-stream device-resident state and attach via setter.
     // accept_len has shape [batch_size]; accept_tokens has shape [batch_size,
-    // propose_step + 1]. next_seq_len_gpu is computed on GPU as
-    // (cur_seq_len_t + accept_len_slice) so the next decode step's prepare
-    // can build sequence_lengths without waiting on a CPU value.
+    // propose_step + 1]. next_seq_len_gpu is computed on GPU. When a prior
+    // step already attached projected committed length, chain from that
+    // device value instead of host seqLength so the future one-inflight path
+    // does not need previous CPU bookkeeping to build next-step inputs.
+    std::vector<uint64_t> device_state_epochs;
+    std::vector<uint64_t> kv_reserve_epochs;
+    device_state_epochs.reserve(all_streams.size());
+    kv_reserve_epochs.reserve(all_streams.size());
     int64_t idx = 0;
     for (auto& stream : all_streams) {
         torch::Tensor accept_len_slice =
@@ -1296,33 +1295,29 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
 
         torch::Tensor next_seq_len_gpu;
         if (accept_len_slice.defined()) {
-            auto cur_seq_len_t = torch::full({1},
-                                             static_cast<int64_t>(old_seq_lens[idx]),
-                                             torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-            next_seq_len_gpu   = (cur_seq_len_t + accept_len_slice).to(torch::kInt32);
+            torch::Tensor base_seq_len_gpu;
+            const auto&   previous_next_seq_len_gpu = stream->getNextSeqLenGpu();
+            if (previous_next_seq_len_gpu.defined() && previous_next_seq_len_gpu.is_cuda()) {
+                base_seq_len_gpu = previous_next_seq_len_gpu.to(torch::kInt32);
+            } else {
+                base_seq_len_gpu = torch::full({1},
+                                               static_cast<int64_t>(stream->seqLength()),
+                                               torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+            }
+            next_seq_len_gpu = (base_seq_len_gpu + accept_len_slice).to(torch::kInt32);
         }
-        stream->setSpecDecodeDeviceState(std::move(accept_len_slice),
-                                         std::move(accept_tokens_slice),
-                                         std::move(next_seq_len_gpu),
-                                         std::move(propose_tokens_slice));
-        ++idx;
-    }
+        auto device_epoch = stream->setSpecDecodeDeviceState(std::move(accept_len_slice),
+                                                             std::move(accept_tokens_slice),
+                                                             std::move(next_seq_len_gpu),
+                                                             std::move(propose_tokens_slice));
+        device_state_epochs.push_back(device_epoch);
 
-    // Step 3: bump host seqLength to the conservative upper bound. The
-    // scheduler / KV manager reads seqLength to size the next step's KV
-    // reservation; reserve_step_ in NormalEngine.cc:104 already pre-reserves
-    // propose_step + 1 blocks, so this bump just makes the reservation
-    // visible. Worker rolls back to old_seq_lens[i] and lets specUpdate set
-    // the actual value (old + accept_len).
-    //
-    // TODO(phase32): the rollback in the worker is not atomic with respect
-    // to scheduler reads of seqLength; under the env switch (Commit 5+) we
-    // need a per-stream lock or a separate "conservative seqLength" field
-    // that the scheduler reads. For Commit 2 the path is dead so the race
-    // cannot fire.
-    idx = 0;
-    for (auto& stream : all_streams) {
-        stream->setSeqLength(old_seq_lens[idx] + static_cast<int>(propose_step_) + 1);
+        // Keep conservative KV reservation out of CompleteTokenIds::seqLength().
+        // The allocator reads kvReserveSeqLength(), while all CPU-visible token
+        // state continues to read the committed seqLength().
+        auto reserve_epoch =
+            stream->setKVReserveSeqLength(stream->kvReserveSeqLength() + static_cast<int>(propose_step_) + 1);
+        kv_reserve_epochs.push_back(reserve_epoch);
         ++idx;
     }
 
@@ -1336,7 +1331,8 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
     decode_future->draft_prefill_output = std::move(draft_prefill_output);
     decode_future->rejection_event      = std::move(rejection_event);
     decode_future->draft_event          = std::move(draft_event);
-    decode_future->old_seq_lens         = std::move(old_seq_lens);
+    decode_future->device_state_epochs  = std::move(device_state_epochs);
+    decode_future->kv_reserve_epochs    = std::move(kv_reserve_epochs);
 
     if (capture_decode_future_) {
         captured_decode_future_ = decode_future;
@@ -1350,7 +1346,8 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
                                      draft_prefill_copy = std::move(decode_future->draft_prefill_output),
                                      rejection_event    = decode_future->rejection_event,
                                      draft_event        = decode_future->draft_event,
-                                     old_seq_lens       = decode_future->old_seq_lens,
+                                     device_epochs      = decode_future->device_state_epochs,
+                                     reserve_epochs     = decode_future->kv_reserve_epochs,
                                      decode_future]() mutable {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_bookkeeping_worker)");
 
@@ -1372,16 +1369,7 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
             state_lock = std::unique_lock<std::recursive_mutex>(asyncStreamStateMutex());
         }
 
-        // Roll back the conservative seqLength bump and clear device-resident
-        // handles. specUpdate (called from updateStreams below) will
-        // increment seqLength by the actual num_new_tokens (= accept_len).
         auto worker_streams = stream_groups_copy.allStreams();
-        int  i              = 0;
-        for (auto& stream : worker_streams) {
-            stream->setSeqLength(old_seq_lens[i]);
-            stream->clearSpecDecodeDeviceState();
-            ++i;
-        }
 
         auto status = processor->dispatchDecode(stream_groups_copy, spec_decode_copy, draft_prefill_copy);
         if (!status.ok()) {
@@ -1389,10 +1377,18 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         }
         decode_future->bookkeeping_status = status;
 
+        size_t i = 0;
         for (auto& stream : worker_streams) {
+            if (i < device_epochs.size()) {
+                stream->clearSpecDecodeDeviceState(device_epochs[i]);
+            }
+            if (i < reserve_epochs.size()) {
+                stream->clearKVReserveSeqLength(reserve_epochs[i]);
+            }
             auto event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
             event->record(cuda_graph::graphGetCurrentStream());
             stream->setPendingSwapDoneEvent(std::static_pointer_cast<void>(event));
+            ++i;
         }
     });
 

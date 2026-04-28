@@ -140,7 +140,7 @@ int HybridTypeKVCacheAllocator::reuseCache(const CacheKeysType& cache_keys, Batc
 MallocResult HybridTypeKVCacheAllocator::incrMalloc(const MallocInfo& malloc_info) {
     auto&     kv_resource  = malloc_info.batch_kv_cache_resource;
     const int batch_size   = kv_resource->batchSize();
-    const int seq_len      = malloc_info.complete_token_ids->seqLength();
+    const int seq_len      = malloc_info.complete_token_ids->seqLengthForKVReserve();
     const int reserve_step = malloc_info.complete_token_ids->getReserveStep();
 
     // Record original sizes for rollback in case any subsequent allocation fails
@@ -494,10 +494,10 @@ int HybridTypeKVCacheAllocator::getNeedBlocks(const MallocInfo& malloc_info) con
         return 0;
     }
     const int batch_size     = malloc_info.batch_kv_cache_resource->batchSize();
-    const int total_seq_len  = malloc_info.complete_token_ids->totalSeqLength();
+    const int total_seq_len  = malloc_info.complete_token_ids->totalSeqLengthForKVReserve();
     const int common_seq_len = std::min(malloc_info.complete_token_ids->commonSeqLength(), total_seq_len);
 
-    const int seq_len      = malloc_info.complete_token_ids->seqLength();
+    const int seq_len      = malloc_info.complete_token_ids->seqLengthForKVReserve();
     const int reserve_step = malloc_info.complete_token_ids->getReserveStep();
 
     const bool reuse_enabled    = malloc_info.reuse_cache;

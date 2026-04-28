@@ -226,6 +226,67 @@ TEST_F(MtpBatchStreamProcessorTest, testGatherDecodeModelInput) {
     EXPECT_EQ(expect_last_hidden_states, toVec<float>(last_hidden_states_h));
 }
 
+TEST_F(MtpBatchStreamProcessorTest, testKVReserveSeqLengthDoesNotMutateTruth) {
+    ModelConfig     model_config;
+    RuntimeConfig   runtime_config;
+    ResourceContext resource_context;
+
+    model_config.max_seq_len = 2048;
+    model_config.vocab_size  = 4;
+    model_config.num_layers  = 1;
+
+    auto      stream            = createContextStream(model_config, runtime_config, resource_context, {1, 2, 3}, 1);
+    const int committed_seq_len = stream->seqLength();
+    const int common_seq_len    = stream->completeTokenIdsPtr()->commonSeqLength();
+
+    auto epoch1 = stream->setKVReserveSeqLength(committed_seq_len + 5);
+    EXPECT_EQ(committed_seq_len, stream->seqLength());
+    EXPECT_EQ(common_seq_len, stream->completeTokenIdsPtr()->commonSeqLength());
+    EXPECT_EQ(committed_seq_len + 5, stream->kvReserveSeqLength());
+
+    auto epoch2 = stream->setKVReserveSeqLength(committed_seq_len + 7);
+    EXPECT_FALSE(stream->clearKVReserveSeqLength(epoch1));
+    EXPECT_EQ(committed_seq_len + 7, stream->kvReserveSeqLength());
+
+    CompleteTokenIds copied_tokens(*stream->completeTokenIdsPtr());
+    EXPECT_EQ(committed_seq_len, copied_tokens.seqLength());
+    EXPECT_EQ(committed_seq_len, copied_tokens.seqLengthForKVReserve());
+
+    EXPECT_TRUE(stream->clearKVReserveSeqLength(epoch2));
+    EXPECT_FALSE(stream->clearKVReserveSeqLength(epoch2));
+    EXPECT_EQ(committed_seq_len, stream->kvReserveSeqLength());
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testSpecDecodeDeviceStateEpochGuard) {
+    ModelConfig     model_config;
+    RuntimeConfig   runtime_config;
+    ResourceContext resource_context;
+
+    model_config.max_seq_len = 2048;
+    model_config.vocab_size  = 4;
+    model_config.num_layers  = 1;
+
+    auto stream = createContextStream(model_config, runtime_config, resource_context, {1}, 1);
+    auto epoch1 = stream->setSpecDecodeDeviceState(torch::tensor({1}, torch::kInt32).to(torch::kCUDA),
+                                                   torch::tensor({{2, 3}}, torch::kInt32).to(torch::kCUDA),
+                                                   torch::tensor({2}, torch::kInt32).to(torch::kCUDA),
+                                                   torch::tensor({{4}}, torch::kInt32).to(torch::kCUDA));
+    auto epoch2 = stream->setSpecDecodeDeviceState(torch::tensor({2}, torch::kInt32).to(torch::kCUDA),
+                                                   torch::tensor({{5, 6}}, torch::kInt32).to(torch::kCUDA),
+                                                   torch::tensor({3}, torch::kInt32).to(torch::kCUDA),
+                                                   torch::tensor({{7}}, torch::kInt32).to(torch::kCUDA));
+
+    EXPECT_FALSE(stream->clearSpecDecodeDeviceState(epoch1));
+    EXPECT_TRUE(stream->getAcceptLenGpu().defined());
+    EXPECT_EQ(2, stream->getAcceptLenGpu().cpu().item<int>());
+    EXPECT_TRUE(stream->clearSpecDecodeDeviceState(epoch2));
+    EXPECT_FALSE(stream->clearSpecDecodeDeviceState(epoch2));
+    EXPECT_FALSE(stream->getAcceptLenGpu().defined());
+    EXPECT_FALSE(stream->getAcceptTokensGpu().defined());
+    EXPECT_FALSE(stream->getNextSeqLenGpu().defined());
+    EXPECT_FALSE(stream->getProposeTokensGpu().defined());
+}
+
 TEST_F(MtpBatchStreamProcessorTest, testPrepareOneStepSpecDecodeModelInput) {
     ModelConfig                 model_config;
     RuntimeConfig               runtime_config;

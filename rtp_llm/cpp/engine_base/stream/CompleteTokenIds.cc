@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/engine_base/stream/CompleteTokenIds.h"
 
+#include <algorithm>
 #include <sstream>
 
 namespace rtp_llm {
@@ -18,6 +19,10 @@ CompleteTokenIds::CompleteTokenIds(const CompleteTokenIds& other, bool share, in
     seq_length_(other.seq_length_),
     common_len_(other.common_len_),
     start_check_seq_length_(other.start_check_seq_length_),
+    // KV reservation is transient scheduler state. A copied token buffer must
+    // inherit committed truth only, not an in-flight conservative projection.
+    kv_reserve_seq_length_(-1),
+    kv_reserve_epoch_(0),
     first_token_time_us_(other.first_token_time_us_),
     first_token_latency_us_(other.first_token_latency_us_) {
     if (share) {
@@ -222,8 +227,27 @@ void CompleteTokenIds::setSeqLength(int seq_length) {
     }
 }
 
+uint64_t CompleteTokenIds::setSeqLengthForKVReserve(int seq_length) {
+    RTP_LLM_CHECK(seq_length <= complete_token_ids_.size(1));
+    kv_reserve_seq_length_ = std::max(seq_length, seq_length_);
+    return ++kv_reserve_epoch_;
+}
+
+bool CompleteTokenIds::clearSeqLengthForKVReserve(uint64_t expected_epoch) {
+    if (kv_reserve_epoch_ != expected_epoch) {
+        return false;
+    }
+    kv_reserve_seq_length_ = -1;
+    ++kv_reserve_epoch_;
+    return true;
+}
+
 int CompleteTokenIds::totalSeqLength() const {
     return seq_length_ + (int)reserve_step_;
+}
+
+int CompleteTokenIds::totalSeqLengthForKVReserve() const {
+    return seqLengthForKVReserve() + (int)reserve_step_;
 }
 
 int CompleteTokenIds::commonSeqLength() const {
@@ -232,6 +256,10 @@ int CompleteTokenIds::commonSeqLength() const {
 
 int CompleteTokenIds::seqLength() const {
     return seq_length_;
+}
+
+int CompleteTokenIds::seqLengthForKVReserve() const {
+    return kv_reserve_seq_length_ >= 0 ? kv_reserve_seq_length_ : seq_length_;
 }
 
 void CompleteTokenIds::copyTokensTo(int batch_id, void* dst, int offset, size_t token_num) {

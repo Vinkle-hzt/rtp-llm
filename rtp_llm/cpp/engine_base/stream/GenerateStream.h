@@ -195,27 +195,30 @@ public:
     int    seqLength() const;
     // NOTE: In generatestream, set seq len must use setSeqLength api, we need to save start_check_seq_length_
     // for checking EOS and stop words
-    void    setSeqLength(int seq_length);
-    int     seqSizePerBlock() const;
-    int     contextLength() const;
-    int     prefixLength() const;
-    int     reuseLength() const;
-    int     initialReuseLength() const;
-    size_t  maxTokenNum() const;
-    void    setReuseLength(int reuse_length);
-    void    setLocalReuseLength(int length);
-    void    setRemoteReuseLength(int length);
-    int     localReuseLength() const;
-    int     remoteReuseLength() const;
-    void    setMemoryReuseLength(int length);
-    int     memoryReuseLength() const;
-    void    setInitialReuseLength(int initial_reuse_length);
-    void    incLastOutputPos();
-    void    setPrefillReuseLength(int64_t total, int64_t local, int64_t remote, int64_t memory);
-    int64_t prefillTotalReuseLen() const;
-    int64_t prefillLocalReuseLen() const;
-    int64_t prefillRemoteReuseLen() const;
-    int64_t prefillMemoryReuseLen() const;
+    void     setSeqLength(int seq_length);
+    int      kvReserveSeqLength() const;
+    uint64_t setKVReserveSeqLength(int seq_length);
+    bool     clearKVReserveSeqLength(uint64_t expected_epoch);
+    int      seqSizePerBlock() const;
+    int      contextLength() const;
+    int      prefixLength() const;
+    int      reuseLength() const;
+    int      initialReuseLength() const;
+    size_t   maxTokenNum() const;
+    void     setReuseLength(int reuse_length);
+    void     setLocalReuseLength(int length);
+    void     setRemoteReuseLength(int length);
+    int      localReuseLength() const;
+    int      remoteReuseLength() const;
+    void     setMemoryReuseLength(int length);
+    int      memoryReuseLength() const;
+    void     setInitialReuseLength(int initial_reuse_length);
+    void     incLastOutputPos();
+    void     setPrefillReuseLength(int64_t total, int64_t local, int64_t remote, int64_t memory);
+    int64_t  prefillTotalReuseLen() const;
+    int64_t  prefillLocalReuseLen() const;
+    int64_t  prefillRemoteReuseLen() const;
+    int64_t  prefillMemoryReuseLen() const;
 
     bool                 isContextStream() const;
     const torch::Tensor& cumLogProbs() const;
@@ -510,14 +513,18 @@ public:
     //   accept_tokens_gpu  : [1, propose+1]     accepted token ids; first accept_len cols valid
     //   next_seq_len_gpu   : [1] int32          old_seq_len + accept_len (committed seq len)
     //   propose_tokens_gpu : [1, token_stride]  draft sampler output for next-step propose
-    void setSpecDecodeDeviceState(torch::Tensor accept_len_gpu,
-                                  torch::Tensor accept_tokens_gpu,
-                                  torch::Tensor next_seq_len_gpu,
-                                  torch::Tensor propose_tokens_gpu = torch::Tensor()) {
+    uint64_t setSpecDecodeDeviceState(torch::Tensor accept_len_gpu,
+                                      torch::Tensor accept_tokens_gpu,
+                                      torch::Tensor next_seq_len_gpu,
+                                      torch::Tensor propose_tokens_gpu = torch::Tensor()) {
         accept_len_gpu_     = std::move(accept_len_gpu);
         accept_tokens_gpu_  = std::move(accept_tokens_gpu);
         next_seq_len_gpu_   = std::move(next_seq_len_gpu);
         propose_tokens_gpu_ = std::move(propose_tokens_gpu);
+        return ++spec_decode_device_state_epoch_;
+    }
+    uint64_t getSpecDecodeDeviceStateEpoch() const {
+        return spec_decode_device_state_epoch_;
     }
     const torch::Tensor& getAcceptLenGpu() const {
         return accept_len_gpu_;
@@ -531,11 +538,19 @@ public:
     const torch::Tensor& getProposeTokensGpu() const {
         return propose_tokens_gpu_;
     }
+    bool clearSpecDecodeDeviceState(uint64_t expected_epoch) {
+        if (spec_decode_device_state_epoch_ != expected_epoch) {
+            return false;
+        }
+        clearSpecDecodeDeviceState();
+        return true;
+    }
     void clearSpecDecodeDeviceState() {
         accept_len_gpu_     = torch::Tensor();
         accept_tokens_gpu_  = torch::Tensor();
         next_seq_len_gpu_   = torch::Tensor();
         propose_tokens_gpu_ = torch::Tensor();
+        ++spec_decode_device_state_epoch_;
     }
 
     GenerateStreamPtr getProposeStream() {
@@ -708,6 +723,7 @@ protected:
     torch::Tensor accept_tokens_gpu_;
     torch::Tensor next_seq_len_gpu_;
     torch::Tensor propose_tokens_gpu_;
+    uint64_t      spec_decode_device_state_epoch_ = 0;
 
     bool return_all_hidden_states_ = false;
 

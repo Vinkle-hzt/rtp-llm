@@ -152,7 +152,7 @@ void GenerateStream::setNeedReleaseResource(bool need_release_resource) {
 }
 int GenerateStream::nextNeedBlockNums(int reserve_step) const {
     // TODO: maybe need fix when context and reuse
-    return stream_cache_resource_->singleBatchNeedBlocks(seqLength(), reserve_step) * nextBatchSize();
+    return stream_cache_resource_->singleBatchNeedBlocks(kvReserveSeqLength(), reserve_step) * nextBatchSize();
 }
 
 std::shared_ptr<GenerateInput> GenerateStream::generateInput() const {
@@ -298,6 +298,10 @@ int GenerateStream::inputLength() const {
 
 int GenerateStream::seqLength() const {
     return complete_token_ids_->seqLength();
+}
+
+int GenerateStream::kvReserveSeqLength() const {
+    return complete_token_ids_->seqLengthForKVReserve();
 }
 
 int GenerateStream::seqSizePerBlock() const {
@@ -1018,6 +1022,14 @@ int GenerateStream::reuseBlockSize() const {
 
 void GenerateStream::setSeqLength(int seq_length) {
     complete_token_ids_->setSeqLength(seq_length);
+}
+
+uint64_t GenerateStream::setKVReserveSeqLength(int seq_length) {
+    return complete_token_ids_->setSeqLengthForKVReserve(seq_length);
+}
+
+bool GenerateStream::clearKVReserveSeqLength(uint64_t expected_epoch) {
+    return complete_token_ids_->clearSeqLengthForKVReserve(expected_epoch);
 }
 
 void GenerateStream::setPerfTest(bool perf_test) {
