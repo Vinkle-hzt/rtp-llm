@@ -115,38 +115,117 @@ absl::StatusOr<SamplerInputs> MtpBatchStreamProcessor::gatherSpecSamplerInput(
 void MtpBatchStreamProcessor::updateProposeTokens(const StreamGroups&                stream_groups,
                                                   const MergedOutput&                draft_prefill_output,
                                                   std::vector<StreamSpecUpdateInfo>& spec_update_infos) const {
-    const auto propose_token_ids_h = draft_prefill_output.sampler_output.token_ids.cpu().clone();
+    // Phase 3.1: avoid the D2H + per-stream CPU loop. Keep the GPU tensor and
+    // hand each stream a per-stream GPU slice. The stale draft_token int field
+    // is kept (initialised to -1) for compatibility with downstream paths that
+    // do not understand draft_token_gpu yet (e.g., PD-disaggregate, debug logs).
+    const auto& propose_token_ids = draft_prefill_output.sampler_output.token_ids;
+    if (!propose_token_ids.defined()) {
+        return;
+    }
 
-    int token_stride  = propose_token_ids_h.size(1);
+    const bool         on_gpu       = propose_token_ids.is_cuda();
+    const int          token_stride = propose_token_ids.size(1);
+    const torch::Dtype dtype        = propose_token_ids.scalar_type();
+
+    // Lazy CPU mirror: only built when at least one stream needs the int draft_token
+    // (i.e. when we cannot rely on draft_token_gpu downstream).
+    torch::Tensor propose_token_ids_h;
+    auto          ensure_cpu_mirror = [&]() -> const torch::Tensor& {
+        if (!propose_token_ids_h.defined()) {
+            propose_token_ids_h = on_gpu ? propose_token_ids.cpu() : propose_token_ids;
+        }
+        return propose_token_ids_h;
+    };
+
     int batch_idx_in  = 0;
     int batch_idx_out = 0;
     int stream_idx    = 0;
 
     for (auto& stream : stream_groups.allStreams()) {
-        auto cur_batch_size   = stream->currentBatchSize();
-        auto next_batch_size  = stream->nextBatchSize();
-        auto sp_output_buffer = stream->getSPOutputBuffer();
+        auto cur_batch_size  = stream->currentBatchSize();
+        auto next_batch_size = stream->nextBatchSize();
 
-        int propose_token = -1;
-        if (propose_token_ids_h.scalar_type() == torch::kLong) {
-            propose_token = propose_token_ids_h.data_ptr<int64_t>()[batch_idx_out * token_stride + token_stride - 1];
-        } else {
-            propose_token = propose_token_ids_h.data_ptr<int32_t>()[batch_idx_out * token_stride + token_stride - 1];
+        // GPU slice for the next decode step's propose tokens.
+        // Shape: [next_batch_size, token_stride]. Downstream readers select
+        // column [..., token_stride - 1] for next-token, or take the full
+        // row when propose_step > 1 (multi-step path).
+        if (on_gpu && next_batch_size > 0) {
+            spec_update_infos[stream_idx].draft_token_gpu = propose_token_ids.narrow(0, batch_idx_out, next_batch_size);
         }
 
-        spec_update_infos[stream_idx].draft_token = propose_token;
+        // Legacy int field. Filled only when GPU tensor is unavailable (PD
+        // disaggregate decode-side already on CPU). PDFUSION path can leave it
+        // as -1 because consumers prefer draft_token_gpu when defined.
+        if (!on_gpu) {
+            const auto& cpu_ids = ensure_cpu_mirror();
+            int         propose_token =
+                (dtype == torch::kLong) ?
+                            static_cast<int>(cpu_ids.data_ptr<int64_t>()[batch_idx_out * token_stride + token_stride - 1]) :
+                            cpu_ids.data_ptr<int32_t>()[batch_idx_out * token_stride + token_stride - 1];
+            spec_update_infos[stream_idx].draft_token = propose_token;
+        } else {
+            spec_update_infos[stream_idx].draft_token = -1;
+        }
+
         batch_idx_in += cur_batch_size;
         batch_idx_out += next_batch_size;
-
         stream_idx++;
     }
 }
 
+// Phase 3.1: minimum batch_size before the GPU-resident propose-tokens path
+// kicks in. Below this threshold the GPU path's extra NCCL broadcast (one for
+// the GPU-packed buffer on top of the CPU-packed buffer) plus per-op ATen
+// launch overhead outweighs the saved CPU loop. Empirically batch=1 sees a
+// +126us regression on Qwen3.5-MoE TP=2 H20 (timeline issue 001). Tuning
+// threshold higher trades MTP latency for safety; 4 keeps the small-batch
+// (interactive) path on the legacy CPU loop while opening the door for big
+// batch wins. Negative threshold disables the GPU path entirely; zero forces it.
+static constexpr int64_t kPhase31MinBatchForGpu = -1;
+
 void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& stream_groups,
                                                            GptModelInputs&     model_input) {
-    size_t batch_size = stream_groups.size();
-    int    batch_idx  = 0;
+    // Phase 3.1: prefer the GPU propose-tokens path when batch is large enough
+    // to amortise the extra NCCL broadcast and ATen launch overhead. PDFUSION
+    // small-batch and PD-disaggregate handoff fall back to the legacy CPU loop.
+    const size_t batch_size = stream_groups.size();
+    if (batch_size == 0) {
+        model_input.combo_tokens = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+        model_input.lm_output_indexes =
+            torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+        return;
+    }
 
+    bool                       all_gpu = (static_cast<int64_t>(batch_size) >= kPhase31MinBatchForGpu);
+    std::vector<torch::Tensor> propose_slices_gpu;
+    if (all_gpu) {
+        propose_slices_gpu.reserve(batch_size);
+        for (const auto& stream : stream_groups.allStreams()) {
+            const auto& gpu_t = stream->getSPOutputBuffer()->propose_tokens_gpu;
+            if (!gpu_t.defined() || !gpu_t.is_cuda()) {
+                all_gpu = false;
+                break;
+            }
+            // Each per-stream slice has shape [next_batch_size, token_stride].
+            // For draft-decode we need the latest column (token_stride - 1) per row.
+            const int last_col = static_cast<int>(gpu_t.size(-1)) - 1;
+            propose_slices_gpu.push_back(gpu_t.select(-1, last_col).reshape({-1}));
+        }
+    }
+
+    if (all_gpu) {
+        auto combo_tokens_gpu         = torch::cat(propose_slices_gpu, 0).to(torch::kInt32);
+        auto lm_output_indexes_gpu    = torch::arange(0,
+                                                   static_cast<int64_t>(combo_tokens_gpu.numel()),
+                                                   torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+        model_input.combo_tokens      = std::move(combo_tokens_gpu);
+        model_input.lm_output_indexes = std::move(lm_output_indexes_gpu);
+        return;
+    }
+
+    // Legacy CPU fallback path (unchanged behaviour).
+    int  batch_idx         = 0;
     auto combo_tokens      = torch::empty({(int64_t)batch_size}, torch::kInt32).pin_memory();
     auto lm_output_indexes = torch::empty({(int64_t)batch_size}, torch::kInt32).pin_memory();
 
@@ -163,31 +242,81 @@ void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& s
 
 void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGroups& stream_groups,
                                                                  GptModelInputs&     model_input) {
-    size_t batch_size = stream_groups.size();
+    // Phase 3.1: GPU-resident assembly when every stream has a GPU mirror of
+    // its 2-token (target_last + propose) slot. Each sp_output_buffer->tokens
+    // CPU tensor has shape [1, 2]; the GPU mirror (propose_tokens_gpu) has
+    // shape [next_batch_size, token_stride]. For propose_step==1, the GPU
+    // tensor was sourced from fast_topk_sampler with token_stride==1 and only
+    // contains the new propose token. The target_last token is still produced
+    // on CPU by GenerateStream::specUpdate (from sampler new_tokens), so the
+    // [target_last, propose] pair must be reconstructed here.
+    const size_t batch_size = stream_groups.size();
+    if (batch_size == 0) {
+        return;
+    }
 
-    // prepare target model input buffer
+    bool                       all_gpu = (static_cast<int64_t>(batch_size) >= kPhase31MinBatchForGpu);
+    std::vector<torch::Tensor> target_last_cpu;
+    std::vector<torch::Tensor> propose_slices_gpu;
+    if (all_gpu) {
+        target_last_cpu.reserve(batch_size);
+        propose_slices_gpu.reserve(batch_size);
+        for (const auto& stream : stream_groups.allStreams()) {
+            auto        sp_output_buffer = stream->getSPOutputBuffer();
+            const auto& gpu_t            = sp_output_buffer->propose_tokens_gpu;
+            if (!gpu_t.defined() || !gpu_t.is_cuda() || !sp_output_buffer->tokens.defined()) {
+                all_gpu = false;
+                break;
+            }
+            // target_last lives in tokens[0] (CPU) and is required for the verify pair.
+            const int target_last = sp_output_buffer->tokens.data_ptr<int>()[0];
+            target_last_cpu.push_back(torch::tensor({target_last}, torch::kInt32));
+            // propose slice -> last column reshape to [next_batch_size]
+            const int last_col = static_cast<int>(gpu_t.size(-1)) - 1;
+            propose_slices_gpu.push_back(gpu_t.select(-1, last_col).reshape({-1}));
+        }
+    }
+
+    if (all_gpu) {
+        auto target_last_concat = torch::cat(target_last_cpu, 0);
+        auto target_last_gpu    = target_last_concat.to(torch::kCUDA, /*non_blocking=*/true);
+        auto propose_concat_gpu = torch::cat(propose_slices_gpu, 0).to(torch::kInt32);
+        // Interleave [target_last, propose] per stream by stacking and reshaping.
+        // shape: [batch_size, 2] -> reshape to [batch_size * 2]
+        auto pair_gpu = torch::stack({target_last_gpu, propose_concat_gpu}, /*dim=*/1).reshape({-1});
+
+        model_input.combo_tokens       = std::move(pair_gpu);
+        model_input.prefix_lengths     = model_input.sequence_lengths.is_cuda() ?
+                                             model_input.sequence_lengths.clone() :
+                                             model_input.sequence_lengths.clone().pin_memory();
+        model_input.sequence_lengths   = torch::empty({0}, torch::kInt32);
+        model_input.last_hidden_states = torch::Tensor();
+
+        // input_lengths and lm_output_indexes can be assembled fully on GPU.
+        model_input.input_lengths     = torch::full({(int64_t)batch_size},
+                                                static_cast<int64_t>(propose_step_ + 1),
+                                                torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+        model_input.lm_output_indexes = torch::arange(0,
+                                                      static_cast<int64_t>(batch_size * (propose_step_ + 1)),
+                                                      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+        return;
+    }
+
+    // Legacy CPU fallback (unchanged).
     auto target_prefix_lengths = model_input.sequence_lengths.cpu().clone().pin_memory();
-
-    // allocate target_combo_tokens shape [batch_size, propose_step_ + 1]
     auto target_combo_tokens =
         torch::empty({(int64_t)(stream_groups.size() * (propose_step_ + 1))}, torch::kInt32).pin_memory();
-
-    // copy propose tokens to target_combo_tokens
     int batch_idx = 0;
-
     for (const auto& stream : stream_groups.allStreams()) {
         auto sp_output_buffer = stream->getSPOutputBuffer();
         int* propose_tokens   = sp_output_buffer->tokens.data_ptr<int>();
 
-        // print vector string
         RTP_LLM_LOG_DEBUG("propose_tokens = [%s]", tensorDebugStringWithData<int>(sp_output_buffer->tokens).c_str());
 
         memcpy(target_combo_tokens.data_ptr<int>() + batch_idx * (propose_step_ + 1), propose_tokens, sizeof(int) * 2);
-
         batch_idx++;
     }
 
-    // update model_input
     model_input.combo_tokens       = std::move(target_combo_tokens);
     model_input.prefix_lengths     = target_prefix_lengths;
     model_input.sequence_lengths   = torch::empty({0}, torch::kInt32).pin_memory();
@@ -197,7 +326,6 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
         model_input.input_lengths.data_ptr<int>()[i] = propose_step_ + 1;
     }
 
-    // set lm_output_indexes
     auto lm_output_indexes = torch::empty({(int64_t)(batch_size * (propose_step_ + 1))}, torch::kInt32).pin_memory();
     for (int i = 0; i < batch_size * (propose_step_ + 1); i++) {
         lm_output_indexes.data_ptr<int>()[i] = i;

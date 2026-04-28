@@ -18,10 +18,26 @@ public:
     virtual absl::Status                   enqueue(const GenerateStreamPtr& stream)                    = 0;
     virtual std::vector<GenerateStreamPtr> batchEnqueue(const std::vector<GenerateStreamPtr>& streams) = 0;
     virtual absl::StatusOr<std::list<GenerateStreamPtr>> schedule()                                    = 0;
-    virtual absl::Status                                 stop()                                        = 0;
-    virtual bool                                         empty()                                       = 0;
-    virtual int64_t                                      lastScheduleTime()                            = 0;
-    virtual int64_t                                      onflightStreams()                             = 0;
+
+    // Phase 3.3: conservative-KV scheduling variant for the async (Phase 3.2)
+    // pipeline. The async path schedules step N+1 before step N's
+    // specUpdate has run, so seq_len isn't yet authoritative. Conservative
+    // variants assume the maximum possible accept_len (propose_step + 1) for
+    // each in-flight speculative stream, then the result thread releases the
+    // surplus blocks once accept_len is known.
+    //
+    // Default implementation: identity passthrough. Subclasses that support
+    // the Phase 3.2 ultimate path (NormalEngine::asyncStep without the
+    // bookkeeping_done.wait() hop) override this with the speculative-aware
+    // allocator. Callers that don't enable the ultimate async path can
+    // continue to use schedule() unchanged.
+    virtual absl::StatusOr<std::list<GenerateStreamPtr>> scheduleConservative(int /*propose_step*/) {
+        return schedule();
+    }
+    virtual absl::Status stop()             = 0;
+    virtual bool         empty()            = 0;
+    virtual int64_t      lastScheduleTime() = 0;
+    virtual int64_t      onflightStreams()  = 0;
 
     virtual std::vector<EngineScheduleInfo::TaskInfo> waitingTaskList() {
         return {};
