@@ -16,6 +16,7 @@
 #include "autil/TimeUtility.h"
 #include "rtp_llm/cpp/normal_engine/speculative/MtpExecutor.h"
 #include <algorithm>
+#include <exception>
 #include <memory>
 #include <thread>
 #include <random>
@@ -408,9 +409,15 @@ void NormalEngine::loop() {
     // without recompiling. Default off (synchronous step()) so smoke tests
     // and existing benchmarks see no behaviour change. The full async path
     // (result thread, executor split, cudaEvent gating) lands in async_opt.
-    use_async_scheduling_ = autil::EnvUtil::getEnv("RTP_LLM_ASYNC_SCHEDULING", false);
+    const bool legacy_async_scaffold = autil::EnvUtil::getEnv("RTP_LLM_ASYNC_SCHEDULING", false);
+    use_async_scheduling_real_       = autil::EnvUtil::getEnv("RTP_LLM_ASYNC_RESULT_THREAD", false)
+                                 && autil::EnvUtil::getEnv("RTP_LLM_ASYNC_SCHEDULING_REAL", false);
+    use_async_scheduling_ = legacy_async_scaffold || use_async_scheduling_real_;
     if (use_async_scheduling_) {
-        RTP_LLM_LOG_INFO("async scheduling scaffold enabled (RTP_LLM_ASYNC_SCHEDULING=1)");
+        RTP_LLM_LOG_INFO("async scheduling scaffold enabled (legacy=%d, real=%d, bookkeeping_timeout_ms=%d)",
+                         static_cast<int>(legacy_async_scaffold),
+                         static_cast<int>(use_async_scheduling_real_),
+                         autil::EnvUtil::getEnv("RTP_LLM_ASYNC_BOOKKEEPING_TIMEOUT_MS", 1000));
         result_thread_ = std::thread(&NormalEngine::resultLoop, this);
     }
     while (running_) {
@@ -426,48 +433,129 @@ absl::Status NormalEngine::awaitLastBookkeeping() {
     if (!last_future_) {
         return absl::OkStatus();
     }
+    auto    future           = last_future_;
+    int64_t start_time_us    = autil::TimeUtility::currentTimeInMicroSeconds();
+    int64_t timeout_ms       = autil::EnvUtil::getEnv("RTP_LLM_ASYNC_BOOKKEEPING_TIMEOUT_MS", 1000);
+    int64_t last_log_time_us = start_time_us;
     // Spin briefly when the result thread is keeping up; otherwise yield.
     // Once the executor processAsync/processResults split lands, this turns
     // into a folly::Promise wait so we can surface errors atomically.
-    for (int i = 0; i < 256 && !last_future_->bookkeeping_done.load(std::memory_order_acquire); ++i) {
+    for (int i = 0; i < 256 && !future->bookkeeping_done.load(std::memory_order_acquire); ++i) {
         // tight spin first to keep the cache hot when bookkeeping is fast
     }
-    while (!last_future_->bookkeeping_done.load(std::memory_order_acquire)) {
+    while (!future->bookkeeping_done.load(std::memory_order_acquire)) {
+        auto now_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        if (timeout_ms > 0 && now_us - start_time_us > timeout_ms * 1000) {
+            future->stage.store(BatchFutureStage::TimedOut, std::memory_order_release);
+            last_future_   = nullptr;
+            auto waited_ms = (now_us - start_time_us) / 1000;
+            RTP_LLM_LOG_ERROR(
+                "async bookkeeping timeout after %ld ms: label=%s stage=%d stream_count=%zu launch_age_ms=%ld",
+                waited_ms,
+                future->debug_label.c_str(),
+                static_cast<int>(future->stage.load(std::memory_order_acquire)),
+                future->streams.size(),
+                future->launch_time_us > 0 ? (now_us - future->launch_time_us) / 1000 : -1);
+            return absl::DeadlineExceededError("async bookkeeping timeout");
+        }
+        if (now_us - last_log_time_us > 1000 * 1000) {
+            RTP_LLM_LOG_WARNING("async bookkeeping still waiting: label=%s waited_ms=%ld stage=%d stream_count=%zu",
+                                future->debug_label.c_str(),
+                                (now_us - start_time_us) / 1000,
+                                static_cast<int>(future->stage.load(std::memory_order_acquire)),
+                                future->streams.size());
+            last_log_time_us = now_us;
+        }
         std::this_thread::yield();
     }
-    auto st      = last_future_->bookkeeping_status;
+    auto st      = future->bookkeeping_status;
     last_future_ = nullptr;
     return st;
 }
 
 absl::Status NormalEngine::asyncStep() {
-    // Phase 3.2 scaffolding. The data path that hands work to the result
-    // thread (BatchFuture build + cudaEvent record + processAsync call)
-    // depends on the MtpExecutor / NormalExecutor process() split, which
-    // is intentionally not part of this scaffolding commit.
-    //
-    // For now: fall back to the synchronous path so the engine keeps
-    // running unchanged, but exercise the await/queue/result-thread plumbing
-    // (with an empty BatchFuture) so smoke tests cover the lifecycle.
+    // While full optimistic scheduling is still gated off, keep the scheduler
+    // conservative: never start a new step until the previous result-thread
+    // bookkeeping has completed or tripped the watchdog.
     auto await_status = awaitLastBookkeeping();
     if (!await_status.ok()) {
         return await_status;
     }
 
-    auto status = step();
+    if (!use_async_scheduling_real_) {
+        auto status = step();
 
-    // Mint a tombstone BatchFuture so the result thread cycles. Once the
-    // executor is split, this will hold real GPU work; right now it just
-    // proves the queue/cv/lifetime mechanics behave under load.
-    auto future            = std::make_shared<BatchFuture>();
-    future->launch_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        // Legacy scaffold: fall back to synchronous step(), then mint a
+        // tombstone future so tests still exercise the queue/cv lifecycle.
+        auto future             = std::make_shared<BatchFuture>();
+        future->debug_label     = "normal_engine_tombstone";
+        future->launch_time_us  = autil::TimeUtility::currentTimeInMicroSeconds();
+        future->enqueue_time_us = future->launch_time_us;
+        future->stage.store(BatchFutureStage::Enqueued, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(result_mutex_);
+            result_queue_.push(future);
+        }
+        result_cv_.notify_one();
+        last_future_ = future;
+        return status;
+    }
+
+    while (pause_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    list<GenerateStreamPtr> streams;
+    if (parallelism_config.tp_rank == 0 && !ffn_disaggregate_config.is_ffn_service()) {
+        {
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.schedule_async(reserve_step=%d)", reserve_step_);
+            CHECK_AND_ASSIGN(streams, scheduler_->schedule());
+        }
+        if (parallelism_config.dp_size > 1) {
+            RTP_LLM_PROFILE_SCOPE("engine.normal.may_add_fake_stream_async_work");
+            mayAddFakeStream(streams);
+        }
+        if (streams.empty() && parallelism_config.tp_size <= 1) {
+            return absl::OkStatus();
+        }
+    }
+
+    int64_t                        launch_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+    absl::StatusOr<BatchFuturePtr> future_or;
+    {
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.execute_async(stream_size=%zu)", streams.size());
+        future_or = executor_->processAsync(streams);
+    }
+    step_profiler_.tick();
+
+    if (!future_or.ok()) {
+        return future_or.status();
+    }
+
+    auto future = std::move(future_or.value());
+    if (!future) {
+        return absl::InternalError("executor processAsync returned null BatchFuture");
+    }
+    if (future->streams.empty()) {
+        future->streams = streams;
+    }
+    future->debug_label     = "normal_engine_process_async";
+    future->launch_time_us  = launch_time_us;
+    future->enqueue_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+    future->stage.store(BatchFutureStage::Enqueued, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(result_mutex_);
         result_queue_.push(future);
     }
     result_cv_.notify_one();
     last_future_ = future;
-    return status;
+
+    if (parallelism_config.tp_rank == 0) {
+        auto step_latency = autil::TimeUtility::currentTimeInMicroSeconds() - launch_time_us;
+        reportMetrics({step_latency});
+    }
+
+    return absl::OkStatus();
 }
 
 void NormalEngine::resultLoop() {
@@ -485,9 +573,22 @@ void NormalEngine::resultLoop() {
             future = std::move(result_queue_.front());
             result_queue_.pop();
         }
-        // TODO(async_opt): cudaEventSynchronize(future->gpu_done);
-        // TODO(async_opt): executor_->processResults(*future);
-        future->bookkeeping_status = absl::OkStatus();
+        future->stage.store(BatchFutureStage::Running, std::memory_order_release);
+        future->result_start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        if (future->gpu_done_event) {
+            RTP_LLM_LOG_WARNING("BatchFuture gpu_done_event is set but F3 resultLoop has no typed wait stream yet");
+        }
+        try {
+            future->bookkeeping_status = executor_->processResults(future);
+        } catch (const std::exception& e) {
+            future->bookkeeping_status =
+                absl::InternalError(std::string("async result processing exception: ") + e.what());
+        } catch (...) {
+            future->bookkeeping_status = absl::InternalError("async result processing unknown exception");
+        }
+        future->result_done_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        future->stage.store(future->bookkeeping_status.ok() ? BatchFutureStage::Done : BatchFutureStage::Failed,
+                            std::memory_order_release);
         future->bookkeeping_done.store(true, std::memory_order_release);
     }
     RTP_LLM_LOG_INFO("normal_engine result loop exit");

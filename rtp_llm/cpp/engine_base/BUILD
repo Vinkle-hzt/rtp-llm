@@ -51,6 +51,7 @@ cc_library(
 cc_library(
     name = "executor",
     hdrs = [
+        "BatchFuture.h",
         "Executor.h",
     ],
     deps = [
@@ -88,5 +89,4 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
 )
-
 

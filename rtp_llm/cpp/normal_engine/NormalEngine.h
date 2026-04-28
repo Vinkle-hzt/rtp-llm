@@ -96,7 +96,8 @@ private:
     // path leaves these untouched. Toggle via env RTP_LLM_ASYNC_SCHEDULING
     // (or, in a follow-up, RuntimeConfig::use_async_scheduling) once the
     // result-thread executor split lands.
-    bool                                          use_async_scheduling_ = false;
+    bool                                          use_async_scheduling_      = false;
+    bool                                          use_async_scheduling_real_ = false;
     std::thread                                   result_thread_;
     std::mutex                                    result_mutex_;
     std::condition_variable                       result_cv_;

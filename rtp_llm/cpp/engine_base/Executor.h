@@ -1,11 +1,14 @@
 #pragma once
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
+#include "rtp_llm/cpp/engine_base/BatchFuture.h"
 #include "rtp_llm/cpp/models/ModelTypes.h"
 #include "rtp_llm/cpp/config/EplbConfig.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/config/ModelConfig.h"
+#include <list>
 #include <memory>
 #include <cstdlib>
 
@@ -15,6 +18,28 @@ class Executor {
 public:
     Executor() {};
     virtual absl::Status process(const std::list<GenerateStreamPtr>& streams) = 0;
+
+    // Async executor split scaffold. The default implementation preserves the
+    // existing synchronous semantics while giving NormalEngine a real
+    // BatchFuture payload to pass through the result-thread watchdog.
+    virtual absl::StatusOr<BatchFuturePtr> processAsync(const std::list<GenerateStreamPtr>& streams) {
+        auto status = process(streams);
+        if (!status.ok()) {
+            return status;
+        }
+        auto future     = std::make_shared<BatchFuture>();
+        future->streams = streams;
+        return future;
+    }
+
+    // Default result processing is a no-op because processAsync() already ran
+    // process() synchronously. MTP overrides this in the full split commit.
+    virtual absl::Status processResults(const BatchFuturePtr& future) {
+        if (!future) {
+            return absl::InvalidArgumentError("processResults got null BatchFuture");
+        }
+        return future->bookkeeping_status;
+    }
 
     static GptModelDescription genModelDescription(const ModelConfig&       model_config,
                                                    const ParallelismConfig& parallelism_config,
