@@ -19,6 +19,7 @@
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "autil/TimeUtility.h"
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <random>
 #include <vector>
@@ -39,6 +40,14 @@ struct MtpDecodeBatchFuture: public BatchFuture {
         debug_label = "mtp_decode_bookkeeping";
     }
 };
+
+bool useAsyncScheduleBeforeAwaitStateLock() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_ASYNC_SCHEDULE_BEFORE_AWAIT");
+        return env != nullptr && std::string(env) == "1";
+    }();
+    return enabled;
+}
 
 }  // namespace
 
@@ -1075,6 +1084,12 @@ absl::Status MtpExecutor::processResults(const BatchFuturePtr& future) {
             draft_event->block(cuda_graph::graphGetCurrentStream());
         }
 
+        std::unique_lock<std::recursive_mutex> state_lock;
+        if (useAsyncScheduleBeforeAwaitStateLock()) {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.process_results(stream_state_locked)");
+            state_lock = std::unique_lock<std::recursive_mutex>(asyncStreamStateMutex());
+        }
+
         auto worker_streams = stream_groups_copy.allStreams();
         int  i              = 0;
         for (auto& stream : worker_streams) {
@@ -1349,6 +1364,12 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         }
         if (draft_event) {
             draft_event->block(cuda_graph::graphGetCurrentStream());
+        }
+
+        std::unique_lock<std::recursive_mutex> state_lock;
+        if (useAsyncScheduleBeforeAwaitStateLock()) {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(stream_state_locked)");
+            state_lock = std::unique_lock<std::recursive_mutex>(asyncStreamStateMutex());
         }
 
         // Roll back the conservative seqLength bump and clear device-resident

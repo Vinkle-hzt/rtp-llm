@@ -412,12 +412,16 @@ void NormalEngine::loop() {
     const bool legacy_async_scaffold = autil::EnvUtil::getEnv("RTP_LLM_ASYNC_SCHEDULING", false);
     use_async_scheduling_real_       = autil::EnvUtil::getEnv("RTP_LLM_ASYNC_RESULT_THREAD", false)
                                  && autil::EnvUtil::getEnv("RTP_LLM_ASYNC_SCHEDULING_REAL", false);
+    use_async_schedule_before_await_ =
+        use_async_scheduling_real_ && autil::EnvUtil::getEnv("RTP_LLM_ASYNC_SCHEDULE_BEFORE_AWAIT", false);
     use_async_scheduling_ = legacy_async_scaffold || use_async_scheduling_real_;
     if (use_async_scheduling_) {
-        RTP_LLM_LOG_INFO("async scheduling scaffold enabled (legacy=%d, real=%d, bookkeeping_timeout_ms=%d)",
-                         static_cast<int>(legacy_async_scaffold),
-                         static_cast<int>(use_async_scheduling_real_),
-                         autil::EnvUtil::getEnv("RTP_LLM_ASYNC_BOOKKEEPING_TIMEOUT_MS", 0));
+        RTP_LLM_LOG_INFO(
+            "async scheduling scaffold enabled (legacy=%d, real=%d, schedule_before_await=%d, bookkeeping_timeout_ms=%d)",
+            static_cast<int>(legacy_async_scaffold),
+            static_cast<int>(use_async_scheduling_real_),
+            static_cast<int>(use_async_schedule_before_await_),
+            autil::EnvUtil::getEnv("RTP_LLM_ASYNC_BOOKKEEPING_TIMEOUT_MS", 0));
         result_thread_ = std::thread(&NormalEngine::resultLoop, this);
     }
     while (running_) {
@@ -429,11 +433,10 @@ void NormalEngine::loop() {
     }
 }
 
-absl::Status NormalEngine::awaitLastBookkeeping() {
-    if (!last_future_) {
+absl::Status NormalEngine::awaitBookkeeping(const BatchFuturePtr& future) {
+    if (!future) {
         return absl::OkStatus();
     }
-    auto    future           = last_future_;
     int64_t start_time_us    = autil::TimeUtility::currentTimeInMicroSeconds();
     int64_t timeout_ms       = autil::EnvUtil::getEnv("RTP_LLM_ASYNC_BOOKKEEPING_TIMEOUT_MS", 0);
     int64_t last_log_time_us = start_time_us;
@@ -468,18 +471,28 @@ absl::Status NormalEngine::awaitLastBookkeeping() {
         }
         std::this_thread::yield();
     }
-    auto st      = future->bookkeeping_status;
-    last_future_ = nullptr;
+    auto st = future->bookkeeping_status;
+    if (last_future_ == future) {
+        last_future_ = nullptr;
+    }
     return st;
+}
+
+absl::Status NormalEngine::awaitLastBookkeeping() {
+    return awaitBookkeeping(last_future_);
 }
 
 absl::Status NormalEngine::asyncStep() {
     // While full optimistic scheduling is still gated off, keep the scheduler
     // conservative: never start a new step until the previous result-thread
     // bookkeeping has completed or tripped the watchdog.
-    auto await_status = awaitLastBookkeeping();
-    if (!await_status.ok()) {
-        return await_status;
+    auto prev_future = last_future_;
+    if (!use_async_schedule_before_await_) {
+        auto await_status = awaitBookkeeping(prev_future);
+        if (!await_status.ok()) {
+            return await_status;
+        }
+        prev_future = nullptr;
     }
 
     if (!use_async_scheduling_real_) {
@@ -508,12 +521,36 @@ absl::Status NormalEngine::asyncStep() {
     list<GenerateStreamPtr> streams;
     if (parallelism_config.tp_rank == 0 && !ffn_disaggregate_config.is_ffn_service()) {
         {
-            RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.schedule_async(reserve_step=%d)", reserve_step_);
-            CHECK_AND_ASSIGN(streams, scheduler_->schedule());
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.schedule_async(reserve_step=%d,before_await=%d)",
+                                          reserve_step_,
+                                          static_cast<int>(use_async_schedule_before_await_));
+            if (use_async_schedule_before_await_) {
+                std::lock_guard<std::recursive_mutex> lock(asyncStreamStateMutex());
+                CHECK_AND_ASSIGN(streams, scheduler_->scheduleConservative(sp_config.gen_num_per_cycle));
+            } else {
+                CHECK_AND_ASSIGN(streams, scheduler_->schedule());
+            }
         }
         if (parallelism_config.dp_size > 1) {
             RTP_LLM_PROFILE_SCOPE("engine.normal.may_add_fake_stream_async_work");
             mayAddFakeStream(streams);
+        }
+        if (streams.empty() && parallelism_config.tp_size <= 1) {
+            if (use_async_schedule_before_await_) {
+                return awaitBookkeeping(prev_future);
+            }
+            return absl::OkStatus();
+        }
+    }
+
+    if (use_async_schedule_before_await_) {
+        auto await_status = awaitBookkeeping(prev_future);
+        if (!await_status.ok()) {
+            return await_status;
+        }
+        {
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.refresh_scheduled_async(stream_size=%zu)", streams.size());
+            RETURN_IF_STATUS_ERROR(scheduler_->refreshRunningStreams(streams));
         }
         if (streams.empty() && parallelism_config.tp_size <= 1) {
             return absl::OkStatus();

@@ -20,6 +20,11 @@ using namespace std;
 
 namespace rtp_llm {
 
+std::recursive_mutex& asyncStreamStateMutex() {
+    static std::recursive_mutex mutex;
+    return mutex;
+}
+
 GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
                                const ModelConfig&               model_config,
                                const RuntimeConfig&             runtime_config,

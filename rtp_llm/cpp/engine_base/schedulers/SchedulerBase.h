@@ -34,6 +34,13 @@ public:
     virtual absl::StatusOr<std::list<GenerateStreamPtr>> scheduleConservative(int /*propose_step*/) {
         return schedule();
     }
+    // F5a async scheduling guard: scheduleConservative() may run before the
+    // previous result future has committed GenerateDone/Error. After awaiting
+    // that future, callers use this hook to consume terminal running-stream
+    // events without doing another reserve-step allocation.
+    virtual absl::Status refreshRunningStreams(std::list<GenerateStreamPtr>& /*streams*/) {
+        return absl::OkStatus();
+    }
     virtual absl::Status stop()             = 0;
     virtual bool         empty()            = 0;
     virtual int64_t      lastScheduleTime() = 0;

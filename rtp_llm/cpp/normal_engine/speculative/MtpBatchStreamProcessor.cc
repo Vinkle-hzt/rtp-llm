@@ -4,9 +4,12 @@
 #include "rtp_llm/cpp/utils/TensorDebugUtils.h"
 #include "rtp_llm/cpp/utils/StringUtil.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
+#include "rtp_llm/cpp/utils/ProfilingScope.h"
+#include "autil/EnvUtil.h"
 #include <numeric>
 #include <cstring>
 #include <cstdlib>
+#include <mutex>
 
 namespace rtp_llm {
 
@@ -40,10 +43,18 @@ absl::Status MtpBatchStreamProcessor::dispatchDecode(const StreamGroups&        
 
     prepareDecodeSpecUpdateInfo(stream_groups, spec_decode_output, draft_prefill_output, spec_update_infos);
 
-    // to avoid cuda sync, we need to set propose token in extra loop
-    updateProposeTokens(stream_groups, draft_prefill_output, spec_update_infos);
-
-    stream_groups.updateStreams(spec_update_infos);
+    auto commit_stream_updates = [&] {
+        // to avoid cuda sync, we need to set propose token in extra loop
+        updateProposeTokens(stream_groups, draft_prefill_output, spec_update_infos);
+        stream_groups.updateStreams(spec_update_infos);
+    };
+    if (autil::EnvUtil::getEnv("RTP_LLM_ASYNC_SCHEDULE_BEFORE_AWAIT", false)) {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.dispatch_decode(commit_stream_state_locked)");
+        std::lock_guard<std::recursive_mutex> lock(asyncStreamStateMutex());
+        commit_stream_updates();
+    } else {
+        commit_stream_updates();
+    }
 
     RTP_LLM_LOG_DEBUG("dispatch decode done");
     return absl::OkStatus();

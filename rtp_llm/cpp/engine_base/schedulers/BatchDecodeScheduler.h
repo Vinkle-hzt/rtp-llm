@@ -5,6 +5,7 @@
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/cache/Types.h"
 #include <atomic>
+#include <algorithm>
 #include <mutex>
 #include <condition_variable>
 #include <list>
@@ -174,6 +175,32 @@ public:
         }
 
         return running_streams_;
+    }
+
+    absl::Status refreshRunningStreams(std::list<GenerateStreamPtr>& streams) override {
+        std::lock_guard<std::mutex> lock(lock_);
+        for (auto it = running_streams_.begin(); it != running_streams_.end();) {
+            const bool terminal = (*it)->hasEvent(StreamEvents::GenerateDone) || (*it)->hasEvent(StreamEvents::Error)
+                                  || (*it)->getStatus() == StreamState::FINISHED;
+            if (!terminal) {
+                ++it;
+                continue;
+            }
+            auto state     = (*it)->getStatus();
+            auto new_state = (*it)->moveToNext();
+            if (new_state != state) {
+                addStreamToNewState(*it, new_state);
+                it = running_streams_.erase(it);
+            } else if (new_state == StreamState::FINISHED) {
+                it = running_streams_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        streams.remove_if([this](const GenerateStreamPtr& stream) {
+            return std::find(running_streams_.begin(), running_streams_.end(), stream) == running_streams_.end();
+        });
+        return absl::OkStatus();
     }
 
     absl::Status stop() override {

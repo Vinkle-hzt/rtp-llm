@@ -86,6 +86,7 @@ private:
     // Wait for any outstanding BatchFuture to finish bookkeeping so the
     // next scheduler call sees the post-update stream state. Returns the
     // bookkeeping status so the caller can short-circuit on error.
+    absl::Status awaitBookkeeping(const BatchFuturePtr& future);
     absl::Status awaitLastBookkeeping();
 
 private:
@@ -96,8 +97,9 @@ private:
     // path leaves these untouched. Toggle via env RTP_LLM_ASYNC_SCHEDULING
     // (or, in a follow-up, RuntimeConfig::use_async_scheduling) once the
     // result-thread executor split lands.
-    bool                                          use_async_scheduling_      = false;
-    bool                                          use_async_scheduling_real_ = false;
+    bool                                          use_async_scheduling_            = false;
+    bool                                          use_async_scheduling_real_       = false;
+    bool                                          use_async_schedule_before_await_ = false;
     std::thread                                   result_thread_;
     std::mutex                                    result_mutex_;
     std::condition_variable                       result_cv_;

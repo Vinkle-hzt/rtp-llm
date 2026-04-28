@@ -20,6 +20,10 @@
 
 namespace rtp_llm {
 
+// Serializes the short CPU-visible stream-state critical sections used by the
+// experimental async scheduler path. The steady-state sync path never takes it.
+std::recursive_mutex& asyncStreamStateMutex();
+
 // WARNGING: buffer in generate stream should all be host to avoid gpu buffer hold more time (except kv cache)
 
 struct StreamUpdateInfo {

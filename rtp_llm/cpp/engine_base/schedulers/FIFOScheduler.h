@@ -36,6 +36,7 @@ public:
     // Caller should compare the returned vector size with the input size to detect dropped streams.
     std::vector<std::shared_ptr<GenerateStream>> batchEnqueue(const std::vector<GenerateStreamPtr>& streams) override;
     absl::StatusOr<std::list<GenerateStreamPtr>> schedule() override;
+    absl::Status                                 refreshRunningStreams(std::list<GenerateStreamPtr>& streams) override;
     absl::Status                                 stop() override;
     bool                                         empty() override;
 

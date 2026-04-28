@@ -5,6 +5,7 @@
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/cache/Types.h"
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -311,6 +312,34 @@ absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
     reportMetrics();
     last_schedule_time_ = autil::TimeUtility::currentTimeInMilliSeconds();
     return running_streams_;
+}
+
+absl::Status FIFOScheduler::refreshRunningStreams(std::list<GenerateStreamPtr>& streams) {
+    RTP_LLM_PROFILE_FUNCTION();
+    std::lock_guard<std::mutex> lock(lock_);
+    for (auto it = running_streams_.begin(); it != running_streams_.end();) {
+        const bool terminal = (*it)->hasEvent(StreamEvents::GenerateDone) || (*it)->hasEvent(StreamEvents::Error)
+                              || (*it)->getStatus() == StreamState::FINISHED;
+        if (!terminal) {
+            ++it;
+            continue;
+        }
+        auto state     = (*it)->getStatus();
+        auto new_state = (*it)->moveToNext();
+        if (new_state != state) {
+            addStreamToNewState(*it, new_state);
+            it = running_streams_.erase(it);
+        } else if (new_state == StreamState::FINISHED) {
+            it = running_streams_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    streams.remove_if([this](const GenerateStreamPtr& stream) {
+        return std::find(running_streams_.begin(), running_streams_.end(), stream) == running_streams_.end();
+    });
+    reportMetrics();
+    return absl::OkStatus();
 }
 
 int64_t FIFOScheduler::waitingStreamsSize() {
