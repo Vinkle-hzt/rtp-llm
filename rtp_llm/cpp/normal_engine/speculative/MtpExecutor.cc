@@ -1109,6 +1109,21 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     }
 }
 
+bool MtpExecutor::useFullAsync() const {
+    // Commit 11: env-gated full-async. RTP_LLM_MTP_FULL_ASYNC=1 turns on the
+    // GPU correction kernel (Commit 11), the AsyncOutput dispatch (Commit 12),
+    // and the NormalEngine async step + grpc-lazy result thread (Commit 13).
+    // Read once and cache; flag is process-wide.
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_MTP_FULL_ASYNC");
+        bool        on  = (env != nullptr && std::string(env) == "1");
+        RTP_LLM_LOG_INFO(
+            "[full-async] RTP_LLM_MTP_FULL_ASYNC=%s -> useFullAsync=%d", env ? env : "(unset)", static_cast<int>(on));
+        return on;
+    }();
+    return enabled;
+}
+
 bool MtpExecutor::useStreamAsync() const {
     // Commit 5: env-gated stream-async. Read once and cache. Default off so
     // production behaviour is unchanged unless RTP_LLM_MTP_STREAM_ASYNC=1
@@ -1116,28 +1131,22 @@ bool MtpExecutor::useStreamAsync() const {
     // needed since the flag is process-wide and the AsyncRunner objects (and
     // the underlying CUDA streams / worker threads) are eagerly constructed
     // in the MtpExecutor ctor whether or not the path is taken.
-    static const bool enabled = []() {
+    //
+    // Commit 11b: full-async (RTP_LLM_MTP_FULL_ASYNC=1) IMPLIES stream-async,
+    // because the new path reuses the per-stream device-tensor scaffolding
+    // (accept_len_gpu / next_seq_len_gpu / propose_tokens_gpu) that
+    // dispatchDecodeAsync sets. Operators don't have to remember to set both
+    // env vars; setting RTP_LLM_MTP_FULL_ASYNC=1 alone is sufficient.
+    static const bool enabled = [this]() {
+        if (useFullAsync()) {
+            RTP_LLM_LOG_INFO("[stream-async] implied by RTP_LLM_MTP_FULL_ASYNC=1 -> useStreamAsync=1");
+            return true;
+        }
         const char* env = std::getenv("RTP_LLM_MTP_STREAM_ASYNC");
         bool        on  = (env != nullptr && std::string(env) == "1");
         RTP_LLM_LOG_INFO("[stream-async] RTP_LLM_MTP_STREAM_ASYNC=%s -> useStreamAsync=%d",
                          env ? env : "(unset)",
                          static_cast<int>(on));
-        return on;
-    }();
-    return enabled;
-}
-
-bool MtpExecutor::useFullAsync() const {
-    // Commit 11: env-gated full-async. Implies useStreamAsync() so callers
-    // can rely on the stream-async device-tensor scaffolding. Read once and
-    // cache. RTP_LLM_MTP_FULL_ASYNC=1 turns on the GPU correction kernel
-    // (Commit 11), the AsyncOutput dispatch (Commit 12), and the
-    // NormalEngine async step + grpc-lazy result thread (Commit 13).
-    static const bool enabled = []() {
-        const char* env = std::getenv("RTP_LLM_MTP_FULL_ASYNC");
-        bool        on  = (env != nullptr && std::string(env) == "1");
-        RTP_LLM_LOG_INFO(
-            "[full-async] RTP_LLM_MTP_FULL_ASYNC=%s -> useFullAsync=%d", env ? env : "(unset)", static_cast<int>(on));
         return on;
     }();
     return enabled;
