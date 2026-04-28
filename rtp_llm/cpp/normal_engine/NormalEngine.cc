@@ -8,6 +8,7 @@
 #include "rtp_llm/cpp/engine_base/schedulers/BatchDecodeScheduler.h"
 #include "rtp_llm/cpp/engine_base/schedulers/GatherBatchScheduler.h"
 #include "rtp_llm/cpp/cache/CacheConfigCreator.h"
+#include "rtp_llm/cpp/cache/CacheGroupType.h"
 #include "rtp_llm/cpp/engine_base/system_prompt/SystemPromptConstructor.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
@@ -414,13 +415,16 @@ void NormalEngine::loop() {
                                  && autil::EnvUtil::getEnv("RTP_LLM_ASYNC_SCHEDULING_REAL", false);
     use_async_schedule_before_await_ =
         use_async_scheduling_real_ && autil::EnvUtil::getEnv("RTP_LLM_ASYNC_SCHEDULE_BEFORE_AWAIT", false);
+    use_async_process_before_await_ =
+        use_async_schedule_before_await_ && autil::EnvUtil::getEnv("RTP_LLM_ASYNC_PROCESS_BEFORE_AWAIT", false);
     use_async_scheduling_ = legacy_async_scaffold || use_async_scheduling_real_;
     if (use_async_scheduling_) {
         RTP_LLM_LOG_INFO(
-            "async scheduling scaffold enabled (legacy=%d, real=%d, schedule_before_await=%d, bookkeeping_timeout_ms=%d)",
+            "async scheduling scaffold enabled (legacy=%d, real=%d, schedule_before_await=%d, process_before_await=%d, bookkeeping_timeout_ms=%d)",
             static_cast<int>(legacy_async_scaffold),
             static_cast<int>(use_async_scheduling_real_),
             static_cast<int>(use_async_schedule_before_await_),
+            static_cast<int>(use_async_process_before_await_),
             autil::EnvUtil::getEnv("RTP_LLM_ASYNC_BOOKKEEPING_TIMEOUT_MS", 0));
         result_thread_ = std::thread(&NormalEngine::resultLoop, this);
     }
@@ -480,6 +484,174 @@ absl::Status NormalEngine::awaitBookkeeping(const BatchFuturePtr& future) {
 
 absl::Status NormalEngine::awaitLastBookkeeping() {
     return awaitBookkeeping(last_future_);
+}
+
+bool NormalEngine::canProcessBeforeAwait(const std::list<GenerateStreamPtr>& streams,
+                                         const BatchFuturePtr&               prev_future,
+                                         std::string*                        reason) const {
+    auto set_reason = [reason](const std::string& value) {
+        if (reason) {
+            *reason = value;
+        }
+    };
+
+    if (!use_async_process_before_await_) {
+        set_reason("env_off");
+        return false;
+    }
+    if (!prev_future) {
+        set_reason("no_prev_future");
+        return false;
+    }
+    if (!use_async_scheduling_real_ || !use_async_schedule_before_await_) {
+        set_reason("async_prereq_off");
+        return false;
+    }
+    if (!autil::EnvUtil::getEnv("RTP_LLM_MTP_STREAM_ASYNC", false)) {
+        set_reason("stream_async_off");
+        return false;
+    }
+    if (!propose_params_) {
+        set_reason("no_propose_params");
+        return false;
+    }
+    if (propose_params_->sp_type != SP_TYPE_MTP) {
+        set_reason("sp_type_not_mtp");
+        return false;
+    }
+    if (sp_config.gen_num_per_cycle != 1 || propose_params_->gen_num_per_circle != 1) {
+        set_reason("gen_num_not_one");
+        return false;
+    }
+    if (parallelism_config.tp_size != 1 || parallelism_config.tp_rank != 0 || parallelism_config.dp_size != 1
+        || parallelism_config.pp_size != 1) {
+        set_reason("parallelism_not_single_rank");
+        return false;
+    }
+    if (pd_sep_config.role_type != RoleType::PDFUSION || ffn_disaggregate_config.enable_ffn_disaggregate
+        || ffn_disaggregate_config.is_ffn_service()) {
+        set_reason("disaggregate_or_role_unsupported");
+        return false;
+    }
+    if (!resource_context_.cache_manager) {
+        set_reason("no_cache_manager");
+        return false;
+    }
+    const auto& cache_config = resource_context_.cache_manager->cacheConfig();
+    for (auto group_type : cache_config.group_types) {
+        if (group_type != CacheGroupType::FULL) {
+            set_reason("linear_or_hybrid_cache");
+            return false;
+        }
+    }
+    if (streams.empty()) {
+        set_reason("empty_streams");
+        return false;
+    }
+
+    const int reserve_guard = 2 * static_cast<int>(sp_config.gen_num_per_cycle + 1);
+    for (auto& stream : streams) {
+        if (!stream) {
+            set_reason("null_stream");
+            return false;
+        }
+        if (stream->generateInput() && stream->generateInput()->fake_query) {
+            set_reason("fake_stream");
+            return false;
+        }
+        if (stream->isContextStream()) {
+            set_reason("context_stream");
+            return false;
+        }
+        if (!stream->isActive() || stream->hasError() || stream->hasEvent(StreamEvents::GenerateDone)
+            || stream->hasEvent(StreamEvents::Error)) {
+            set_reason("terminal_or_error_stream");
+            return false;
+        }
+        if (stream->disableSpRun()) {
+            set_reason("sp_disabled_stream");
+            return false;
+        }
+        if (stream->getPendingSwapDoneEvent()) {
+            set_reason("pending_swap_event");
+            return false;
+        }
+        const auto& accept_len     = stream->getAcceptLenGpu();
+        const auto& accept_tokens  = stream->getAcceptTokensGpu();
+        const auto& next_seq_len   = stream->getNextSeqLenGpu();
+        const auto& propose_tokens = stream->getProposeTokensGpu();
+        if (!accept_len.defined() || !accept_len.is_cuda() || !accept_tokens.defined() || !accept_tokens.is_cuda()
+            || !next_seq_len.defined() || !next_seq_len.is_cuda() || !propose_tokens.defined()
+            || !propose_tokens.is_cuda()) {
+            set_reason("device_state_missing");
+            return false;
+        }
+        auto& generate_config = stream->generateConfig();
+        if (!generate_config || !generate_config->ignore_eos || !generate_config->stop_words_list.empty()
+            || !generate_config->stop_words_str.empty()) {
+            set_reason("terminal_boundary_needs_cpu");
+            return false;
+        }
+        if (stream->seqLength() + reserve_guard > static_cast<int>(stream->maxTokenNum())) {
+            set_reason("near_max_token_boundary");
+            return false;
+        }
+    }
+
+    set_reason("enabled");
+    return true;
+}
+
+absl::StatusOr<BatchFuturePtr> NormalEngine::launchAsyncBatch(const std::list<GenerateStreamPtr>& streams,
+                                                              bool                                process_before_await,
+                                                              const string&                       gate_reason) {
+    int64_t launch_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+
+    absl::StatusOr<BatchFuturePtr> future_or;
+    if (process_before_await) {
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.execute_async_process_before_await(stream_size=%zu)",
+                                      streams.size());
+        future_or = executor_->processAsync(streams);
+    } else {
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.execute_async(stream_size=%zu)", streams.size());
+        future_or = executor_->processAsync(streams);
+    }
+    step_profiler_.tick();
+
+    if (!future_or.ok()) {
+        return future_or.status();
+    }
+
+    auto future = std::move(future_or.value());
+    if (!future) {
+        return absl::InternalError("executor processAsync returned null BatchFuture");
+    }
+    if (future->streams.empty()) {
+        future->streams = streams;
+    }
+    if (future->debug_label.empty() || future->debug_label == "normal_engine_batch") {
+        future->debug_label =
+            process_before_await ? "normal_engine_process_before_await" : "normal_engine_process_async";
+    }
+    if (future->launch_time_us == 0) {
+        future->launch_time_us = launch_time_us;
+    }
+    future->process_before_await = process_before_await;
+    future->gate_reason          = gate_reason;
+    future->enqueue_time_us      = autil::TimeUtility::currentTimeInMicroSeconds();
+    future->stage.store(BatchFutureStage::Enqueued, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(result_mutex_);
+        result_queue_.push(future);
+    }
+    result_cv_.notify_one();
+    last_future_ = future;
+
+    if (parallelism_config.tp_rank == 0) {
+        auto step_latency = autil::TimeUtility::currentTimeInMicroSeconds() - launch_time_us;
+        reportMetrics({step_latency});
+    }
+    return future;
 }
 
 absl::Status NormalEngine::asyncStep() {
@@ -543,7 +715,44 @@ absl::Status NormalEngine::asyncStep() {
         }
     }
 
+    std::string one_inflight_reason;
+    bool        one_inflight = canProcessBeforeAwait(streams, prev_future, &one_inflight_reason);
+    if (use_async_process_before_await_) {
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.one_inflight_gate(enabled=%d,reason=%s,stream_size=%zu)",
+                                      static_cast<int>(one_inflight),
+                                      one_inflight_reason.c_str(),
+                                      streams.size());
+    }
+
+    if (one_inflight) {
+        BatchFuturePtr future;
+        {
+            std::unique_lock<std::recursive_mutex> lock(asyncStreamStateMutex());
+            std::string                            recheck_reason;
+            if (canProcessBeforeAwait(streams, prev_future, &recheck_reason)) {
+                auto future_or = launchAsyncBatch(streams, true, recheck_reason);
+                if (!future_or.ok()) {
+                    return future_or.status();
+                }
+                future = std::move(future_or.value());
+            } else {
+                one_inflight_reason = std::string("recheck_") + recheck_reason;
+                one_inflight        = false;
+            }
+        }
+        if (one_inflight) {
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.await_prev_after_process(label=%s)",
+                                          prev_future ? prev_future->debug_label.c_str() : "none");
+            return awaitBookkeeping(prev_future);
+        }
+    }
+
     if (use_async_schedule_before_await_) {
+        if (use_async_process_before_await_) {
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.one_inflight_fallback(reason=%s,stream_size=%zu)",
+                                          one_inflight_reason.c_str(),
+                                          streams.size());
+        }
         auto await_status = awaitBookkeeping(prev_future);
         if (!await_status.ok()) {
             return await_status;
@@ -557,45 +766,10 @@ absl::Status NormalEngine::asyncStep() {
         }
     }
 
-    int64_t                        launch_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
-    absl::StatusOr<BatchFuturePtr> future_or;
-    {
-        RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.execute_async(stream_size=%zu)", streams.size());
-        future_or = executor_->processAsync(streams);
-    }
-    step_profiler_.tick();
-
+    auto future_or = launchAsyncBatch(streams, false, one_inflight_reason);
     if (!future_or.ok()) {
         return future_or.status();
     }
-
-    auto future = std::move(future_or.value());
-    if (!future) {
-        return absl::InternalError("executor processAsync returned null BatchFuture");
-    }
-    if (future->streams.empty()) {
-        future->streams = streams;
-    }
-    if (future->debug_label.empty() || future->debug_label == "normal_engine_batch") {
-        future->debug_label = "normal_engine_process_async";
-    }
-    if (future->launch_time_us == 0) {
-        future->launch_time_us = launch_time_us;
-    }
-    future->enqueue_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
-    future->stage.store(BatchFutureStage::Enqueued, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lk(result_mutex_);
-        result_queue_.push(future);
-    }
-    result_cv_.notify_one();
-    last_future_ = future;
-
-    if (parallelism_config.tp_rank == 0) {
-        auto step_latency = autil::TimeUtility::currentTimeInMicroSeconds() - launch_time_us;
-        reportMetrics({step_latency});
-    }
-
     return absl::OkStatus();
 }
 

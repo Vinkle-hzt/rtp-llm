@@ -9,6 +9,7 @@
 #include <queue>
 #include <thread>
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/engine_base/TorchProfiler.h"
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
@@ -86,8 +87,14 @@ private:
     // Wait for any outstanding BatchFuture to finish bookkeeping so the
     // next scheduler call sees the post-update stream state. Returns the
     // bookkeeping status so the caller can short-circuit on error.
-    absl::Status awaitBookkeeping(const BatchFuturePtr& future);
-    absl::Status awaitLastBookkeeping();
+    absl::Status                   awaitBookkeeping(const BatchFuturePtr& future);
+    absl::Status                   awaitLastBookkeeping();
+    bool                           canProcessBeforeAwait(const std::list<GenerateStreamPtr>& streams,
+                                                         const BatchFuturePtr&               prev_future,
+                                                         std::string*                        reason) const;
+    absl::StatusOr<BatchFuturePtr> launchAsyncBatch(const std::list<GenerateStreamPtr>& streams,
+                                                    bool                                process_before_await,
+                                                    const std::string&                  gate_reason);
 
 private:
     autil::ThreadPtr          loop_thread_;
@@ -100,6 +107,7 @@ private:
     bool                                          use_async_scheduling_            = false;
     bool                                          use_async_scheduling_real_       = false;
     bool                                          use_async_schedule_before_await_ = false;
+    bool                                          use_async_process_before_await_  = false;
     std::thread                                   result_thread_;
     std::mutex                                    result_mutex_;
     std::condition_variable                       result_cv_;

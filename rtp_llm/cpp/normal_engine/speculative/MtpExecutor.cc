@@ -606,9 +606,14 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     // Commit 5 will gate this on RTP_LLM_MTP_STREAM_ASYNC). AsyncRunner.sync
     // is also a no-op on the very first decodeStep (task_done_ starts true).
     if (useStreamAsync()) {
-        RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(wait_prev_bookkeeping,stream_count=%zu)",
-                                      streams.size());
-        spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+        if (canSkipPrevBookkeepingWaitForOneInflight(streams)) {
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC(
+                "executor.mtp.decode_step(skip_wait_prev_bookkeeping_one_inflight,stream_count=%zu)", streams.size());
+        } else {
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(wait_prev_bookkeeping,stream_count=%zu)",
+                                          streams.size());
+            spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+        }
     }
 
     // Phase 3.3: linear-attention KV swap synchronisation. On the Phase 3.2
@@ -1249,6 +1254,50 @@ bool MtpExecutor::useStreamAsync() const {
         return on;
     }();
     return enabled;
+}
+
+bool MtpExecutor::useProcessBeforeAwait() const {
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_ASYNC_PROCESS_BEFORE_AWAIT");
+        bool        on  = (env != nullptr && std::string(env) == "1");
+        RTP_LLM_LOG_INFO("[stream-async] RTP_LLM_ASYNC_PROCESS_BEFORE_AWAIT=%s -> useProcessBeforeAwait=%d",
+                         env ? env : "(unset)",
+                         static_cast<int>(on));
+        return on;
+    }();
+    return enabled;
+}
+
+bool MtpExecutor::hasOneInflightDeviceState(const GenerateStreamPtr& stream) {
+    if (!stream) {
+        return false;
+    }
+    const auto& accept_len     = stream->getAcceptLenGpu();
+    const auto& accept_tokens  = stream->getAcceptTokensGpu();
+    const auto& next_seq_len   = stream->getNextSeqLenGpu();
+    const auto& propose_tokens = stream->getProposeTokensGpu();
+    return accept_len.defined() && accept_len.is_cuda() && accept_tokens.defined() && accept_tokens.is_cuda()
+           && next_seq_len.defined() && next_seq_len.is_cuda() && propose_tokens.defined() && propose_tokens.is_cuda();
+}
+
+bool MtpExecutor::canSkipPrevBookkeepingWaitForOneInflight(const std::list<GenerateStreamPtr>& streams) const {
+    if (!useProcessBeforeAwait() || !useStreamAsync()) {
+        return false;
+    }
+    if (propose_step_ != 1 || parallelism_config_.tp_size != 1 || parallelism_config_.tp_rank != 0
+        || parallelism_config_.dp_size != 1 || parallelism_config_.pp_size != 1) {
+        return false;
+    }
+    if (role_type_ != RoleType::PDFUSION || enable_ffn_disaggregate_ || streams.empty()) {
+        return false;
+    }
+    for (const auto& stream : streams) {
+        if (!stream || stream->isContextStream() || !stream->isActive() || stream->disableSpRun()
+            || stream->getPendingSwapDoneEvent() || !hasOneInflightDeviceState(stream)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&                          stream_groups,

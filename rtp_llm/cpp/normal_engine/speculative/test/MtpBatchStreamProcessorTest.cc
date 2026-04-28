@@ -9,6 +9,7 @@
 #include "rtp_llm/cpp/normal_engine/speculative/MtpBatchStreamProcessor.h"
 #undef private
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
+#include "rtp_llm/cpp/normal_engine/speculative/MtpExecutor.h"
 #include "rtp_llm/cpp/models/SampleInfos.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
@@ -285,6 +286,33 @@ TEST_F(MtpBatchStreamProcessorTest, testSpecDecodeDeviceStateEpochGuard) {
     EXPECT_FALSE(stream->getAcceptTokensGpu().defined());
     EXPECT_FALSE(stream->getNextSeqLenGpu().defined());
     EXPECT_FALSE(stream->getProposeTokensGpu().defined());
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testOneInflightDeviceStateRequiresCudaTensors) {
+    ModelConfig     model_config;
+    RuntimeConfig   runtime_config;
+    ResourceContext resource_context;
+
+    model_config.max_seq_len = 2048;
+    model_config.vocab_size  = 4;
+    model_config.num_layers  = 1;
+
+    auto stream = createContextStream(model_config, runtime_config, resource_context, {1}, 1);
+    EXPECT_FALSE(MtpExecutor::hasOneInflightDeviceState(stream));
+
+    auto cpu_epoch = stream->setSpecDecodeDeviceState(torch::tensor({1}, torch::kInt32),
+                                                      torch::tensor({{2, 3}}, torch::kInt32),
+                                                      torch::tensor({2}, torch::kInt32),
+                                                      torch::tensor({{4}}, torch::kInt32));
+    EXPECT_FALSE(MtpExecutor::hasOneInflightDeviceState(stream));
+    EXPECT_TRUE(stream->clearSpecDecodeDeviceState(cpu_epoch));
+
+    auto cuda_epoch = stream->setSpecDecodeDeviceState(torch::tensor({1}, torch::kInt32).to(torch::kCUDA),
+                                                       torch::tensor({{2, 3}}, torch::kInt32).to(torch::kCUDA),
+                                                       torch::tensor({2}, torch::kInt32).to(torch::kCUDA),
+                                                       torch::tensor({{4}}, torch::kInt32).to(torch::kCUDA));
+    EXPECT_TRUE(MtpExecutor::hasOneInflightDeviceState(stream));
+    EXPECT_TRUE(stream->clearSpecDecodeDeviceState(cuda_epoch));
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testPrepareOneStepSpecDecodeModelInput) {

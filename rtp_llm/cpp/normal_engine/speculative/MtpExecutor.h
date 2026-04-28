@@ -85,6 +85,8 @@ public:
         sampler_ = std::move(sampler);
     }
 
+    static bool hasOneInflightDeviceState(const GenerateStreamPtr& stream);
+
 public:
     static GenerateStreamPtr createMinFakePrefillStream(int                    max_new_tokens,
                                                         const ModelConfig&     model_config,
@@ -118,6 +120,8 @@ protected:
     // false so the new dispatchDecodeAsync path stays dead; Commit 5 replaces
     // the body with the RTP_LLM_MTP_STREAM_ASYNC env switch.
     bool useStreamAsync() const;
+    bool useProcessBeforeAwait() const;
+    bool canSkipPrevBookkeepingWaitForOneInflight(const std::list<GenerateStreamPtr>& streams) const;
 
     // Stream-async (Phase 3.2 lite) dispatch. Caller records two events on
     // the main stream BEFORE calling: rejection_event right after the

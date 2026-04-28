@@ -30,6 +30,7 @@ struct BatchFuture {
     virtual ~BatchFuture() = default;
 
     std::string debug_label = "normal_engine_batch";
+    std::string gate_reason;
 
     // Streams that participated in this batch. Owned references are kept
     // alive until bookkeeping completes so per-stream specUpdate / KV release
@@ -42,6 +43,8 @@ struct BatchFuture {
     int64_t enqueue_time_us      = 0;
     int64_t result_start_time_us = 0;
     int64_t result_done_time_us  = 0;
+
+    bool process_before_await = false;
 
     std::atomic<BatchFutureStage> stage{BatchFutureStage::Created};
 
