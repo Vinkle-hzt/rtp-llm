@@ -530,22 +530,45 @@ void MtpBatchStreamProcessor::updateDecodePostDraftModelInput(
 void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups& stream_groups,
                                                               SamplerOutput&      draft_sampler_output,
                                                               torch::Tensor&      draft_token_probs_d_t) {
-    const size_t batch_size      = stream_groups.size();
-    auto         draft_token_ids = torch::empty({(int64_t)batch_size, (int64_t)propose_step_}, torch::kInt32);
+    const size_t batch_size = stream_groups.size();
 
     std::vector<torch::Tensor> draft_token_probs_list;
-    int                        batch_idx = 0;
+    std::vector<torch::Tensor> draft_token_id_slices_gpu;
+    draft_token_id_slices_gpu.reserve(batch_size);
 
+    bool all_gpu = batch_size > 0;
     for (const auto& stream : stream_groups.allStreams()) {
-        auto sp_output_buffer                                      = stream->getSPOutputBuffer();
-        auto propose_tokens                                        = sp_output_buffer->tokens.data_ptr<int>();
-        draft_token_ids.data_ptr<int>()[batch_idx * propose_step_] = propose_tokens[1];
+        auto        sp_output_buffer = stream->getSPOutputBuffer();
+        const auto& stream_gpu       = stream->getProposeTokensGpu();
+        const auto& buffer_gpu       = sp_output_buffer->propose_tokens_gpu;
+        const auto& gpu_tokens       = stream_gpu.defined() ? stream_gpu : buffer_gpu;
+        if (!gpu_tokens.defined() || !gpu_tokens.is_cuda()) {
+            all_gpu = false;
+        } else {
+            const int last_col = static_cast<int>(gpu_tokens.size(-1)) - 1;
+            draft_token_id_slices_gpu.push_back(gpu_tokens.select(-1, last_col).reshape({-1}));
+        }
         draft_token_probs_list.push_back(sp_output_buffer->all_probs);
-        batch_idx++;
     }
 
     draft_token_probs_d_t          = torch::stack(draft_token_probs_list, 0).contiguous();
     draft_sampler_output.all_probs = draft_token_probs_d_t;
+
+    if (all_gpu && draft_token_id_slices_gpu.size() == batch_size) {
+        draft_sampler_output.token_ids = torch::cat(draft_token_id_slices_gpu, 0)
+                                             .reshape({(int64_t)batch_size, (int64_t)propose_step_})
+                                             .to(torch::kInt32);
+        return;
+    }
+
+    auto draft_token_ids = torch::empty({(int64_t)batch_size, (int64_t)propose_step_}, torch::kInt32);
+    int  batch_idx       = 0;
+    for (const auto& stream : stream_groups.allStreams()) {
+        auto sp_output_buffer                                      = stream->getSPOutputBuffer();
+        auto propose_tokens                                        = sp_output_buffer->tokens.data_ptr<int>();
+        draft_token_ids.data_ptr<int>()[batch_idx * propose_step_] = propose_tokens[1];
+        batch_idx++;
+    }
     draft_sampler_output.token_ids = std::move(draft_token_ids);
 }
 
