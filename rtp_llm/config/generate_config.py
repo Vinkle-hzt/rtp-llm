@@ -79,6 +79,7 @@ class GenerateConfig(BaseModel):
     bos_token_id: Optional[Union[List[int], int]] = None
     using_hf_sampling: bool = False
     print_stop_words: bool = False
+    disable_default_stop_words: bool = False
     timeout_ms: Optional[int] = -1
     ttft_timeout_ms: Optional[int] = -1
     traffic_reject_priority: Optional[int] = 100
@@ -212,6 +213,8 @@ class GenerateConfig(BaseModel):
             )
 
     def add_special_tokens(self, special_tokens: Any):
+        if self.disable_default_stop_words:
+            return
         # 这里假设外部传进来的stop_word_list和stop_word_str都不包含batch维度
         self.stop_words_list += special_tokens.stop_words_id_list
         self.stop_words_str += special_tokens.stop_words_str_list

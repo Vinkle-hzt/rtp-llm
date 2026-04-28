@@ -183,15 +183,19 @@ class OpenaiEndpoint(object):
         request_stop_words_list = request.stop if request.stop != None else []
         if isinstance(request_stop_words_list, str):
             request_stop_words_list = [request_stop_words_list]
+        default_stop_words_str = (
+            [] if config.disable_default_stop_words else self.stop_words_str_list
+        )
+        default_stop_words_list = (
+            [] if config.disable_default_stop_words else self.stop_words_id_list
+        )
         config.stop_words_str = list(
             set(
-                self.stop_words_str_list
-                + request_stop_words_list
-                + config.stop_words_str
+                default_stop_words_str + request_stop_words_list + config.stop_words_str
             )
         )
         config.stop_words_list = self._dedup_stop_words_list(
-            self.stop_words_id_list
+            default_stop_words_list
             + self.chat_renderer.tokenize_words(config.stop_words_str)
             + config.stop_words_list
         )

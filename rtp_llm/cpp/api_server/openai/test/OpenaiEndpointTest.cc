@@ -33,7 +33,7 @@ protected:
 
 TEST_F(OpenaiEndpointTest, Constructor_TokenizerIsNull) {
     ModelConfig model_config;
-    auto openai_endpoint = std::make_shared<OpenaiEndpoint>(nullptr, nullptr, model_config);
+    auto        openai_endpoint = std::make_shared<OpenaiEndpoint>(nullptr, nullptr, model_config);
     EXPECT_TRUE(openai_endpoint->stop_word_ids_list_.empty());
     EXPECT_TRUE(openai_endpoint->stop_words_list_.empty());
 }
@@ -102,7 +102,7 @@ TEST_F(OpenaiEndpointTest, ExtractGenerationConfig) {
     EXPECT_CALL(*mock_render_, get_all_extra_stop_word_ids_list).WillOnce(Return(std::vector<std::vector<int>>()));
 
     ModelConfig model_config;
-    auto                      openai_endpoint = std::make_shared<OpenaiEndpoint>(tokenizer_, render_, model_config);
+    auto        openai_endpoint = std::make_shared<OpenaiEndpoint>(tokenizer_, render_, model_config);
 
     ChatCompletionRequest req;
     req.stream      = false;
@@ -128,16 +128,44 @@ TEST_F(OpenaiEndpointTest, ExtractGenerationConfig) {
     EXPECT_EQ(config->random_seed, req.seed.value());
 }
 
+TEST_F(OpenaiEndpointTest, ExtractGenerationConfig_DisableDefaultStopWords) {
+    ModelConfig model_config;
+    model_config.special_tokens.stop_words_id_list = {{10}};
+
+    EXPECT_CALL(*mock_tokenizer_, isPreTrainedTokenizer).WillOnce(Return(false));
+    EXPECT_CALL(*mock_render_, get_all_extra_stop_word_ids_list).WillOnce(Return(std::vector<std::vector<int>>{{20}}));
+    EXPECT_CALL(*mock_tokenizer_, decode(std::vector<int>{20})).WillOnce(Return("<render_stop>"));
+    EXPECT_CALL(*mock_tokenizer_, decode(std::vector<int>{10})).WillOnce(Return("<model_stop>"));
+
+    auto openai_endpoint = std::make_shared<OpenaiEndpoint>(tokenizer_, render_, model_config);
+
+    ChatCompletionRequest req;
+    GenerateConfig        extra_config;
+    extra_config.disable_default_stop_words = true;
+    req.extra_configs                       = extra_config;
+    req.stop                                = "client_stop";
+
+    std::vector<std::string>      request_stop_words_list = {std::get<std::string>(req.stop.value())};
+    std::vector<std::vector<int>> tokenize_words_res      = {{1, 2, 3}};
+    EXPECT_CALL(*mock_render_, tokenize_words(request_stop_words_list)).WillOnce(Return(tokenize_words_res));
+
+    auto config = openai_endpoint->extract_generation_config(req);
+    ASSERT_TRUE(config != nullptr);
+    EXPECT_TRUE(config->disable_default_stop_words);
+    EXPECT_EQ(config->stop_words_str, request_stop_words_list);
+    EXPECT_EQ(config->stop_words_list, tokenize_words_res);
+}
+
 TEST_F(OpenaiEndpointTest, GetChatRender) {
     {
         ModelConfig model_config;
-        auto openai_endpoint = std::make_shared<OpenaiEndpoint>(nullptr, nullptr, model_config);
+        auto        openai_endpoint = std::make_shared<OpenaiEndpoint>(nullptr, nullptr, model_config);
         EXPECT_EQ(openai_endpoint->getChatRender(), nullptr);
     }
     {
         EXPECT_CALL(*mock_render_, get_all_extra_stop_word_ids_list).WillOnce(Return(std::vector<std::vector<int>>()));
         ModelConfig model_config;
-        auto openai_endpoint = std::make_shared<OpenaiEndpoint>(nullptr, render_, model_config);
+        auto        openai_endpoint = std::make_shared<OpenaiEndpoint>(nullptr, render_, model_config);
         EXPECT_EQ(openai_endpoint->getChatRender(), render_);
     }
 }

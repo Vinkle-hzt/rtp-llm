@@ -67,7 +67,8 @@ public:
     bool                          aux_info                 = true;
     std::vector<std::vector<int>> stop_words_list;
     std::vector<std::string>      stop_words_str;
-    bool                          print_stop_words = false;
+    bool                          print_stop_words           = false;
+    bool                          disable_default_stop_words = false;
     std::string                   sp_advice_prompt;
     std::vector<int>              sp_advice_prompt_token_ids;
 
@@ -89,7 +90,7 @@ public:
     std::string        trace_id;
     bool               force_batch = false;  // If true, streams with same batch_group_id must be scheduled together
     std::optional<int> batch_group_timeout;
-    std::string      unique_key;
+    std::string        unique_key;
 
     bool top1() {
         return top_k == 1;
@@ -110,6 +111,9 @@ public:
     }
 
     void addSpecialTokens(const rtp_llm::SpecialTokens& special_tokens) {
+        if (disable_default_stop_words) {
+            return;
+        }
         for (const auto& vec : special_tokens.stop_words_id_list) {
             std::vector<int> tmpVec;
             for (int64_t val : vec) {
@@ -137,13 +141,16 @@ public:
                      << ", top_p:" << top_p << ", force_disable_sp_run: " << force_disable_sp_run
                      << ", force_sp_accept: " << force_sp_accept << ", return_all_probs: " << return_all_probs
                      << ", stop_words_list:" << vectorsToString(stop_words_list)
+                     << ", disable_default_stop_words:" << disable_default_stop_words
                      << ", can_use_pd_separation: " << can_use_pd_separation << ", pd_separation: " << pd_separation
                      << ", in_think_mode: " << in_think_mode << ", max_thinking_tokens: " << max_thinking_tokens
                      << ", end_think_token_ids: " << vectorToString(end_think_token_ids)
                      << ", gen_timeline: " << gen_timeline << ", profile_step: " << profile_step
-                     << ", reuse_cache: " << reuse_cache << ", enable_device_cache: " << enable_device_cache
+                     << ", ignore_eos: " << ignore_eos << ", reuse_cache: " << reuse_cache
+                     << ", enable_device_cache: " << enable_device_cache
                      << ", enable_memory_cache: " << enable_memory_cache
-                     << ", enable_remote_cache: " << enable_remote_cache << ", force_batch: " << force_batch << ", unique_key: " << unique_key << "}";
+                     << ", enable_remote_cache: " << enable_remote_cache << ", force_batch: " << force_batch
+                     << ", unique_key: " << unique_key << "}";
         return debug_string.str();
     }
 
@@ -207,6 +214,7 @@ public:
         JSONIZE(stop_words_list);
         JSONIZE(stop_words_str);
         JSONIZE(print_stop_words);
+        JSONIZE(disable_default_stop_words);
         JSONIZE(sp_edit);
         JSONIZE(force_disable_sp_run);
         JSONIZE(force_sp_accept);
@@ -219,6 +227,7 @@ public:
         JSONIZE(gen_timeline);
         JSONIZE(profile_step);
         JSONIZE(profile_trace_name);
+        JSONIZE(ignore_eos);
         JSONIZE(reuse_cache);
         JSONIZE(enable_device_cache);
         JSONIZE(enable_memory_cache);

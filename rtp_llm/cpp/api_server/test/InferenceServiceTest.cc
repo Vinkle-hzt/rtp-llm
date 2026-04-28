@@ -476,6 +476,21 @@ TEST_F(InferenceServiceTest, ExtractRequest_Prompt) {
     ASSERT_EQ(req.generate_configs.size(), 1);
 }
 
+TEST_F(InferenceServiceTest, ExtractRequest_DisableDefaultStopWords) {
+    ModelConfig model_config;
+    model_config.special_tokens.stop_words_id_list  = {{11}, {12, 13}};
+    model_config.special_tokens.stop_words_str_list = {"<default_stop>"};
+
+    std::string jsonStr =
+        R"({"prompt": "prompt1", "generate_config": {"ignore_eos": true, "disable_default_stop_words": true}})";
+    auto req = InferenceParsedRequest::extractRequest(jsonStr, model_config, nullptr);
+    ASSERT_EQ(req.generate_configs.size(), 1);
+    EXPECT_TRUE(req.generate_configs[0]->disable_default_stop_words);
+    EXPECT_TRUE(req.generate_configs[0]->ignore_eos);
+    EXPECT_TRUE(req.generate_configs[0]->stop_words_list.empty());
+    EXPECT_TRUE(req.generate_configs[0]->stop_words_str.empty());
+}
+
 TEST_F(InferenceServiceTest, ExtractRequest_AdapterName) {
     std::string jsonStr =
         R"({"prompt_batch": ["prompt1", "prompt2", "prompt3"], "generate_config": {"adapter_name": ["test0", "test1", "test2"]}})";

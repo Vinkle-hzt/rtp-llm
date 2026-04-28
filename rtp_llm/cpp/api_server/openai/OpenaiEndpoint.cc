@@ -71,9 +71,11 @@ std::shared_ptr<GenerateConfig> OpenaiEndpoint::extract_generation_config(const 
     }
     config.stop_words_str.insert(
         config.stop_words_str.begin(), request_stop_words_list.begin(), request_stop_words_list.end());
-    config.stop_words_str.insert(config.stop_words_str.begin(), stop_words_list_.begin(), stop_words_list_.end());
-    config.stop_words_list.insert(
-        config.stop_words_list.begin(), stop_word_ids_list_.begin(), stop_word_ids_list_.end());
+    if (!config.disable_default_stop_words) {
+        config.stop_words_str.insert(config.stop_words_str.begin(), stop_words_list_.begin(), stop_words_list_.end());
+        config.stop_words_list.insert(
+            config.stop_words_list.begin(), stop_word_ids_list_.begin(), stop_word_ids_list_.end());
+    }
     auto request_stop_words_list_ids = chat_render_->tokenize_words(request_stop_words_list);
     config.stop_words_list.insert(
         config.stop_words_list.begin(), request_stop_words_list_ids.begin(), request_stop_words_list_ids.end());

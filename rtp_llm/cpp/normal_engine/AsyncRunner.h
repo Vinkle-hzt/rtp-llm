@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -35,8 +36,9 @@ private:
     std::condition_variable cv_done_;
 
     struct Task {
-        std::function<void()> fn;
-        at::ThreadLocalState  tls_state;
+        std::function<void()>         fn;
+        at::ThreadLocalState          tls_state;
+        std::shared_ptr<torch::Event> ready_event;
     };
     std::optional<Task> pending_task_;
     std::exception_ptr  pending_exception_;

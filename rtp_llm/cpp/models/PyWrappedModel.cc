@@ -79,9 +79,24 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs");
     DevicePerfWrapper            wrapper(enable_device_perf_, "py model buildPyAttentionInputs");
     torch_ext::PyAttentionInputs py_attn_inputs;
-    py_attn_inputs.prefix_lengths   = inputs.prefix_lengths;
-    py_attn_inputs.sequence_lengths = inputs.sequence_lengths;
-    py_attn_inputs.input_lengths    = inputs.input_lengths;
+
+    auto to_host_lengths = [](const torch::Tensor& t) -> torch::Tensor {
+        if (!t.defined()) {
+            return t;
+        }
+        auto host = t.device().is_cuda() ? t.cpu() : t;
+        host      = host.contiguous();
+        return host.is_pinned() ? host : host.pin_memory();
+    };
+
+    // PyAttentionInputs keeps host length tensors for CPU-side metadata
+    // assembly, while the one-inflight MTP path may hand us device-resident
+    // lengths. Normalize the host view here and preserve CUDA tensors below
+    // for *_d fields so device-first callers do not crash in mixed CPU/CUDA
+    // arithmetic.
+    py_attn_inputs.prefix_lengths   = to_host_lengths(inputs.prefix_lengths);
+    py_attn_inputs.sequence_lengths = to_host_lengths(inputs.sequence_lengths);
+    py_attn_inputs.input_lengths    = to_host_lengths(inputs.input_lengths);
 
     if (inputs.kv_cache_kernel_block_id.defined()) {
         py_attn_inputs.kv_cache_kernel_block_id_host = inputs.kv_cache_kernel_block_id.clone().pin_memory();
@@ -156,16 +171,29 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     }
 
     // create device tensors
-    py_attn_inputs.prefix_lengths_d = tensorHoldHostAndToCuda(py_attn_inputs.prefix_lengths);
-    py_attn_inputs.input_lengths_d  = tensorHoldHostAndToCuda(py_attn_inputs.input_lengths);
+    py_attn_inputs.prefix_lengths_d = inputs.prefix_lengths.defined() && inputs.prefix_lengths.device().is_cuda() ?
+                                          inputs.prefix_lengths.to(torch::kInt32) :
+                                          tensorHoldHostAndToCuda(py_attn_inputs.prefix_lengths);
+    py_attn_inputs.input_lengths_d  = inputs.input_lengths.defined() && inputs.input_lengths.device().is_cuda() ?
+                                          inputs.input_lengths.to(torch::kInt32) :
+                                          tensorHoldHostAndToCuda(py_attn_inputs.input_lengths);
 
     // In qwen3-next target verify mode, sequence_lengths_plus_1_d uses prefix_lengths
     if (py_attn_inputs.is_target_verify) {
-        auto sequence_lengths_plus_1             = (py_attn_inputs.prefix_lengths + 1).pin_memory();
-        py_attn_inputs.sequence_lengths_plus_1_d = tensorHoldHostAndToCuda(sequence_lengths_plus_1);
+        if (inputs.prefix_lengths.defined() && inputs.prefix_lengths.device().is_cuda()) {
+            py_attn_inputs.sequence_lengths_plus_1_d = (inputs.prefix_lengths.to(torch::kInt32) + 1).to(torch::kInt32);
+        } else {
+            auto sequence_lengths_plus_1             = (py_attn_inputs.prefix_lengths + 1).pin_memory();
+            py_attn_inputs.sequence_lengths_plus_1_d = tensorHoldHostAndToCuda(sequence_lengths_plus_1);
+        }
     } else {
-        auto sequence_lengths_plus_1             = (py_attn_inputs.sequence_lengths + 1).pin_memory();
-        py_attn_inputs.sequence_lengths_plus_1_d = tensorHoldHostAndToCuda(sequence_lengths_plus_1);
+        if (inputs.sequence_lengths.defined() && inputs.sequence_lengths.device().is_cuda()) {
+            py_attn_inputs.sequence_lengths_plus_1_d =
+                (inputs.sequence_lengths.to(torch::kInt32) + 1).to(torch::kInt32);
+        } else {
+            auto sequence_lengths_plus_1             = (py_attn_inputs.sequence_lengths + 1).pin_memory();
+            py_attn_inputs.sequence_lengths_plus_1_d = tensorHoldHostAndToCuda(sequence_lengths_plus_1);
+        }
     }
 
     return py_attn_inputs;

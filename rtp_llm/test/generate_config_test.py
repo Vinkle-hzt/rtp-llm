@@ -4,20 +4,21 @@ from unittest import TestCase, main
 
 from transformers import AutoTokenizer
 
-from rtp_llm.ops import SpecialTokens
-from rtp_llm.frontend.tokenizer_factory.tokenizers.tokenization_qwen import (
-    QWenTokenizer,
-)
-from rtp_llm.openai.api_datatype import ChatCompletionRequest, GenerateConfig
-from rtp_llm.openai.openai_endpoint import OpenaiEndpoint
-from rtp_llm.pipeline.pipeline import Pipeline
+from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.config.py_config_modules import (
     GenerateEnvConfig,
     PyMiscellaneousConfig,
     RenderConfig,
     VitConfig,
 )
-from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.frontend.tokenizer_factory.tokenizers.tokenization_qwen import (
+    QWenTokenizer,
+)
+from rtp_llm.openai.api_datatype import ChatCompletionRequest, GenerateConfig
+from rtp_llm.openai.openai_endpoint import OpenaiEndpoint
+from rtp_llm.ops import SpecialTokens
+from rtp_llm.pipeline.pipeline import Pipeline
+
 
 class GenerateConfigTest(TestCase):
     def __init__(self, *args: Any, **kwargs: Any):
@@ -106,6 +107,24 @@ class GenerateConfigTest(TestCase):
         self.assertEqual(
             generate_config.stop_words_str, ["hello", "what's your name", "gg"]
         )
+
+    def test_disable_default_stop_words(self):
+        special_tokens = SpecialTokens()
+        special_tokens.stop_words_id_list = [[1233, 19912]]
+        special_tokens.stop_words_str_list = ["gg"]
+        generate_config = Pipeline.create_generate_config(
+            generate_config={
+                **self._create_generate_config(),
+                "disable_default_stop_words": True,
+            },
+            vocab_size=100,
+            special_tokens=special_tokens,
+            tokenizer=None,
+            generate_env_config=GenerateEnvConfig(),
+        )
+        self.assertTrue(generate_config.disable_default_stop_words)
+        self.assertEqual(generate_config.stop_words_list, [[8848]])
+        self.assertEqual(generate_config.stop_words_str, ["hello", "what's your name"])
 
     def test_stop_words_merge_with_toeknizer(self):
         special_tokens = SpecialTokens()
@@ -249,7 +268,6 @@ class OpenaiGenerateConfigTest(TestCase):
             **kwargs,
         )
 
-
     def _generate_config_with_stop_word(
         self,
         model_stop_word_str: Optional[List[str]] = None,
@@ -259,6 +277,7 @@ class OpenaiGenerateConfigTest(TestCase):
         req_stop: Optional[List[str]] = None,
         req_config_stop_word_str: Optional[List[str]] = None,
         req_config_stop_word_list: Optional[List[List[int]]] = None,
+        disable_default_stop_words: bool = False,
     ):
         special_tokens = SpecialTokens()
         if model_stop_word_str is not None:
@@ -268,13 +287,9 @@ class OpenaiGenerateConfigTest(TestCase):
 
         generate_env_config = GenerateEnvConfig()
         if env_stop_word_str is not None:
-            generate_env_config.stop_words_str = (
-                env_stop_word_str
-            )
+            generate_env_config.stop_words_str = env_stop_word_str
         if env_stop_word_list is not None:
-            generate_env_config.stop_words_list = (
-                env_stop_word_list
-            )
+            generate_env_config.stop_words_list = env_stop_word_list
 
         # Create ModelConfig object
         model_config = ModelConfig()
@@ -305,6 +320,10 @@ class OpenaiGenerateConfigTest(TestCase):
             if request.extra_configs is None:
                 request.extra_configs = GenerateConfig()
             request.extra_configs.stop_words_list = req_config_stop_word_list
+        if disable_default_stop_words:
+            if request.extra_configs is None:
+                request.extra_configs = GenerateConfig()
+            request.extra_configs.disable_default_stop_words = True
 
         return openai_endpoint._extract_generation_config(request)
 
@@ -325,6 +344,19 @@ class OpenaiGenerateConfigTest(TestCase):
             )
 
     def test_stop_word_config(self):
+        self.assert_config_stop_word(
+            expect_stop_word_str=[],
+            expect_stop_word_list=[],
+            disable_default_stop_words=True,
+        )
+
+        self.assert_config_stop_word(
+            expect_stop_word_str=["req stop word"],
+            expect_stop_word_list=[[2958, 2936, 3409]],
+            req_stop=["req stop word"],
+            disable_default_stop_words=True,
+        )
+
         self.assert_config_stop_word(
             expect_stop_word_str=["<|im_end|>", "<|endoftext|>"],
             expect_stop_word_list=[[151643], [151645]],

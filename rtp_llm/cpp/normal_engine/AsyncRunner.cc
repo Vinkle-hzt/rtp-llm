@@ -24,11 +24,13 @@ AsyncRunner::~AsyncRunner() {
 void AsyncRunner::launch(std::function<void()> fn) {
     RTP_LLM_PROFILE_SCOPE("async_runner.launch");
     at::ThreadLocalState tls_state;
+    auto                 ready_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    ready_event->record(cuda_graph::graphGetCurrentStream());
     {
         std::unique_lock<std::mutex> lk(mutex_);
         cv_done_.wait(lk, [this] { return task_done_; });
         rethrowPendingExceptionIfAny(lk);
-        pending_task_ = Task{std::move(fn), std::move(tls_state)};
+        pending_task_ = Task{std::move(fn), std::move(tls_state), std::move(ready_event)};
         task_done_    = false;
     }
     cv_task_.notify_one();
@@ -71,6 +73,9 @@ void AsyncRunner::workerLoop() {
             RTP_LLM_PROFILE_SCOPE("async_runner.thread");
             cuda_graph::GraphStreamGuard stream_guard(cuda_graph::toGraphStream(stream_));
             try {
+                if (task.ready_event) {
+                    task.ready_event->block(stream_);
+                }
                 task.fn();
                 event_.record(stream_);
             } catch (...) {

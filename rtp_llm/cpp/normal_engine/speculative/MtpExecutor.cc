@@ -4,6 +4,7 @@
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
 #include "rtp_llm/cpp/engine_base/stream/StreamGroups.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
+#include "rtp_llm/cpp/cache/CacheGroupType.h"
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOScheduler.h"
@@ -48,6 +49,32 @@ bool useAsyncScheduleBeforeAwaitStateLock() {
         return env != nullptr && std::string(env) == "1";
     }();
     return enabled;
+}
+
+bool needsPendingSwapDoneEvent(const std::shared_ptr<KVCacheManager>& cache_manager) {
+    if (!cache_manager) {
+        return true;
+    }
+    const auto& group_types = cache_manager->cacheConfig().group_types;
+    for (auto group_type : group_types) {
+        if (group_type != CacheGroupType::FULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void publishPendingSwapDoneEvent(const GenerateStreamPtr& stream, bool publish_event) {
+    if (!stream) {
+        return;
+    }
+    if (!publish_event) {
+        stream->clearPendingSwapDoneEvent();
+        return;
+    }
+    auto event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    event->record(cuda_graph::graphGetCurrentStream());
+    stream->setPendingSwapDoneEvent(std::static_pointer_cast<void>(event));
 }
 
 }  // namespace
@@ -1073,6 +1100,10 @@ absl::Status MtpExecutor::processResults(const BatchFuturePtr& future) {
 
     RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.process_results(stream_size=%zu)", decode_future->streams.size());
 
+    const bool publish_swap_event = needsPendingSwapDoneEvent(cache_manager_);
+    // FULL-cache one-inflight consumers may arrive after CPU bookkeeping has
+    // completed; keep the device state until the next dispatch overwrites it.
+    const bool keep_device_state_for_next_step = useProcessBeforeAwait() && !publish_swap_event;
     spec_bookkeeping_runner_.launch([processor          = batch_stream_processor_.get(),
                                      stream_groups_copy = decode_future->stream_groups,
                                      spec_decode_copy   = decode_future->spec_decode_output,
@@ -1081,6 +1112,8 @@ absl::Status MtpExecutor::processResults(const BatchFuturePtr& future) {
                                      draft_event        = decode_future->draft_event,
                                      device_epochs      = decode_future->device_state_epochs,
                                      reserve_epochs     = decode_future->kv_reserve_epochs,
+                                     publish_swap_event,
+                                     keep_device_state_for_next_step,
                                      decode_future]() mutable {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_bookkeeping_worker)");
 
@@ -1107,15 +1140,13 @@ absl::Status MtpExecutor::processResults(const BatchFuturePtr& future) {
 
         size_t i = 0;
         for (auto& stream : worker_streams) {
-            if (i < device_epochs.size()) {
+            if (!keep_device_state_for_next_step && i < device_epochs.size()) {
                 stream->clearSpecDecodeDeviceState(device_epochs[i]);
             }
             if (i < reserve_epochs.size()) {
                 stream->clearKVReserveSeqLength(reserve_epochs[i]);
             }
-            auto event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
-            event->record(cuda_graph::graphGetCurrentStream());
-            stream->setPendingSwapDoneEvent(std::static_pointer_cast<void>(event));
+            publishPendingSwapDoneEvent(stream, publish_swap_event);
             ++i;
         }
     });
@@ -1388,7 +1419,11 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         return absl::OkStatus();
     }
 
-    auto* processor = batch_stream_processor_.get();
+    auto*      processor          = batch_stream_processor_.get();
+    const bool publish_swap_event = needsPendingSwapDoneEvent(cache_manager_);
+    // FULL-cache one-inflight consumers may arrive after CPU bookkeeping has
+    // completed; keep the device state until the next dispatch overwrites it.
+    const bool keep_device_state_for_next_step = useProcessBeforeAwait() && !publish_swap_event;
     spec_bookkeeping_runner_.launch([processor,
                                      stream_groups_copy = decode_future->stream_groups,
                                      spec_decode_copy   = decode_future->spec_decode_output,
@@ -1397,6 +1432,8 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
                                      draft_event        = decode_future->draft_event,
                                      device_epochs      = decode_future->device_state_epochs,
                                      reserve_epochs     = decode_future->kv_reserve_epochs,
+                                     publish_swap_event,
+                                     keep_device_state_for_next_step,
                                      decode_future]() mutable {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_bookkeeping_worker)");
 
@@ -1428,15 +1465,13 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
 
         size_t i = 0;
         for (auto& stream : worker_streams) {
-            if (i < device_epochs.size()) {
+            if (!keep_device_state_for_next_step && i < device_epochs.size()) {
                 stream->clearSpecDecodeDeviceState(device_epochs[i]);
             }
             if (i < reserve_epochs.size()) {
                 stream->clearKVReserveSeqLength(reserve_epochs[i]);
             }
-            auto event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
-            event->record(cuda_graph::graphGetCurrentStream());
-            stream->setPendingSwapDoneEvent(std::static_pointer_cast<void>(event));
+            publishPendingSwapDoneEvent(stream, publish_swap_event);
             ++i;
         }
     });
