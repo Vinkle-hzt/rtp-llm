@@ -45,6 +45,10 @@ struct StreamSpecUpdateInfo {
     int                 draft_token;
     const torch::Tensor draft_hidden_states;
     const torch::Tensor draft_token_probs;
+    // GPU tensor of propose tokens for the next step.
+    // shape: [propose_step] (the per-stream slice). When defined, PDFUSION
+    // path will skip D2H and consume this GPU tensor directly.
+    torch::Tensor draft_token_gpu;
 
     bool update_remote_generate = true;
     bool force_update_info      = false;
@@ -70,7 +74,13 @@ public:
 
 public:
     size_t        propose_step = 0;
-    torch::Tensor tokens;  // selected tokens
+    torch::Tensor tokens;  // selected tokens (CPU, preserved for PD-disaggregate / RPC / tests)
+    // GPU mirror of the next-step propose tokens. shape [propose_step].
+    // Populated only on the PDFUSION fast path (via specUpdate). When defined,
+    // PDFUSION readers (prepareDecodeDraftModelInput / prepareOneStepSpecDecodeModelInput
+    // / updateOneStepDraftSamplerOutput / MtpExecutor::prefillStep) consume this
+    // GPU tensor directly and avoid the D2H + CPU loop + H2D round trip.
+    torch::Tensor propose_tokens_gpu;
     torch::Tensor hidden_states;
     torch::Tensor all_probs;
 
@@ -458,6 +468,24 @@ public:
         return sp_output_buffer_;
     }
 
+    // Linear-attention KV swap synchronisation handle. A fully async step can
+    // dispatch the next target verify before the previous specUpdate finishes
+    // swapLinearBlocks, so the verify stream waits on this completion event.
+    //
+    // The opaque shared_ptr<void> keeps cuda_runtime.h out of this header. The
+    // deleter (set by the producer side, e.g. specUpdate / cache resource)
+    // cleans up the cudaEvent_t with cudaEventDestroy. nullptr means "no
+    // pending swap" and the executor short-circuits the wait.
+    void setPendingSwapDoneEvent(std::shared_ptr<void> event) {
+        pending_swap_done_event_ = std::move(event);
+    }
+    std::shared_ptr<void> getPendingSwapDoneEvent() const {
+        return pending_swap_done_event_;
+    }
+    void clearPendingSwapDoneEvent() {
+        pending_swap_done_event_.reset();
+    }
+
     GenerateStreamPtr getProposeStream() {
         return propose_stream_;
     }
@@ -615,6 +643,10 @@ protected:
     bool                               contain_propose_token_ = false;
     int                                mtp_token_index_       = 0;
     SpeculativeExecutorStreamOutputPtr sp_output_buffer_      = nullptr;
+    // cudaEvent_t (type-erased) recorded after specUpdate runs
+    // swapLinearBlocks. MtpExecutor waits on it before issuing the next
+    // target verify. nullptr on streams without pending swaps.
+    std::shared_ptr<void> pending_swap_done_event_;
 
     bool return_all_hidden_states_ = false;
 
