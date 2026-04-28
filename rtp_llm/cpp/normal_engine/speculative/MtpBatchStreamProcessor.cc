@@ -702,6 +702,85 @@ void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
     }
 }
 
+// Full-async (Commit 11): batch GPU correction kernel mirroring vLLM v1's
+// update_num_computed_tokens_for_batch_change. See header for the contract.
+//
+// Implementation strategy: stay in ATen ops only (no custom CUDA kernel) so
+// the path can be validated quickly with no Triton/CUTLASS dependencies. The
+// batch sizes are tiny (typically 1-32) so launch overhead dominates the
+// wall time anyway, leaving little to win from a hand-written kernel. If a
+// later commit shows the launch overhead matters we can fuse this into a
+// single Triton kernel matching vLLM's reference at spec_decode/utils.py:567.
+torch::Tensor MtpBatchStreamProcessor::correctOptimisticGpuState(const StreamGroups& stream_groups) const {
+    const auto all_streams = stream_groups.allStreams();
+    if (all_streams.empty()) {
+        return torch::Tensor();
+    }
+    const int64_t batch_size = static_cast<int64_t>(all_streams.size());
+
+    // Collect host-side optimistic projections for this step. Whether or not
+    // the previous dispatch wrote them, the defaults (0 / -1 / 0) signal
+    // "no prior dispatch" which the where() below routes to the new-arrival
+    // branch (corrected = optimistic, no GPU read of accept_len_gpu).
+    std::vector<int32_t> optimistic_seq_len_h(batch_size);
+    std::vector<int32_t> prev_batch_index_h(batch_size);
+    std::vector<int32_t> prev_num_draft_h(batch_size);
+    int64_t              i = 0;
+    for (const auto& stream : all_streams) {
+        optimistic_seq_len_h[i] = static_cast<int32_t>(stream->optimisticSeqLen());
+        prev_batch_index_h[i]   = static_cast<int32_t>(stream->prevBatchIndex());
+        prev_num_draft_h[i]     = static_cast<int32_t>(stream->prevNumDraftTokens());
+        ++i;
+    }
+
+    auto host_int_opts = torch::TensorOptions().dtype(torch::kInt32);
+    auto optimistic_cpu =
+        torch::from_blob(optimistic_seq_len_h.data(), {batch_size}, host_int_opts).clone().pin_memory();
+    auto prev_idx_cpu   = torch::from_blob(prev_batch_index_h.data(), {batch_size}, host_int_opts).clone().pin_memory();
+    auto prev_draft_cpu = torch::from_blob(prev_num_draft_h.data(), {batch_size}, host_int_opts).clone().pin_memory();
+
+    auto optimistic_gpu = optimistic_cpu.to(torch::kCUDA, /*non_blocking=*/true);
+    auto prev_idx_gpu   = prev_idx_cpu.to(torch::kCUDA, /*non_blocking=*/true);
+    auto prev_draft_gpu = prev_draft_cpu.to(torch::kCUDA, /*non_blocking=*/true);
+
+    // Concatenate the previous step's accept_len_gpu slices ([1] each) into a
+    // single [batch] tensor. Streams missing accept_len_gpu (= first decode
+    // step / preempt+resume) get a placeholder 0 -- safe because their
+    // prev_batch_index is -1, which routes to the new-arrival branch.
+    std::vector<torch::Tensor> accept_len_slices;
+    accept_len_slices.reserve(batch_size);
+    bool any_accept_len_defined = false;
+    for (const auto& stream : all_streams) {
+        const auto& al = stream->getAcceptLenGpu();
+        if (al.defined()) {
+            any_accept_len_defined = true;
+            accept_len_slices.push_back(al.reshape({1}).to(torch::kInt32));
+        } else {
+            accept_len_slices.push_back(
+                torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA)));
+        }
+    }
+    if (!any_accept_len_defined) {
+        // First decode step in the burst -- nothing to correct, optimistic
+        // already equals the truth (caller will fall back to the legacy path).
+        return optimistic_gpu;
+    }
+    auto accept_len_prev_gpu = torch::cat(accept_len_slices, 0);
+
+    // Gather indices: clamp -1 sentinels up to 0 so index_select stays in
+    // bounds. The corresponding stream's `participating` flag is false so the
+    // gathered value is discarded by the where() below.
+    auto gather_idx       = prev_idx_gpu.clamp_min(0).to(torch::kLong);
+    auto gathered_accept  = accept_len_prev_gpu.index_select(/*dim=*/0, gather_idx);
+    auto gathered_draft   = prev_draft_gpu.index_select(/*dim=*/0, gather_idx);
+    auto participating    = (prev_idx_gpu >= 0).logical_and(prev_draft_gpu > 0);
+    auto delta            = gathered_accept - gathered_draft;
+    auto corrected        = optimistic_gpu + delta;
+    auto corrected_int32  = corrected.to(torch::kInt32);
+    auto optimistic_int32 = optimistic_gpu.to(torch::kInt32);
+    return torch::where(participating, corrected_int32, optimistic_int32);
+}
+
 void MtpBatchStreamProcessor::gatherHiddenStates(const StreamGroups& stream_groups, GptModelInputs& model_input) const {
     auto            all_streams = stream_groups.allStreams();
     c10::ScalarType dtype       = c10::ScalarType::Undefined;

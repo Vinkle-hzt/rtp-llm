@@ -581,6 +581,24 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
     }
 
+    // Full-async (Commit 11): GPU correction kernel. Computes a [batch] tensor
+    // of corrected next_seq_len values from each stream's host-side optimistic
+    // projection plus the previous step's per-stream accept_len_gpu. The
+    // result is the batch-level analogue of the per-stream next_seq_len_gpu_
+    // already attached by dispatchDecodeAsync; it lets subsequent commits
+    // drop the per-stream setter + cat in prepareOneStepSpecDecodeModelInput.
+    //
+    // Commit 11 only computes it (dead consumer) so we can validate the
+    // kernel runs and measure its overhead in isolation. The result lives
+    // for the lifetime of this scope; `[[maybe_unused]]` keeps the compiler
+    // quiet until Commit 12 wires the consumer.
+    if (useFullAsync()) {
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(correct_optimistic_gpu,stream_count=%zu)",
+                                      streams.size());
+        [[maybe_unused]] auto corrected_next_seq_len_gpu =
+            batch_stream_processor_->correctOptimisticGpuState(stream_groups);
+    }
+
     // Phase 3.3: linear-attention KV swap synchronisation. On the Phase 3.2
     // ultimate async path, the previous step's specUpdate runs on the result
     // thread and rewrites KV-block mappings via swapLinearBlocks. This step's
@@ -1104,6 +1122,22 @@ bool MtpExecutor::useStreamAsync() const {
         RTP_LLM_LOG_INFO("[stream-async] RTP_LLM_MTP_STREAM_ASYNC=%s -> useStreamAsync=%d",
                          env ? env : "(unset)",
                          static_cast<int>(on));
+        return on;
+    }();
+    return enabled;
+}
+
+bool MtpExecutor::useFullAsync() const {
+    // Commit 11: env-gated full-async. Implies useStreamAsync() so callers
+    // can rely on the stream-async device-tensor scaffolding. Read once and
+    // cache. RTP_LLM_MTP_FULL_ASYNC=1 turns on the GPU correction kernel
+    // (Commit 11), the AsyncOutput dispatch (Commit 12), and the
+    // NormalEngine async step + grpc-lazy result thread (Commit 13).
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_MTP_FULL_ASYNC");
+        bool        on  = (env != nullptr && std::string(env) == "1");
+        RTP_LLM_LOG_INFO(
+            "[full-async] RTP_LLM_MTP_FULL_ASYNC=%s -> useFullAsync=%d", env ? env : "(unset)", static_cast<int>(on));
         return on;
     }();
     return enabled;

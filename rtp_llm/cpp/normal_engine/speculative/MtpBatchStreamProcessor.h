@@ -35,6 +35,25 @@ public:
 
     void prepareOneStepSpecDecodeModelInput(const StreamGroups& stream_groups, GptModelInputs& model_input);
 
+    // Full-async (Commit 11): batch GPU correction kernel mirroring vLLM v1's
+    // update_num_computed_tokens_for_batch_change. Reads each stream's
+    // host-side optimistic projections (optimisticSeqLen / prevBatchIndex /
+    // prevNumDraftTokens) plus the previous step's per-stream accept_len_gpu
+    // ([1] tensors set by setSpecDecodeDeviceState), and produces a [batch]
+    // GPU tensor of corrected next_seq_len values:
+    //   for stream i with prev_batch_index >= 0 and prev_num_draft > 0:
+    //       corrected[i] = optimistic[i] - prev_num_draft[i] + accept_len_gpu_prev[i]
+    //   else:
+    //       corrected[i] = optimistic[i]   (new arrival, no correction needed)
+    //
+    // Result is the batch-level analogue of next_seq_len_gpu_ (which is
+    // per-stream [1]). Commit 11 only computes it -- subsequent commits will
+    // use it to replace the per-stream cat in prepareOneStepSpecDecodeModelInput
+    // and to drop the per-stream next_seq_len setter from dispatchDecodeAsync.
+    // Returns an undefined tensor when the batch has no eligible streams (i.e.
+    // missing accept_len_gpu / first decode step).
+    torch::Tensor correctOptimisticGpuState(const StreamGroups& stream_groups) const;
+
     void updateDecodeDraftModelInput(GptModelInputs&        model_input,
                                      const GptModelOutputs& model_output,
                                      const torch::Tensor&   draft_token_ids);

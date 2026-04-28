@@ -113,6 +113,16 @@ protected:
     // the body with the RTP_LLM_MTP_STREAM_ASYNC env switch.
     bool useStreamAsync() const;
 
+    // Full-async (Commit 11+) gate. Switched on by RTP_LLM_MTP_FULL_ASYNC=1.
+    // Independent of useStreamAsync(); when full-async is on we still rely on
+    // the stream-async device-tensor scaffolding (per-stream
+    // accept_len_gpu / next_seq_len_gpu / propose_tokens_gpu set by
+    // dispatchDecodeAsync) so callers should treat full-async as implying
+    // stream-async. Commit 11 uses this flag only to gate the GPU correction
+    // kernel call (dead consumer); subsequent commits will gate the prepare
+    // optimistic path, the AsyncOutput dispatch, and the wait_prev removal.
+    bool useFullAsync() const;
+
     // Stream-async (Phase 3.2 lite) dispatch. Caller records two events on
     // the main stream BEFORE calling: rejection_event right after the
     // rejection_sampling kernel launch (earliest signal that
