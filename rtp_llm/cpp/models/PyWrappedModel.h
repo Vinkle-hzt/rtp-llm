@@ -4,6 +4,7 @@
 #include "rtp_llm/models_py/bindings/core/torch_utils/TypeConvert.h"
 #include <optional>
 #include <string>
+#include <atomic>
 #include <mutex>
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
@@ -102,7 +103,7 @@ private:
     static constexpr int kPinnedCheckForwardCount = 3;
     int                  pinned_check_remaining_{kPinnedCheckForwardCount};
 
-    bool                         prepared_attention_inputs_{false};
+    std::atomic<bool>            prepared_attention_inputs_{false};
     torch_ext::PyAttentionInputs attention_inputs_;
     CudaGraphState               graph_state_;
 };

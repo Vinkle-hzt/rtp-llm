@@ -2,6 +2,7 @@
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include <thread>
+#include <utility>
 
 namespace rtp_llm {
 
@@ -26,6 +27,7 @@ void AsyncRunner::launch(std::function<void()> fn) {
     {
         std::unique_lock<std::mutex> lk(mutex_);
         cv_done_.wait(lk, [this] { return task_done_; });
+        rethrowPendingExceptionIfAny(lk);
         pending_task_ = Task{std::move(fn), std::move(tls_state)};
         task_done_    = false;
     }
@@ -36,8 +38,18 @@ void AsyncRunner::sync(const torch::Stream& wait_stream) {
     RTP_LLM_PROFILE_SCOPE("async_runner.sync");
     std::unique_lock<std::mutex> lk(mutex_);
     cv_done_.wait(lk, [this] { return task_done_; });
+    rethrowPendingExceptionIfAny(lk);
     lk.unlock();
     event_.block(wait_stream);
+}
+
+void AsyncRunner::rethrowPendingExceptionIfAny(std::unique_lock<std::mutex>& lk) {
+    if (!pending_exception_) {
+        return;
+    }
+    auto exception = std::exchange(pending_exception_, nullptr);
+    lk.unlock();
+    std::rethrow_exception(exception);
 }
 
 void AsyncRunner::workerLoop() {
@@ -53,20 +65,26 @@ void AsyncRunner::workerLoop() {
             pending_task_.reset();
         }
 
+        std::exception_ptr exception;
         {
             at::ThreadLocalStateGuard tls_guard(task.tls_state);
             RTP_LLM_PROFILE_SCOPE("async_runner.thread");
             cuda_graph::GraphStreamGuard stream_guard(cuda_graph::toGraphStream(stream_));
-            task.fn();
-            // Block worker CPU until stream_ drains: torch caching allocator handed
-            // main-stream allocations memory the worker stream was still reading.
-            stream_.synchronize();
-            event_.record(stream_);
+            try {
+                task.fn();
+                // Block worker CPU until stream_ drains: torch caching allocator handed
+                // main-stream allocations memory the worker stream was still reading.
+                stream_.synchronize();
+                event_.record(stream_);
+            } catch (...) {
+                exception = std::current_exception();
+            }
         }
 
         {
             std::lock_guard<std::mutex> lk(mutex_);
-            task_done_ = true;
+            pending_exception_ = exception;
+            task_done_         = true;
         }
         cv_done_.notify_one();
     }

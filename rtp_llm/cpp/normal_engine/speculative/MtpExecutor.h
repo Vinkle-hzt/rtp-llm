@@ -143,6 +143,8 @@ private:
 
     torch::Tensor d2t_map_;
 
+    torch::Stream collect_metrics_stream_;
+
     AsyncRunner target_verify_prepare_runner_;
     AsyncRunner draft_prefill_prepare_runner_;
 };

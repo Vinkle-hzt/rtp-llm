@@ -79,7 +79,7 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs, CudaGr
 
     // should wait last forward done before prepare inputs
     forward_event_.synchronize();
-    prepared_attention_inputs_ = true;
+    prepared_attention_inputs_.store(true, std::memory_order_release);
 
     const size_t graph_idx =
         is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
@@ -295,14 +295,22 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs, CudaGr
 PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphState& state) {
     PyModelOutputs outputs;
 
+    // RAII guard: ensure prepared_attention_inputs_ is always reset to false on scope exit,
+    // even if forward() throws after async prepareAttentionInputs set it to true.
+    struct PreparedFlagGuard {
+        std::atomic<bool>& flag;
+        ~PreparedFlagGuard() {
+            flag.store(false, std::memory_order_release);
+        }
+    } flag_guard{prepared_attention_inputs_};
+
     // decode or embedding model only
     RTP_LLM_LOG_DEBUG("Replay Start");
 
-    if (!prepared_attention_inputs_) {
+    if (!prepared_attention_inputs_.load(std::memory_order_acquire)) {
         prepareInputs(inputs, state);
     } else {
         prepareInputData(inputs, state);
-        prepared_attention_inputs_ = false;
     }
 
     if (is_prefill_cuda_graph_mode_) {

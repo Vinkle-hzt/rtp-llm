@@ -421,8 +421,8 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs) {
     calculatePaddingOffset(attention_inputs);
     attention_inputs.padding_offset = tensorHoldHostAndToCuda(attention_inputs.padding_offset);
 
-    attention_inputs_          = attention_inputs;
-    prepared_attention_inputs_ = true;
+    attention_inputs_ = attention_inputs;
+    prepared_attention_inputs_.store(true, std::memory_order_release);
 
     // CRITICAL ORDERING: flush queued H2D copies BEFORE graph_runner_->prepareAttentionInputs.
     // graph_runner internally launches strided D2D copies that READ from these freshly allocated
@@ -446,6 +446,17 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.forward");
     DevicePerfWrapper wrapper(enable_device_perf_, "py model forward");
     holdInputsHostBuffers(inputs);
+
+    // RAII guard: ensure prepared_attention_inputs_ is always reset to false on scope exit,
+    // even if forward() throws. Without this, an exception after async prepareAttentionInputs
+    // would leave the flag true, causing the next forward() to use stale attention_inputs_.
+    struct PreparedFlagGuard {
+        std::atomic<bool>& flag;
+        ~PreparedFlagGuard() {
+            flag.store(false, std::memory_order_release);
+        }
+    } flag_guard{prepared_attention_inputs_};
+
     try {
         RTP_LLM_LOG_DEBUG("Calling forward method on Python object instance.");
 
@@ -474,10 +485,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
 
         auto bert_embedding_inputs = buildBertEmbeddingInputs(inputs);
 
-        if (!prepared_attention_inputs_) {
+        if (!prepared_attention_inputs_.load(std::memory_order_acquire)) {
             prepareAttentionInputs(inputs);
         }
-        prepared_attention_inputs_ = false;
 
         if (device_props_.enable_prefill_cp) {
             attention_inputs_.context_parallel_info = cp_params;

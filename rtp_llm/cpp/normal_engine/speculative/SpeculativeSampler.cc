@@ -139,6 +139,40 @@ void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&           sample_
     }
 
     RTP_LLM_PROFILE_SCOPE("speculative_sampler.batchSample.post_rejection_sampling");
+
+    // forceSpAccept: override rejection sampling results for streams that requested
+    // forced acceptance — accept all draft tokens plus the target bonus token.
+    {
+        bool has_force = false;
+        auto force_mask =
+            torch::zeros({(long)batch_size}, torch::TensorOptions().dtype(torch::kBool).device(target_device));
+        int idx = 0;
+        for (const auto& stream : streams) {
+            if (stream->forceSpAccept()) {
+                force_mask[idx] = true;
+                has_force       = true;
+            }
+            idx++;
+        }
+        if (has_force) {
+            RTP_LLM_PROFILE_SCOPE("speculative_sampler.batchSample.post_rejection_sampling.forceSpAccept");
+            // target_token_ids_d_t layout: [batch_size * (propose_step+1), token_stride]
+            // Extract the bonus token at position propose_step for each batch item.
+            int64_t token_stride = target_token_ids_d_t.size(1);
+            auto    target_bonus_t =
+                target_token_ids_d_t.reshape({(long)batch_size, (long)(propose_step_ + 1), token_stride});
+            auto target_bonus = target_bonus_t.select(1, propose_step_).select(1, token_stride - 1).unsqueeze(1);
+            // forced_tokens: draft tokens [0..propose_step-1] + target bonus
+            auto forced_tokens = torch::cat({draft_token_ids_d_t, target_bonus}, 1);
+            auto force_mask_2d = force_mask.unsqueeze(1).expand_as(output_token_ids_d);
+            output_token_ids_d = torch::where(force_mask_2d, forced_tokens, output_token_ids_d);
+            output_accepted_token_num_d =
+                torch::where(force_mask,
+                             torch::full_like(output_accepted_token_num_d, (int32_t)(propose_step_ + 1)),
+                             output_accepted_token_num_d);
+        }
+    }
+
     // use async sample here, we assume accept all tokens
     // so we need to reset -1 to 0 in output_token_ids_d
     output_token_ids_d.index_put_({output_token_ids_d == -1}, 0);

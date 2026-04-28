@@ -1,6 +1,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -23,6 +24,7 @@ public:
 
 private:
     void workerLoop();
+    void rethrowPendingExceptionIfAny(std::unique_lock<std::mutex>& lk);
 
     torch::Stream stream_;
     torch::Event  event_;
@@ -37,6 +39,7 @@ private:
         at::ThreadLocalState  tls_state;
     };
     std::optional<Task> pending_task_;
+    std::exception_ptr  pending_exception_;
     bool                task_done_ = true;
     bool                shutdown_  = false;
 };

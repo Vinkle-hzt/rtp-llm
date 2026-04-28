@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 #include <pybind11/embed.h>
@@ -150,7 +151,7 @@ private:
     // event to record forward done
     torch::Event forward_event_ = cuda_graph::makeGraphEvent();
 
-    bool prepared_attention_inputs_ = false;
+    std::atomic<bool> prepared_attention_inputs_ = false;
 };
 
 }  // namespace rtp_llm

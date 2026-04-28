@@ -11,7 +11,10 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
     }
 
     // first sync stage: shape hints
-    static auto host_tensor_stream = cuda_graph::graphGetStreamFromPool(true);
+    // Keep one host-transfer stream per caller thread. TP worker threads may call this function
+    // concurrently, and sharing one process-global stream would serialize unrelated transfers and
+    // let one caller's synchronize() wait on another caller's queued work.
+    static thread_local auto host_tensor_stream = cuda_graph::graphGetStreamFromPool(true);
 
     const size_t shape_hints_size = GptModelInputIndex::gptModelInputLength;
     auto         shape_hints_t    = torch::empty({(int64_t)shape_hints_size}, torch::kInt32).pin_memory();

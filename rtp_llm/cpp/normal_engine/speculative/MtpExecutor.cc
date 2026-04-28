@@ -4,6 +4,7 @@
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
 #include "rtp_llm/cpp/engine_base/stream/StreamGroups.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
+#include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOScheduler.h"
 #include "rtp_llm/cpp/engine_base/schedulers/BatchDecodeScheduler.h"
@@ -122,6 +123,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     metrics_reporter_(params.metrics_reporter),
     warm_up_(warm_up),
     role_type_(params.pd_sep_config.role_type),
+    collect_metrics_stream_(cuda_graph::graphGetStreamFromPool(true)),
     target_verify_prepare_runner_(cuda_graph::graphGetStreamFromPool(true)),
     draft_prefill_prepare_runner_(cuda_graph::graphGetStreamFromPool(true)) {
     data_type_        = params.model_config_.data_type;
@@ -153,6 +155,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                                              params.model_config_.hidden_size,
                                              params.parallelism_config.ep_rank,
                                              params.parallelism_config.ep_size,
+                                             params.parallelism_config.world_size,
                                              params.py_eplb,
                                              moe_weight_type,
                                              params.model_config_.quant_algo,
@@ -270,7 +273,8 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
            draft_cache_layer_layout.layer_to_groups.data(),
            draft_cache_layer_layout.layer_to_groups.size() * sizeof(int));
 
-    d2t_map_ = draft_model_->weights_.d2t_map;
+    const auto& draft_weights = propose_params->getEngineInitParams().gpt_weights;
+    d2t_map_                  = draft_model_ ? draft_model_->weights_.d2t_map : draft_weights.d2t_map;
     speculative_sampler_.reset(new speculative::SpeculativeSampler(d2t_map_, propose_step_));
     fast_topk_sampler_.reset(new speculative::FastTopKSampler(d2t_map_));
 
@@ -535,8 +539,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     torch::Tensor                      spec_token_ids_t;
     std::vector<torch::Tensor>         draft_probs_list;
     speculative::FastTopKSamplerOutput fast_topk_sampler_output;
-
-    size_t total_accept_len = 0;
+    torch::Event                       accept_len_ready_event = cuda_graph::makeGraphEvent();
 
     const auto& cache_cfg     = cache_manager_->cacheConfig();
     const auto& mtp_cache_cfg = cache_manager_->getMTPModuleCacheConfig(0);
@@ -602,6 +605,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     if (propose_step_ > 1) {
         {
+            // NOTE: combo_tokens never used in prepare stage, so it is safe to use shallow copy
             auto model_input_copy                    = model_input;
             model_input_copy.kv_block_stride_bytes   = cache_cfg.kv_block_stride_bytes;
             model_input_copy.kv_scale_stride_bytes   = cache_cfg.kv_scale_stride_bytes;
@@ -649,8 +653,10 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     }
 
     {
-        auto* prefill_model    = sp_prefill_draft_model_ ? sp_prefill_draft_model_.get() : draft_model_.get();
-        auto  model_input_copy = model_input;
+        auto* prefill_model = sp_prefill_draft_model_ ? sp_prefill_draft_model_.get() : draft_model_.get();
+
+        // NOTE: combo_tokens never used in prepare stage, so it is safe to use shallow copy
+        auto model_input_copy                    = model_input;
         model_input_copy.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
         model_input_copy.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
         model_input_copy.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
@@ -707,9 +713,11 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             // rejection sampling
             speculative_sampler_output = speculative_sampler_->forward(streams, draft_sampler_output, sampler_output);
         }
-        // NOTE: here will have cuda device sync before update model input
         batch_stream_processor_->updateDecodePostDraftModelInput(
-            model_input, model_output, speculative_sampler_output, batch_size, hidden_states_d_t, total_accept_len);
+            model_input, model_output, speculative_sampler_output, batch_size, hidden_states_d_t);
+        if (metrics_reporter_) {
+            accept_len_ready_event.record(cuda_graph::graphGetCurrentStream());
+        }
     } else {
         model_input.lm_output_indexes =
             torch::empty({(int64_t)batch_size}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
@@ -718,9 +726,15 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(tp_sync_post_rejection)");
-        execBroadcast({{model_input.combo_tokens}, 0});
-        execBroadcast({{model_input.last_hidden_states}, 0});
-        execBroadcast({{model_input.lm_output_indexes}, 0});
+        // only broadcast combo_tokens, last_hidden_states, and lm_output_indexes
+        // because these are the only fields updated by updateDecodePostDraftModelInput after rejection sampling
+        if (parallelism_config_.tp_size > 1) {
+            execBroadcast({{model_input.combo_tokens}, 0});
+            execBroadcast({{model_input.last_hidden_states}, 0});
+            execBroadcast({{model_input.lm_output_indexes}, 0});
+            execSyncCommunication(false);
+            cudaSyncAndCheck();
+        }
         model_input.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
         model_input.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
@@ -757,6 +771,14 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     // collect metrics
     if (metrics_reporter_) {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(collect_metrics)");
+        size_t total_accept_len = 0;
+        {
+            c10::StreamGuard stream_guard(collect_metrics_stream_);
+            // launch when data is ready
+            accept_len_ready_event.block(collect_metrics_stream_);
+            // implicitly stream sync here
+            total_accept_len = speculative_sampler_output.accept_len.sum().item<int>();
+        }
         executor_collector.generate_batch_size = stream_groups.totalModelBatchSize();
         executor_collector.execute_token_size += total_accept_len;
         executor_collector.max_seq_len = stream_groups.maxSeqLen();
