@@ -41,17 +41,10 @@ void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&           sample_
                                      SamplerOutput&                      target_sampler_output) const {
     RTP_LLM_PROFILE_SCOPE("speculative_sampler.batchSample");
     torch::Device target_device = getTorchCudaDevice();
-    torch::Device host_device   = torch::Device(torch::kCPU);
 
     int batch_size = streams.size();
 
-    // target_sampler_output.token_ids may be a CUDA tensor (Sampler keeps it on GPU to avoid
-    // D2H sync during sampling). Move to CPU once here for data_ptr access.
-    const torch::Tensor target_token_ids_cpu = target_sampler_output.token_ids.is_cuda() ?
-                                                   target_sampler_output.token_ids.to(host_device, true) :
-                                                   target_sampler_output.token_ids;
-    auto                draft_token_ids      = draft_sampler_output.token_ids;
-    auto                target_token_ids     = target_sampler_output.token_ids;
+    auto draft_token_ids = draft_sampler_output.token_ids;
 
     auto draft_token_probs  = draft_sampler_output.all_probs;
     auto target_token_probs = target_sampler_output.all_probs;

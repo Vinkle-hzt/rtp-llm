@@ -6,6 +6,7 @@
 #include "rtp_llm/cpp/engine_base/ProposeModelEngineInitParams.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
+#include <utility>
 
 namespace rtp_llm {
 
@@ -22,6 +23,15 @@ public:
     std::shared_ptr<torch::Event> transfer_done_event;
 
     SpeculativeSamplerOutput(): transfer_done_event(std::make_shared<torch::Event>(cuda_graph::makeGraphEvent())) {}
+
+    SpeculativeSamplerOutput(torch::Tensor accept_tokens_in, torch::Tensor accept_len_in):
+        accept_tokens(std::move(accept_tokens_in)),
+        accept_len(std::move(accept_len_in)),
+        transfer_done_event(std::make_shared<torch::Event>(cuda_graph::makeGraphEvent())) {
+        accept_tokens_cpu = accept_tokens.defined() ? accept_tokens.to(torch::kCPU, true) : torch::Tensor();
+        accept_len_cpu    = accept_len.defined() ? accept_len.to(torch::kCPU, true) : torch::Tensor();
+        transfer_done_event->record(cuda_graph::graphGetCurrentStream());
+    }
 };
 
 struct FastTopKSamplerOutput {

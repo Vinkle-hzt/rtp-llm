@@ -6,6 +6,7 @@
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include <numeric>
 #include <cstring>
+#include <cstdlib>
 
 namespace rtp_llm {
 
@@ -183,7 +184,27 @@ void MtpBatchStreamProcessor::updateProposeTokens(const StreamGroups&           
 // threshold higher trades MTP latency for safety; 4 keeps the small-batch
 // (interactive) path on the legacy CPU loop while opening the door for big
 // batch wins. Negative threshold disables the GPU path entirely; zero forces it.
-static constexpr int64_t kPhase31MinBatchForGpu = -1;
+// Keep the default at zero to preserve the pre-v2 effective behavior; use
+// RTP_LLM_MTP_GPU_PROPOSE_MIN_BATCH=-1 when an experiment needs a CPU fallback.
+static constexpr int64_t kPhase31MinBatchForGpu = 0;
+
+static int64_t phase31MinBatchForGpu() {
+    static const int64_t value = []() {
+        const char* env = std::getenv("RTP_LLM_MTP_GPU_PROPOSE_MIN_BATCH");
+        if (env == nullptr || *env == '\0') {
+            return kPhase31MinBatchForGpu;
+        }
+        char*     end    = nullptr;
+        long long parsed = std::strtoll(env, &end, 10);
+        return end == env ? kPhase31MinBatchForGpu : static_cast<int64_t>(parsed);
+    }();
+    return value;
+}
+
+static bool usePhase31GpuProposePath(size_t batch_size) {
+    const int64_t min_batch = phase31MinBatchForGpu();
+    return min_batch >= 0 && static_cast<int64_t>(batch_size) >= min_batch;
+}
 
 void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& stream_groups,
                                                            GptModelInputs&     model_input) {
@@ -233,7 +254,7 @@ void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& s
         }
     }
 
-    bool                       all_gpu = (static_cast<int64_t>(batch_size) >= kPhase31MinBatchForGpu);
+    bool                       all_gpu = usePhase31GpuProposePath(batch_size);
     std::vector<torch::Tensor> propose_slices_gpu;
     if (all_gpu) {
         propose_slices_gpu.reserve(batch_size);
@@ -361,7 +382,7 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
         }
     }
 
-    bool                       all_gpu = (static_cast<int64_t>(batch_size) >= kPhase31MinBatchForGpu);
+    bool                       all_gpu = usePhase31GpuProposePath(batch_size);
     std::vector<torch::Tensor> target_last_cpu;
     std::vector<torch::Tensor> propose_slices_gpu;
     if (all_gpu) {
@@ -622,8 +643,16 @@ void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
     std::vector<StreamSpecUpdateInfo>&           spec_update_infos) const {
     // wait for the transfer to complete
     spec_decode_output.transfer_done_event->synchronize();
-    const auto& accept_len    = spec_decode_output.accept_len_cpu;
-    const auto& accept_tokens = spec_decode_output.accept_tokens_cpu;
+    const torch::Tensor accept_len =
+        spec_decode_output.accept_len_cpu.defined() ?
+            spec_decode_output.accept_len_cpu :
+            (spec_decode_output.accept_len.is_cuda() ? spec_decode_output.accept_len.cpu() :
+                                                       spec_decode_output.accept_len);
+    const torch::Tensor accept_tokens =
+        spec_decode_output.accept_tokens_cpu.defined() ?
+            spec_decode_output.accept_tokens_cpu :
+            (spec_decode_output.accept_tokens.is_cuda() ? spec_decode_output.accept_tokens.cpu() :
+                                                          spec_decode_output.accept_tokens);
 
     const auto& draft_model_output   = draft_prefill_output.model_output;
     const auto& draft_sampler_output = draft_prefill_output.sampler_output;
