@@ -72,9 +72,6 @@ void AsyncRunner::workerLoop() {
             cuda_graph::GraphStreamGuard stream_guard(cuda_graph::toGraphStream(stream_));
             try {
                 task.fn();
-                // Block worker CPU until stream_ drains: torch caching allocator handed
-                // main-stream allocations memory the worker stream was still reading.
-                stream_.synchronize();
                 event_.record(stream_);
             } catch (...) {
                 exception = std::current_exception();
