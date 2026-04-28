@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/normal_engine/speculative/MtpBatchStreamProcessor.h"
+#include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/cpp/utils/TensorDebugUtils.h"
 #include "rtp_llm/cpp/utils/StringUtil.h"
@@ -643,8 +644,29 @@ void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
     const speculative::SpeculativeSamplerOutput& spec_decode_output,
     const MergedOutput&                          draft_prefill_output,
     std::vector<StreamSpecUpdateInfo>&           spec_update_infos) const {
-    const auto& accept_len    = spec_decode_output.accept_len.cpu();
-    const auto& accept_tokens = spec_decode_output.accept_tokens.cpu();
+    // Phase 3.2 lite v2: replace `.cpu()` (allocates a non-pinned host tensor
+    // and synchronously D2H-copies via a staging buffer — measured ~8.5ms even
+    // for a few-byte payload, dominating the bookkeeping worker timeline) with
+    // an explicit pinned destination + non_blocking copy. Both source tensors
+    // are produced on the current CUDA stream (worker stream when called from
+    // MtpExecutor::dispatchDecodeAsync's worker lambda; main stream on the
+    // synchronous fallback path), and we sync that stream once at the end —
+    // semantically equivalent to the original `.cpu()`'s end-of-call sync but
+    // without the staging-buffer overhead.
+    auto accept_len_cpu = torch::empty(
+        spec_decode_output.accept_len.sizes(),
+        torch::TensorOptions().dtype(spec_decode_output.accept_len.dtype()).device(torch::kCPU).pinned_memory(true));
+    accept_len_cpu.copy_(spec_decode_output.accept_len, /*non_blocking=*/true);
+
+    auto accept_tokens_cpu = torch::empty(
+        spec_decode_output.accept_tokens.sizes(),
+        torch::TensorOptions().dtype(spec_decode_output.accept_tokens.dtype()).device(torch::kCPU).pinned_memory(true));
+    accept_tokens_cpu.copy_(spec_decode_output.accept_tokens, /*non_blocking=*/true);
+
+    cuda_graph::graphGetCurrentStream().synchronize();
+
+    const auto& accept_len    = accept_len_cpu;
+    const auto& accept_tokens = accept_tokens_cpu;
 
     const auto& draft_model_output   = draft_prefill_output.model_output;
     const auto& draft_sampler_output = draft_prefill_output.sampler_output;
