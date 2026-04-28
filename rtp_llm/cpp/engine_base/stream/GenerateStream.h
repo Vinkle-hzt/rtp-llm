@@ -486,6 +486,43 @@ public:
         pending_swap_done_event_.reset();
     }
 
+    // Stream-async state for the next decode step. These per-stream GPU handles
+    // let prepare build combo_tokens / sequence_lengths without waiting for
+    // host bookkeeping (D2H + specUpdate + KV release).
+    //
+    // Shapes (per stream slice):
+    //   accept_len_gpu     : [1] int32          number of accepted tokens
+    //   accept_tokens_gpu  : [1, propose+1]     accepted token ids; first accept_len cols valid
+    //   next_seq_len_gpu   : [1] int32          old_seq_len + accept_len (committed seq len)
+    //   propose_tokens_gpu : [1, token_stride]  draft sampler output for next-step propose
+    void setSpecDecodeDeviceState(torch::Tensor accept_len_gpu,
+                                  torch::Tensor accept_tokens_gpu,
+                                  torch::Tensor next_seq_len_gpu,
+                                  torch::Tensor propose_tokens_gpu = torch::Tensor()) {
+        accept_len_gpu_     = std::move(accept_len_gpu);
+        accept_tokens_gpu_  = std::move(accept_tokens_gpu);
+        next_seq_len_gpu_   = std::move(next_seq_len_gpu);
+        propose_tokens_gpu_ = std::move(propose_tokens_gpu);
+    }
+    const torch::Tensor& getAcceptLenGpu() const {
+        return accept_len_gpu_;
+    }
+    const torch::Tensor& getAcceptTokensGpu() const {
+        return accept_tokens_gpu_;
+    }
+    const torch::Tensor& getNextSeqLenGpu() const {
+        return next_seq_len_gpu_;
+    }
+    const torch::Tensor& getProposeTokensGpu() const {
+        return propose_tokens_gpu_;
+    }
+    void clearSpecDecodeDeviceState() {
+        accept_len_gpu_     = torch::Tensor();
+        accept_tokens_gpu_  = torch::Tensor();
+        next_seq_len_gpu_   = torch::Tensor();
+        propose_tokens_gpu_ = torch::Tensor();
+    }
+
     GenerateStreamPtr getProposeStream() {
         return propose_stream_;
     }
@@ -647,6 +684,15 @@ protected:
     // swapLinearBlocks. MtpExecutor waits on it before issuing the next
     // target verify. nullptr on streams without pending swaps.
     std::shared_ptr<void> pending_swap_done_event_;
+
+    // Stream-async device-resident state for the next decode step's prepare.
+    // See setSpecDecodeDeviceState() for the contract; fields stay default
+    // (undefined Tensor) on the synchronous path so existing callers see no
+    // behaviour change.
+    torch::Tensor accept_len_gpu_;
+    torch::Tensor accept_tokens_gpu_;
+    torch::Tensor next_seq_len_gpu_;
+    torch::Tensor propose_tokens_gpu_;
 
     bool return_all_hidden_states_ = false;
 
