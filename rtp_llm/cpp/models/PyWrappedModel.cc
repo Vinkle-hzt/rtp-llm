@@ -189,7 +189,9 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     }
 
     // In qwen3-next target verify mode, sequence_lengths_plus_1_d uses prefix_lengths
-    if (py_attn_inputs.is_target_verify) {
+    if (py_attn_inputs.is_target_verify && inputs.sequence_lengths_plus_1.defined()) {
+        py_attn_inputs.sequence_lengths_plus_1_d = to_device_i32(inputs.sequence_lengths_plus_1);
+    } else if (py_attn_inputs.is_target_verify) {
         py_attn_inputs.sequence_lengths_plus_1_d = length_plus_one_device(prefix_lengths_src);
     } else {
         py_attn_inputs.sequence_lengths_plus_1_d = length_plus_one_device(sequence_lengths_src);
@@ -467,17 +469,27 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs) {
         --pinned_check_remaining_;
     }
 
-    DevicePerfWrapper wrapper(enable_device_perf_, "py model prepareAttentionInputs");
-    auto              attention_inputs = buildPyAttentionInputs(inputs);
+    DevicePerfWrapper            wrapper(enable_device_perf_, "py model prepareAttentionInputs");
+    torch_ext::PyAttentionInputs attention_inputs;
+    {
+        RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs(build)");
+        attention_inputs = buildPyAttentionInputs(inputs);
+    }
     if (!inputs.warmup && inputs.pd_separation) {
         attention_inputs.cache_store_inputs = prepareWriteCacheParams(inputs);
         cache_store_async_writer_->init();
     }
-    setupKVCacheForAttentionInputs(attention_inputs, inputs);
+    {
+        RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs(setup_kv_cache)");
+        setupKVCacheForAttentionInputs(attention_inputs, inputs);
+    }
 
-    calculatePaddingOffsetDeviceAware(attention_inputs);
-    if (attention_inputs.padding_offset.defined() && !attention_inputs.padding_offset.device().is_cuda()) {
-        attention_inputs.padding_offset = tensorHoldHostAndToCuda(attention_inputs.padding_offset);
+    {
+        RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs(padding_offset)");
+        calculatePaddingOffsetDeviceAware(attention_inputs);
+        if (attention_inputs.padding_offset.defined() && !attention_inputs.padding_offset.device().is_cuda()) {
+            attention_inputs.padding_offset = tensorHoldHostAndToCuda(attention_inputs.padding_offset);
+        }
     }
 
     attention_inputs_ = attention_inputs;
@@ -490,13 +502,17 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs) {
     // QKV+RoPE+KVCache kernel then dereferences as block-id pointers → WARP_ILLEGAL_ADDRESS.
     // (Pre-d318b63ea forward() did fusedCopy before graph_runner->forward; the async-prepare
     // extraction split those steps and broke the implicit ordering.)
-    fusedCopy(d2d_copies_);
+    {
+        RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs(fused_h2d)");
+        fusedCopy(d2d_copies_);
+    }
 
     graph_state_         = CudaGraphState();
     auto empty_tensor    = torch::Tensor();
     auto py_model_inputs = PyModelInputs({empty_tensor, empty_tensor, attention_inputs_, empty_tensor});
 
     if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state_)) {
+        RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs(cuda_graph_prepare)");
         graph_runner_->prepareAttentionInputs(py_model_inputs, graph_state_);
     }
 }

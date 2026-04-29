@@ -17,6 +17,9 @@
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorFactory.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
+#if USING_CUDA
+#include "rtp_llm/models_py/bindings/cuda/kernels/mtp_target_verify_prepare.h"
+#endif
 #include "autil/TimeUtility.h"
 #include <cstdlib>
 #include <memory>
@@ -82,6 +85,7 @@ void MtpExecutor::ensureMtpModelInputsOnCuda(GptModelInputs& model_input, const 
     to_cuda(model_input.input_lengths, "input_lengths");
     to_cuda(model_input.sequence_lengths, "sequence_lengths");
     to_cuda(model_input.prefix_lengths, "prefix_lengths");
+    to_cuda(model_input.sequence_lengths_plus_1, "sequence_lengths_plus_1");
     to_cuda(model_input.lm_output_indexes, "lm_output_indexes");
     checkMtpModelInputsOnCuda(model_input, tag);
 }
@@ -105,6 +109,7 @@ void MtpExecutor::checkMtpModelInputsOnCuda(const GptModelInputs& model_input, c
     check(model_input.input_lengths, "input_lengths");
     check(model_input.sequence_lengths, "sequence_lengths");
     check(model_input.prefix_lengths, "prefix_lengths");
+    check(model_input.sequence_lengths_plus_1, "sequence_lengths_plus_1");
     check(model_input.lm_output_indexes, "lm_output_indexes");
     RTP_LLM_LOG_DEBUG("[mtp-device-input] %s metadata tensors are CUDA", tag);
 }
@@ -769,24 +774,49 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             model_input_copy.kv_block_stride_bytes   = cache_cfg.kv_block_stride_bytes;
             model_input_copy.kv_scale_stride_bytes   = cache_cfg.kv_scale_stride_bytes;
             model_input_copy.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
-            model_input_copy.input_lengths =
-                torch::full({(long)batch_size},
-                            (long)(propose_step_ + 1),
-                            torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-            model_input_copy.lm_output_indexes =
-                torch::arange(0,
-                              batch_size * (propose_step_ + 1),
-                              propose_step_ + 1,
-                              torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-            // Async prepare only needs the token count for metadata/cudagraph sizing.
-            // The actual target-verify token ids are produced by draftModelDecode below.
-            model_input_copy.combo_tokens = torch::empty(
-                {static_cast<int64_t>(batch_size * (propose_step_ + 1))},
-                torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-            model_input_copy.prefix_lengths =
-                model_input.sequence_lengths.is_cuda() ?
-                    model_input.sequence_lengths.clone() :
-                    model_input.sequence_lengths.to(torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+            {
+                RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_target_verify_input)");
+                const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+                // Async prepare only needs the token count for metadata/cudagraph sizing.
+                // The actual target-verify token ids are produced by draftModelDecode below.
+                model_input_copy.combo_tokens =
+                    torch::empty({static_cast<int64_t>(batch_size * (propose_step_ + 1))}, cuda_i32);
+#if USING_CUDA
+                const bool can_fuse_target_prepare = model_input.sequence_lengths.defined()
+                                                     && model_input.sequence_lengths.is_cuda()
+                                                     && model_input.sequence_lengths.scalar_type() == torch::kInt32
+                                                     && model_input.sequence_lengths.is_contiguous();
+                if (can_fuse_target_prepare) {
+                    model_input_copy.input_lengths  = torch::empty({static_cast<int64_t>(batch_size)}, cuda_i32);
+                    model_input_copy.prefix_lengths = torch::empty({static_cast<int64_t>(batch_size)}, cuda_i32);
+                    model_input_copy.sequence_lengths_plus_1 =
+                        torch::empty({static_cast<int64_t>(batch_size)}, cuda_i32);
+                    model_input_copy.lm_output_indexes = torch::empty({static_cast<int64_t>(batch_size)}, cuda_i32);
+                    RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_target_verify_input_fused)");
+                    invokeMtpTargetVerifyPrepare(model_input.sequence_lengths,
+                                                 model_input_copy.input_lengths,
+                                                 model_input_copy.prefix_lengths,
+                                                 model_input_copy.sequence_lengths_plus_1,
+                                                 model_input_copy.lm_output_indexes,
+                                                 static_cast<int32_t>(propose_step_ + 1),
+                                                 cuda_graph::graphGetCurrentStream().stream());
+                } else
+#endif
+                {
+                    RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_target_verify_input_fallback)");
+                    model_input_copy.input_lengths = torch::full(
+                        {static_cast<int64_t>(batch_size)}, static_cast<int64_t>(propose_step_ + 1), cuda_i32);
+                    model_input_copy.lm_output_indexes =
+                        torch::arange(0,
+                                      static_cast<int64_t>(batch_size * (propose_step_ + 1)),
+                                      static_cast<int64_t>(propose_step_ + 1),
+                                      cuda_i32);
+                    model_input_copy.prefix_lengths          = model_input.sequence_lengths.is_cuda() ?
+                                                                   model_input.sequence_lengths.clone() :
+                                                                   model_input.sequence_lengths.to(cuda_i32);
+                    model_input_copy.sequence_lengths_plus_1 = model_input_copy.prefix_lengths + 1;
+                }
+            }
             model_input_copy.last_hidden_states = torch::Tensor();
             model_input_copy.sequence_lengths =
                 torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));

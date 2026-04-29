@@ -137,7 +137,10 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs, CudaGr
     // for now we only support 2.2.1 and 2.2.3 in deocode cuda graph, and 2.2.2 will be support in prefill cuda graph.
 
     // should wait last forward done before prepare inputs
-    forward_event_.synchronize();
+    {
+        RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(wait_forward_event)");
+        forward_event_.synchronize();
+    }
     prepared_attention_inputs_.store(true, std::memory_order_release);
 
     const size_t graph_idx =
@@ -219,42 +222,48 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs, CudaGr
     // Clear stale device ranges before strided D2D copies. All device-side fills
     // are fused into one kernel to avoid a train of tiny aten::fill_ launches.
 #if USING_CUDA
-    CudaGraphPrepareFillParams fill_params;
-    addCudaGraphPrepareFillRegion(fill_params,
-                                  py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device,
-                                  0,
-                                  py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device.numel(),
-                                  0);
-    if (has_hybrid_cache) {
-        for (size_t g = 0; g < hybrid_cache_group; ++g) {
-            addCudaGraphPrepareFillRegion(
-                fill_params,
-                py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device_by_group[g],
-                0,
-                py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device_by_group[g].numel(),
-                0);
-        }
-    }
-    if (is_prefill_cuda_graph_mode_) {
-        if (state.current_batch_size < max_bs_) {
-            addCudaGraphPrepareFillRegion(
-                fill_params, py_model_inputs_.attention_inputs.prefix_lengths, state.current_batch_size, max_bs_, 0);
-            addCudaGraphPrepareFillRegion(
-                fill_params, py_model_inputs_.attention_inputs.input_lengths, state.current_batch_size, max_bs_, 0);
-        }
-        const int last_valid = state.current_seq_len;
+    {
+        RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(fused_fill)");
+        CudaGraphPrepareFillParams fill_params;
         addCudaGraphPrepareFillRegion(fill_params,
-                                      py_model_inputs_.attention_inputs.cu_seqlens,
-                                      state.current_batch_size + 1,
-                                      max_bs_ + 1,
-                                      last_valid);
-        addCudaGraphPrepareFillRegion(fill_params,
-                                      py_model_inputs_.attention_inputs.cu_kv_seqlens,
-                                      state.current_batch_size + 1,
-                                      max_bs_ + 1,
-                                      last_valid);
+                                      py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device,
+                                      0,
+                                      py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device.numel(),
+                                      0);
+        if (has_hybrid_cache) {
+            for (size_t g = 0; g < hybrid_cache_group; ++g) {
+                addCudaGraphPrepareFillRegion(
+                    fill_params,
+                    py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device_by_group[g],
+                    0,
+                    py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device_by_group[g].numel(),
+                    0);
+            }
+        }
+        if (is_prefill_cuda_graph_mode_) {
+            if (state.current_batch_size < max_bs_) {
+                addCudaGraphPrepareFillRegion(fill_params,
+                                              py_model_inputs_.attention_inputs.prefix_lengths,
+                                              state.current_batch_size,
+                                              max_bs_,
+                                              0);
+                addCudaGraphPrepareFillRegion(
+                    fill_params, py_model_inputs_.attention_inputs.input_lengths, state.current_batch_size, max_bs_, 0);
+            }
+            const int last_valid = state.current_seq_len;
+            addCudaGraphPrepareFillRegion(fill_params,
+                                          py_model_inputs_.attention_inputs.cu_seqlens,
+                                          state.current_batch_size + 1,
+                                          max_bs_ + 1,
+                                          last_valid);
+            addCudaGraphPrepareFillRegion(fill_params,
+                                          py_model_inputs_.attention_inputs.cu_kv_seqlens,
+                                          state.current_batch_size + 1,
+                                          max_bs_ + 1,
+                                          last_valid);
+        }
+        invokeCudaGraphPrepareFill(fill_params, cuda_graph::graphGetCurrentStream().stream());
     }
-    invokeCudaGraphPrepareFill(fill_params, cuda_graph::graphGetCurrentStream().stream());
 #else
     py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device.fill_(0);
 #endif
@@ -314,56 +323,63 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs, CudaGr
     }
 
     // Launch ALL D2D copies (contiguous + strided) in two fused kernels
-    fusedCopy(d2d_copies);
-    fusedStridedCopy(strided_d2d_copies);
+    {
+        RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(fused_d2d_copy)");
+        fusedCopy(d2d_copies);
+        fusedStridedCopy(strided_d2d_copies);
+    }
 
     // NOTE: we do H2H after D2D copies to let GPU finish the D2D copies as soon as possible,
     // so that the GPU can start the kernel launch as soon as possible.
 
-    // H2H copies (common to both modes)
-    optimizedCopyAsync(inputs.attention_inputs.cu_seqlens_host,
-                       py_model_inputs_.attention_inputs.cu_seqlens_host,
-                       (state.current_batch_size + 1) * sizeof(int));
+    {
+        RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(host_mirror_copy)");
+        optimizedCopyAsync(inputs.attention_inputs.cu_seqlens_host,
+                           py_model_inputs_.attention_inputs.cu_seqlens_host,
+                           (state.current_batch_size + 1) * sizeof(int));
 
-    // Common H2H strided copies for kv_cache block tables (both decode & prefill)
-    stridedCopyHost(inputs.attention_inputs.kv_cache_kernel_block_id_host,
-                    py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host);
+        // Common H2H strided copies for kv_cache block tables (both decode & prefill)
+        stridedCopyHost(inputs.attention_inputs.kv_cache_kernel_block_id_host,
+                        py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host);
 
-    optimizedCopyAsync(inputs.attention_inputs.kv_cache_layer_to_group,
-                       py_model_inputs_.attention_inputs.kv_cache_layer_to_group,
-                       inputs.attention_inputs.kv_cache_layer_to_group.numel() * sizeof(int32_t));
+        optimizedCopyAsync(inputs.attention_inputs.kv_cache_layer_to_group,
+                           py_model_inputs_.attention_inputs.kv_cache_layer_to_group,
+                           inputs.attention_inputs.kv_cache_layer_to_group.numel() * sizeof(int32_t));
 
-    if (!is_prefill_cuda_graph_mode_) {
-        optimizedCopyAsync(inputs.attention_inputs.sequence_lengths,
-                           py_model_inputs_.attention_inputs.sequence_lengths,
-                           state.current_batch_size * sizeof(int));
-    } else {
-        optimizedCopyAsync(inputs.attention_inputs.padding_offset,
-                           py_model_inputs_.attention_inputs.padding_offset,
-                           state.current_seq_len * sizeof(int));
+        if (!is_prefill_cuda_graph_mode_) {
+            optimizedCopyAsync(inputs.attention_inputs.sequence_lengths,
+                               py_model_inputs_.attention_inputs.sequence_lengths,
+                               state.current_batch_size * sizeof(int));
+        } else {
+            optimizedCopyAsync(inputs.attention_inputs.padding_offset,
+                               py_model_inputs_.attention_inputs.padding_offset,
+                               state.current_seq_len * sizeof(int));
 
-        if (py_model_inputs_.attention_inputs.prefill_cuda_graph_copy_params) {
-            auto* batch_size_ptr = py_model_inputs_.attention_inputs.prefill_cuda_graph_copy_params
-                                       ->cuda_graph_prefill_batch_size.data_ptr<int>();
-            *batch_size_ptr = state.current_batch_size;
+            if (py_model_inputs_.attention_inputs.prefill_cuda_graph_copy_params) {
+                auto* batch_size_ptr = py_model_inputs_.attention_inputs.prefill_cuda_graph_copy_params
+                                           ->cuda_graph_prefill_batch_size.data_ptr<int>();
+                *batch_size_ptr = state.current_batch_size;
+            }
         }
-    }
 
-    // Hybrid cache: H2H strided copies for per-group block tables
-    if (has_hybrid_cache) {
-        for (size_t g = 0; g < hybrid_cache_group; ++g) {
-            stridedCopyHost(inputs.attention_inputs.kv_cache_kernel_block_id_host_by_group[g],
-                            py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host_by_group[g]);
+        // Hybrid cache: H2H strided copies for per-group block tables
+        if (has_hybrid_cache) {
+            for (size_t g = 0; g < hybrid_cache_group; ++g) {
+                stridedCopyHost(inputs.attention_inputs.kv_cache_kernel_block_id_host_by_group[g],
+                                py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host_by_group[g]);
+            }
         }
-    }
 
-    // Reset unused host-side batch portions to prevent stale data (prefill only).
-    // prefix_lengths/input_lengths are CUDA tensors and are reset by the fused
-    // prepare-fill kernel above.
-    if (is_prefill_cuda_graph_mode_) {
-        int last_valid = state.current_seq_len;
-        fillHostInt32(
-            py_model_inputs_.attention_inputs.cu_seqlens_host, state.current_batch_size + 1, max_bs_ + 1, last_valid);
+        // Reset unused host-side batch portions to prevent stale data (prefill only).
+        // prefix_lengths/input_lengths are CUDA tensors and are reset by the fused
+        // prepare-fill kernel above.
+        if (is_prefill_cuda_graph_mode_) {
+            int last_valid = state.current_seq_len;
+            fillHostInt32(py_model_inputs_.attention_inputs.cu_seqlens_host,
+                          state.current_batch_size + 1,
+                          max_bs_ + 1,
+                          last_valid);
+        }
     }
 
     // launch prepare_cuda_graph when attention inputs are ready.

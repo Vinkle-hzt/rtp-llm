@@ -149,6 +149,19 @@ cc_library(
 )
 
 cc_library(
+    name = "mtp_target_verify_prepare",
+    srcs = ["mtp_target_verify_prepare.cu"],
+    hdrs = ["mtp_target_verify_prepare.h"],
+    deps = [
+        "//rtp_llm/cpp/utils:core_utils",
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+    ] + torch_deps(),
+    copts = cuda_copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "mla_quant_kernel",
     srcs = ["mla_quant_kernel.cu"],
     hdrs = ["mla_quant_kernel.h"],
