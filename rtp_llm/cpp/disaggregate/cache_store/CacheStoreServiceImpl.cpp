@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/disaggregate/cache_store/CacheStoreServiceImpl.h"
 
+#include "rtp_llm/cpp/disaggregate/cache_store/CommonDefine.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 
@@ -87,14 +88,19 @@ void CacheStoreServiceImpl::transfer(::google::protobuf::RpcController* controll
             return;
         }
 
-        // verify length
-        if (transfer_info.partition_count() == 0 || local_block->len % transfer_info.partition_count() != 0
-            || local_block->len / transfer_info.partition_count() != iter->second->len()) {
+        CacheStoreBlockPartition partition;
+        if (!resolveCacheStoreBlockPartition(local_block->len,
+                                             iter->second->len(),
+                                             transfer_info.partition_count(),
+                                             transfer_info.partition_id(),
+                                             partition)) {
             RTP_LLM_LOG_WARNING(
-                "cache store service verify local block %s failed, len %d, partition count %d, remote block len %d,  request id is %s, request from %s",
+                "cache store service verify local block %s failed, len %d, partition count %d, partition id %d, "
+                "remote block len %d, request id is %s, request from %s",
                 local_key.c_str(),
                 local_block->len,
                 transfer_info.partition_count(),
+                transfer_info.partition_id(),
                 iter->second->len(),
                 request_id.c_str(),
                 client_ip.c_str());
@@ -103,14 +109,13 @@ void CacheStoreServiceImpl::transfer(::google::protobuf::RpcController* controll
             return;
         }
 
-        if (transfer_info.partition_count() == 1) {
+        if (partition.len == local_block->len && partition.partition_id == 0) {
             local_blocks.emplace_back(local_block);
         } else {
             auto new_block  = std::make_shared<BlockBuffer>(*local_block);
-            new_block->len  = local_block->len / transfer_info.partition_count();
+            new_block->len  = partition.len;
             new_block->addr = std::shared_ptr<void>(
-                (void*)((int64_t)(local_block->addr.get()) + transfer_info.partition_id() * new_block->len),
-                [](void*) {});
+                (void*)((int64_t)(local_block->addr.get()) + partition.partition_id * new_block->len), [](void*) {});
             local_blocks.push_back(new_block);
         }
         remote_blocks.emplace_back(iter->second);

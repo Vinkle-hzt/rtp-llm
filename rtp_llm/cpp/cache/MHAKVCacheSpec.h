@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <string>
 
@@ -17,15 +18,15 @@ struct MHAKVCacheSpec: public KVCacheSpec {
     MHAKVCacheSpec() = default;
 
     MHAKVCacheSpec(const AttentionConfigs& attn_config, const ParallelismConfig& parallelism_config) {
-        type              = KVCacheSpecType::MultiHeadAttention;
-        layer_num         = 1;  // Will be set by caller
+        type      = KVCacheSpecType::MultiHeadAttention;
+        layer_num = 1;  // Will be set by caller
 
-        // TODO(xinfei.sxf): 这里的head_num_kv分配逻辑需要和ModelConfig::getAttentionConfigs里保持一致，目前这里还是单独计算的
+        // TODO(xinfei.sxf):
+        // 这里的head_num_kv分配逻辑需要和ModelConfig::getAttentionConfigs里保持一致，目前这里还是单独计算的
         local_head_num_kv = static_cast<uint32_t>(
             (attn_config.kv_head_num % parallelism_config.get_attn_tp_size() == 0) ?
                 attn_config.kv_head_num / parallelism_config.get_attn_tp_size() :
-                attn_config.kv_head_num / std::gcd(attn_config.kv_head_num, parallelism_config.get_attn_tp_size())
-        );
+                attn_config.kv_head_num / std::gcd(attn_config.kv_head_num, parallelism_config.get_attn_tp_size()));
         seq_size_per_block = static_cast<uint32_t>(attn_config.tokens_per_block);
         size_per_head      = static_cast<uint32_t>(attn_config.size_per_head);
     }
@@ -106,8 +107,10 @@ struct MHAKVCacheSpec: public KVCacheSpec {
                                 debug_name,
                                 v_block_bytes,
                                 heads);
-        RTP_LLM_CHECK_WITH_INFO(heads % partition_count == 0,
-                                "heads must be divisible by partition_count (%s): heads=%d partition_count=%d",
+
+        const int effective_partition_count = std::gcd(heads, partition_count);
+        RTP_LLM_CHECK_WITH_INFO(effective_partition_count > 0,
+                                "effective_partition_count must be > 0 (%s): heads=%d partition_count=%d",
                                 debug_name,
                                 heads,
                                 partition_count);
@@ -115,9 +118,14 @@ struct MHAKVCacheSpec: public KVCacheSpec {
         const size_t k_partition_bytes_per_head = k_block_bytes / static_cast<size_t>(heads);
         const size_t v_partition_bytes_per_head = v_block_bytes / static_cast<size_t>(heads);
 
-        // Compute [head_begin, head_cnt] for this partition_id (equal split).
-        const int head_cnt   = heads / partition_count;
-        const int head_begin = partition_id * head_cnt;
+        // For duplicated KV heads (tp_size > kv_head_num), multiple TP ranks own
+        // identical KV slices. Map those duplicated partitions to the same cache
+        // byte range instead of trying to split a single KV head further.
+        const int duplicate_partition_count = partition_count / effective_partition_count;
+        const int effective_partition_id    = partition_id / duplicate_partition_count;
+
+        const int head_cnt   = heads / effective_partition_count;
+        const int head_begin = effective_partition_id * head_cnt;
 
         const size_t k_partition_off = static_cast<size_t>(head_begin) * k_partition_bytes_per_head;
         const size_t v_partition_off = k_block_bytes + static_cast<size_t>(head_begin) * v_partition_bytes_per_head;

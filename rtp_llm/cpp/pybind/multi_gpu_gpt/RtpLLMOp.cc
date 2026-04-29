@@ -39,22 +39,30 @@ prepareMTPEngineInitParams(size_t model_id, py::object propose_model, const Engi
     auto       py_layers_weights_vec = convertPyObjectToVec(py_layers_weights);
     size_t     model_num             = py_layers_weights_vec.size();
     size_t     gen_num_per_cycle     = base_params.sp_config.gen_num_per_cycle;
-    if (gen_num_per_cycle > 1 && py_layers_weights_vec.size() == 1) {
-        RTP_LLM_LOG_WARNING("duplicate py_layers_weights_vec from 1 to sp_config.gen_num_per_cycle: %ld",
-                            gen_num_per_cycle);
-        for (size_t i = 1; i < gen_num_per_cycle; i++) {
-            py_layers_weights_vec.push_back(py_layers_weights_vec[0]);
+    RTP_LLM_CHECK_WITH_INFO(!py_layers_weights_vec.empty(), "propose model weights is empty");
+    if (sp_type == SP_TYPE_MTP) {
+        if (py_layers_weights_vec.size() != 1) {
+            RTP_LLM_LOG_WARNING("MTP currently uses only one draft model, got weights size: %ld",
+                                py_layers_weights_vec.size());
         }
-        model_num = gen_num_per_cycle;
-    }
-    if (gen_num_per_cycle != py_layers_weights_vec.size()) {
-        RTP_LLM_LOG_WARNING("sp_config.gen_num_per_cycle: %ld  != py_layers_weights_vec.size(): %ld",
-                            gen_num_per_cycle,
-                            py_layers_weights_vec.size());
-        model_num = std::min(model_num, size_t(gen_num_per_cycle));
-    }
-    if (sp_type == SP_TYPE_EAGLE || sp_type == SP_TYPE_EAGLE3) {
         model_num = 1;
+    } else if (sp_type == SP_TYPE_EAGLE || sp_type == SP_TYPE_EAGLE3) {
+        model_num = 1;
+    } else {
+        if (gen_num_per_cycle > 1 && py_layers_weights_vec.size() == 1) {
+            RTP_LLM_LOG_WARNING("duplicate py_layers_weights_vec from 1 to sp_config.gen_num_per_cycle: %ld",
+                                gen_num_per_cycle);
+            for (size_t i = 1; i < gen_num_per_cycle; i++) {
+                py_layers_weights_vec.push_back(py_layers_weights_vec[0]);
+            }
+            model_num = gen_num_per_cycle;
+        }
+        if (gen_num_per_cycle != py_layers_weights_vec.size()) {
+            RTP_LLM_LOG_WARNING("sp_config.gen_num_per_cycle: %ld  != py_layers_weights_vec.size(): %ld",
+                                gen_num_per_cycle,
+                                py_layers_weights_vec.size());
+            model_num = std::min(model_num, size_t(gen_num_per_cycle));
+        }
     }
 
     // Get py_eplb if available (from model)

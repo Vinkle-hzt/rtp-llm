@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/disaggregate/cache_store/TcpCacheStoreServiceImplContext.h"
+#include "rtp_llm/cpp/disaggregate/cache_store/CommonDefine.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 
 namespace rtp_llm {
@@ -22,13 +23,17 @@ void TcpCacheStoreServiceImplContext::loadBlockOnTcp(bool ok, const std::vector<
             continue;
         }
 
-        if (unloaded_block_info->len() != block->len / partition_count_) {
-            RTP_LLM_LOG_WARNING(
-                "cache store service load block not match expect block len, key: %s, len %d vs %d, peer is %s",
-                block->key.c_str(),
-                unloaded_block_info->len(),
-                block->len / partition_count_,
-                peer_ip_.c_str());
+        CacheStoreBlockPartition partition;
+        if (!resolveCacheStoreBlockPartition(
+                block->len, unloaded_block_info->len(), partition_count_, partition_id_, partition)) {
+            RTP_LLM_LOG_WARNING("cache store service load block not match expect block len, key: %s, len %d, "
+                                "partition count %d, partition id %d, peer len %d, peer is %s",
+                                block->key.c_str(),
+                                block->len,
+                                partition_count_,
+                                partition_id_,
+                                unloaded_block_info->len(),
+                                peer_ip_.c_str());
             runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_INVALID_REQ);
             return;
         }
@@ -53,12 +58,15 @@ bool TcpCacheStoreServiceImplContext::writeResponseBlock(const std::shared_ptr<B
         return false;
     }
 
-    auto block_len = block->len / partition_count_;
-    if (block_len != peer_block->len()) {
+    CacheStoreBlockPartition partition;
+    if (!resolveCacheStoreBlockPartition(block->len, peer_block->len(), partition_count_, partition_id_, partition)) {
         RTP_LLM_LOG_WARNING(
-            "cache store service load block not match expect block len, key: %s, len %d vs %d, peer is %s",
+            "cache store service load block not match expect block len, key: %s, len %d, partition count %d, "
+            "partition id %d, peer len %d, peer is %s",
             block->key.c_str(),
-            block_len,
+            block->len,
+            partition_count_,
+            partition_id_,
             peer_block->len(),
             peer_ip_.c_str());
         return false;
@@ -66,12 +74,13 @@ bool TcpCacheStoreServiceImplContext::writeResponseBlock(const std::shared_ptr<B
 
     auto* block_info = response_->add_blocks();
     block_info->set_key(block->key);
-    block_info->set_len(block_len);
+    block_info->set_len(partition.len);
     auto block_content = block_info->mutable_content();
     block_content->assign(
         std::shared_ptr<const char>(
-            block->addr, reinterpret_cast<const char*>((int64_t)(block->addr.get()) + block_len * partition_id_)),
-        size_t(block_len));
+            block->addr,
+            reinterpret_cast<const char*>((int64_t)(block->addr.get()) + partition.len * partition.partition_id)),
+        size_t(partition.len));
     return true;
 }
 

@@ -342,6 +342,77 @@ TEST_F(MemoryLayoutStrategyTest, ConvertIndexToBufferPartitionedByHead) {
     }
 }
 
+TEST_F(MemoryLayoutStrategyTest, ConvertIndexToBufferDuplicatedKvPartitionsByGcd) {
+    auto config               = createTestConfig(/*k_block_bytes=*/128, /*v_block_bytes=*/128);
+    config.is_mla             = false;
+    config.local_head_num_kv  = 2;
+    config.seq_size_per_block = 64;
+
+    auto ctx = createTestContext(std::move(config), torch::kCPU, BufferInitMode::Arange);
+
+    auto          strategy = std::make_unique<MemoryLayoutStrategy>();
+    torch::Tensor empty_scale;
+    ASSERT_TRUE(strategy->init(ctx.config, ctx.kv_cache_buffer, empty_scale, ctx.cache_ptr));
+
+    const int layer           = 0;
+    const int block           = 0;
+    const int partition_count = 4;
+
+    auto full_block_tensor = strategy->getLayerCacheTensors()[layer][block];
+    ASSERT_TRUE(full_block_tensor.defined());
+    const uintptr_t base_ptr = reinterpret_cast<uintptr_t>(full_block_tensor.data_ptr());
+
+    const size_t k_bytes_per_head = static_cast<size_t>(ctx.config.k_block_stride_bytes) / 2;
+    const size_t v_bytes_per_head = static_cast<size_t>(ctx.config.v_block_stride_bytes) / 2;
+
+    for (int partition_id = 0; partition_id < partition_count; ++partition_id) {
+        auto buffers = strategy->convertIndexToBuffer(layer, block, partition_count, partition_id);
+        ASSERT_EQ(buffers.size(), 2u);
+
+        const int    effective_partition_id = partition_id / 2;
+        const size_t k_off                  = static_cast<size_t>(effective_partition_id) * k_bytes_per_head;
+        const size_t v_off                  = static_cast<size_t>(ctx.config.k_block_stride_bytes)
+                             + static_cast<size_t>(effective_partition_id) * v_bytes_per_head;
+
+        EXPECT_EQ(buffers[0].size_bytes, k_bytes_per_head);
+        EXPECT_EQ(buffers[1].size_bytes, v_bytes_per_head);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(buffers[0].addr), base_ptr + k_off);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(buffers[1].addr), base_ptr + v_off);
+    }
+}
+
+TEST_F(MemoryLayoutStrategyTest, ConvertIndexToBufferSingleKvHeadDuplicatesFullBlock) {
+    auto config               = createTestConfig(/*k_block_bytes=*/64, /*v_block_bytes=*/64);
+    config.is_mla             = false;
+    config.local_head_num_kv  = 1;
+    config.seq_size_per_block = 64;
+
+    auto ctx = createTestContext(std::move(config), torch::kCPU, BufferInitMode::Arange);
+
+    auto          strategy = std::make_unique<MemoryLayoutStrategy>();
+    torch::Tensor empty_scale;
+    ASSERT_TRUE(strategy->init(ctx.config, ctx.kv_cache_buffer, empty_scale, ctx.cache_ptr));
+
+    const int layer           = 0;
+    const int block           = 0;
+    const int partition_count = 8;
+
+    auto full_block_tensor = strategy->getLayerCacheTensors()[layer][block];
+    ASSERT_TRUE(full_block_tensor.defined());
+    const uintptr_t base_ptr = reinterpret_cast<uintptr_t>(full_block_tensor.data_ptr());
+
+    for (int partition_id = 0; partition_id < partition_count; ++partition_id) {
+        auto buffers = strategy->convertIndexToBuffer(layer, block, partition_count, partition_id);
+        ASSERT_EQ(buffers.size(), 2u);
+
+        EXPECT_EQ(buffers[0].size_bytes, static_cast<size_t>(ctx.config.k_block_stride_bytes));
+        EXPECT_EQ(buffers[1].size_bytes, static_cast<size_t>(ctx.config.v_block_stride_bytes));
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(buffers[0].addr), base_ptr);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(buffers[1].addr),
+                  base_ptr + static_cast<size_t>(ctx.config.k_block_stride_bytes));
+    }
+}
+
 TEST_F(MemoryLayoutStrategyTest, ConvertIndexToBufferPartitionedByHeadFp16UsesByteView) {
     // Regression test: splitKVPartition uses byte offsets; when dtype element size > 1 (e.g. FP16),
     // partitioned slicing must use byte-view tensors.
@@ -560,8 +631,6 @@ TEST_F(MemoryLayoutStrategyTest, ConvertIndexToBufferPartitionedInvalidArgsThrow
     EXPECT_THROW((void)strategy->convertIndexToBuffer(layer, block, /*partition_count=*/0, /*partition_id=*/0),
                  rtp_llm::RTPException);
     EXPECT_THROW((void)strategy->convertIndexToBuffer(layer, block, /*partition_count=*/2, /*partition_id=*/2),
-                 rtp_llm::RTPException);
-    EXPECT_THROW((void)strategy->convertIndexToBuffer(layer, block, /*partition_count=*/3, /*partition_id=*/0),
                  rtp_llm::RTPException);
 }
 

@@ -67,6 +67,35 @@ const std::string kEnvRdmaMode             = "CACHE_STORE_RDMA_MODE";
 const std::string kEnvRdmaWriteBlockConcat = "CACHE_STORE_RDMA_WRITE_BLOCK_CONCAT";
 const uint32_t    kTcpRdmaPortDiff         = 100;
 
+struct CacheStoreBlockPartition {
+    uint32_t len          = 0;
+    uint32_t partition_id = 0;
+};
+
+inline bool resolveCacheStoreBlockPartition(uint32_t                  local_len,
+                                            uint32_t                  requested_len,
+                                            int32_t                   partition_count,
+                                            int32_t                   partition_id,
+                                            CacheStoreBlockPartition& partition) {
+    if (local_len == 0 || requested_len == 0 || partition_count <= 0 || partition_id < 0
+        || partition_id >= partition_count) {
+        return false;
+    }
+    if (local_len % requested_len != 0) {
+        return false;
+    }
+
+    const uint32_t effective_partition_count = local_len / requested_len;
+    if (effective_partition_count == 0 || static_cast<uint32_t>(partition_count) % effective_partition_count != 0) {
+        return false;
+    }
+
+    const uint32_t duplicate_partition_count = static_cast<uint32_t>(partition_count) / effective_partition_count;
+    partition.len                            = requested_len;
+    partition.partition_id                   = static_cast<uint32_t>(partition_id) / duplicate_partition_count;
+    return partition.partition_id < effective_partition_count;
+}
+
 struct RemoteStoreRequest {
     std::string                        client_id;
     std::string                        request_id;

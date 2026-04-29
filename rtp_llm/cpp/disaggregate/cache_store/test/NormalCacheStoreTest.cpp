@@ -1,4 +1,5 @@
 #include "gtest/gtest.h"
+#include "rtp_llm/cpp/disaggregate/cache_store/CommonDefine.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/NormalCacheStore.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/RequestBlockBuffer.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/test/CacheStoreTestBase.h"
@@ -845,6 +846,28 @@ TEST_F(NormalCacheStoreTest, testLoadPatition_Success) {
     }
 
     set_block_thread.join();
+}
+
+TEST_F(NormalCacheStoreTest, testResolveDuplicatedPartition) {
+    CacheStoreBlockPartition partition;
+
+    ASSERT_TRUE(resolveCacheStoreBlockPartition(
+        /*local_len=*/16, /*requested_len=*/16, /*partition_count=*/8, /*partition_id=*/7, partition));
+    EXPECT_EQ(partition.len, 16);
+    EXPECT_EQ(partition.partition_id, 0);
+
+    ASSERT_TRUE(resolveCacheStoreBlockPartition(
+        /*local_len=*/16, /*requested_len=*/8, /*partition_count=*/4, /*partition_id=*/1, partition));
+    EXPECT_EQ(partition.len, 8);
+    EXPECT_EQ(partition.partition_id, 0);
+
+    ASSERT_TRUE(resolveCacheStoreBlockPartition(
+        /*local_len=*/16, /*requested_len=*/8, /*partition_count=*/4, /*partition_id=*/2, partition));
+    EXPECT_EQ(partition.len, 8);
+    EXPECT_EQ(partition.partition_id, 1);
+
+    EXPECT_FALSE(resolveCacheStoreBlockPartition(
+        /*local_len=*/16, /*requested_len=*/5, /*partition_count=*/4, /*partition_id=*/0, partition));
 }
 
 }  // namespace rtp_llm
