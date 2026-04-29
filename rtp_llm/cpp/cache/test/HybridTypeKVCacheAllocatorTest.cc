@@ -260,6 +260,207 @@ TEST_F(HybridTypeKVCacheAllocatorTest, ConvertToGlobalLayerIdHybridWithMtpSubCon
               std::numeric_limits<uint32_t>::max());
 }
 
+TEST_F(HybridTypeKVCacheAllocatorTest, CreateSpConfigMtpSubConfigGroupTypesAlwaysFull) {
+    // Scenario: qwen35_moe-like hybrid model (LINEAR + FULL layers) with Eagle MTP (1 layer).
+    // The MTP propose model inherits hybrid attention from the main model, so its propose_config
+    // may have group_types=[LINEAR] (when MTP only has LINEAR layers). After createSpConfig,
+    // sub_cfg->group_types must be [FULL] to ensure PD separation cache transfer consistency:
+    //   - prefill side uses group_type to decide block-count (LINEAR=last-only, FULL=all)
+    //   - decode side uses groupNums()>1 for mtp_use_hybrid flag
+    // Inconsistency causes cache keys or block counts to mismatch, hanging the transfer.
+
+    // Case 1: propose model has only LINEAR layers (1-layer MTP, like qwen35_moe with interval=4)
+    {
+        auto score_cfg   = makeTinyModelConfig(/*num_layers=*/4);
+        auto propose_cfg = makeTinyModelConfig(/*num_layers=*/1);
+
+        score_cfg.hybrid_attention_config.enable_hybrid_attention = true;
+        score_cfg.hybrid_attention_config.hybrid_attention_types  = {HybridAttentionType::LINEAR,
+                                                                     HybridAttentionType::LINEAR,
+                                                                     HybridAttentionType::NONE,
+                                                                     HybridAttentionType::NONE};
+        score_cfg.linear_attention_config.linear_conv_kernel_dim  = 2;
+        score_cfg.linear_attention_config.linear_key_head_dim     = 8;
+        score_cfg.linear_attention_config.linear_value_head_dim   = 8;
+        score_cfg.linear_attention_config.linear_num_key_heads    = 2;
+        score_cfg.linear_attention_config.linear_num_value_heads  = 2;
+
+        propose_cfg.hybrid_attention_config.enable_hybrid_attention = true;
+        propose_cfg.hybrid_attention_config.hybrid_attention_types  = {HybridAttentionType::LINEAR};
+        propose_cfg.linear_attention_config                         = score_cfg.linear_attention_config;
+
+        ParallelismConfig par_cfg;
+        par_cfg.tp_size = 1;
+        RuntimeConfig rt_cfg;
+        KVCacheConfig kv_cfg;
+        kv_cfg.test_block_num = 8;
+        SpeculativeExecutionConfig sp_cfg;
+        sp_cfg.type              = SP_TYPE_MTP;
+        sp_cfg.gen_num_per_cycle = 1;
+
+        auto config = CacheConfigCreator::createSpConfig(
+            score_cfg, propose_cfg, par_cfg, rt_cfg, kv_cfg, sp_cfg, std::nullopt, /*is_mtp=*/true, /*is_eagle=*/true);
+
+        ASSERT_EQ(config.mtp_sub_configs.size(), 1u);
+        const auto& sub = config.mtp_sub_configs[0];
+        ASSERT_EQ(sub->group_types.size(), 1u);
+        EXPECT_EQ(sub->group_types[0], CacheGroupType::FULL);
+        EXPECT_EQ(sub->groupNums(), 1u);
+        ASSERT_EQ(sub->cache_specs.size(), 1u);
+        EXPECT_EQ(sub->cache_specs[0]->type, KVCacheSpecType::MultiHeadAttention);
+        EXPECT_EQ(sub->full_group_num, 1);
+        EXPECT_EQ(sub->linear_group_num, 0);
+        ASSERT_EQ(sub->layer_attn_types.size(), 1u);
+        EXPECT_EQ(sub->layer_attn_types[0], CacheGroupType::FULL);
+        ASSERT_EQ(sub->global_layer_ids.size(), 1u);
+        ASSERT_EQ(sub->global_layer_ids[0].size(), 1u);
+        EXPECT_EQ(config.layer_attn_types[static_cast<size_t>(sub->global_layer_ids[0][0])], CacheGroupType::FULL);
+        for (size_t l = 0; l < sub->layer_to_group_id.size(); ++l) {
+            EXPECT_EQ(sub->layer_to_group_id[l], 0);
+        }
+    }
+
+    // Case 2: propose model has both FULL and LINEAR layers
+    {
+        auto score_cfg   = makeTinyModelConfig(/*num_layers=*/4);
+        auto propose_cfg = makeTinyModelConfig(/*num_layers=*/2);
+
+        score_cfg.hybrid_attention_config.enable_hybrid_attention = true;
+        score_cfg.hybrid_attention_config.hybrid_attention_types  = {HybridAttentionType::LINEAR,
+                                                                     HybridAttentionType::LINEAR,
+                                                                     HybridAttentionType::NONE,
+                                                                     HybridAttentionType::NONE};
+        score_cfg.linear_attention_config.linear_conv_kernel_dim  = 2;
+        score_cfg.linear_attention_config.linear_key_head_dim     = 8;
+        score_cfg.linear_attention_config.linear_value_head_dim   = 8;
+        score_cfg.linear_attention_config.linear_num_key_heads    = 2;
+        score_cfg.linear_attention_config.linear_num_value_heads  = 2;
+
+        propose_cfg.hybrid_attention_config.enable_hybrid_attention = true;
+        propose_cfg.hybrid_attention_config.hybrid_attention_types  = {HybridAttentionType::LINEAR,
+                                                                       HybridAttentionType::NONE};
+        propose_cfg.linear_attention_config                         = score_cfg.linear_attention_config;
+
+        ParallelismConfig par_cfg;
+        par_cfg.tp_size = 1;
+        RuntimeConfig rt_cfg;
+        KVCacheConfig kv_cfg;
+        kv_cfg.test_block_num = 8;
+        SpeculativeExecutionConfig sp_cfg;
+        sp_cfg.type              = SP_TYPE_MTP;
+        sp_cfg.gen_num_per_cycle = 1;
+
+        auto config = CacheConfigCreator::createSpConfig(
+            score_cfg, propose_cfg, par_cfg, rt_cfg, kv_cfg, sp_cfg, std::nullopt, /*is_mtp=*/true, /*is_eagle=*/true);
+
+        ASSERT_EQ(config.mtp_sub_configs.size(), 1u);
+        const auto& sub = config.mtp_sub_configs[0];
+        ASSERT_EQ(sub->group_types.size(), 1u);
+        EXPECT_EQ(sub->group_types[0], CacheGroupType::FULL);
+        EXPECT_EQ(sub->groupNums(), 1u);
+        ASSERT_EQ(sub->cache_specs.size(), 1u);
+        EXPECT_EQ(sub->cache_specs[0]->type, KVCacheSpecType::MultiHeadAttention);
+        EXPECT_EQ(sub->full_group_num, 1);
+        EXPECT_EQ(sub->linear_group_num, 0);
+        EXPECT_EQ(sub->group_layer_num, static_cast<int>(sub->layer_num));
+        ASSERT_EQ(sub->layer_attn_types.size(), 2u);
+        EXPECT_EQ(sub->block_size_bytes,
+                  static_cast<size_t>(sub->layer_num)
+                      * (sub->cache_specs[0]->block_size_bytes() + sub->cache_specs[0]->scale_block_size_bytes()));
+        for (size_t l = 0; l < sub->layer_to_group_id.size(); ++l) {
+            EXPECT_EQ(sub->layer_to_group_id[l], 0);
+            EXPECT_EQ(sub->layer_attn_types[l], CacheGroupType::FULL);
+            ASSERT_EQ(sub->global_layer_ids.size(), 1u);
+            ASSERT_LT(l, sub->global_layer_ids[0].size());
+            EXPECT_EQ(config.layer_attn_types[static_cast<size_t>(sub->global_layer_ids[0][l])], CacheGroupType::FULL);
+        }
+    }
+}
+
+TEST_F(HybridTypeKVCacheAllocatorTest, CreateSpConfigMtpTpGreaterThanKvHeadsUsesMhaPartitionLayout) {
+    auto score_cfg   = makeTinyModelConfig(/*num_layers=*/4);
+    auto propose_cfg = makeTinyModelConfig(/*num_layers=*/1);
+
+    auto configure_qwen_like_attention = [](ModelConfig& cfg) {
+        cfg.attn_config.head_num      = 32;
+        cfg.attn_config.kv_head_num   = 2;
+        cfg.attn_config.size_per_head = 16;
+    };
+    configure_qwen_like_attention(score_cfg);
+    configure_qwen_like_attention(propose_cfg);
+
+    score_cfg.hybrid_attention_config.enable_hybrid_attention = true;
+    score_cfg.hybrid_attention_config.hybrid_attention_types  = {HybridAttentionType::LINEAR,
+                                                                 HybridAttentionType::LINEAR,
+                                                                 HybridAttentionType::LINEAR,
+                                                                 HybridAttentionType::NONE};
+    score_cfg.linear_attention_config.linear_conv_kernel_dim  = 2;
+    score_cfg.linear_attention_config.linear_key_head_dim     = 4;
+    score_cfg.linear_attention_config.linear_value_head_dim   = 4;
+    score_cfg.linear_attention_config.linear_num_key_heads    = 8;
+    score_cfg.linear_attention_config.linear_num_value_heads  = 8;
+
+    // The bug reproduces when a one-layer MTP propose config is seen as LINEAR while the real MTP attention is MQA.
+    propose_cfg.hybrid_attention_config.enable_hybrid_attention = true;
+    propose_cfg.hybrid_attention_config.hybrid_attention_types  = {HybridAttentionType::LINEAR};
+    propose_cfg.linear_attention_config                         = score_cfg.linear_attention_config;
+
+    ParallelismConfig par_cfg;
+    par_cfg.tp_size = 8;
+    RuntimeConfig rt_cfg;
+    KVCacheConfig kv_cfg;
+    kv_cfg.test_block_num = 8;
+    SpeculativeExecutionConfig sp_cfg;
+    sp_cfg.type              = SP_TYPE_MTP;
+    sp_cfg.gen_num_per_cycle = 1;
+
+    auto config = CacheConfigCreator::createSpConfig(score_cfg,
+                                                     propose_cfg,
+                                                     par_cfg,
+                                                     rt_cfg,
+                                                     kv_cfg,
+                                                     sp_cfg,
+                                                     std::nullopt,
+                                                     /*is_mtp=*/true,
+                                                     /*is_eagle=*/true);
+
+    ASSERT_EQ(config.mtp_sub_configs.size(), 1u);
+    const auto& sub = config.mtp_sub_configs[0];
+    ASSERT_EQ(sub->cache_specs.size(), 1u);
+    const auto& mtp_spec = sub->cache_specs[0];
+
+    EXPECT_EQ(sub->group_types, std::vector<CacheGroupType>{CacheGroupType::FULL});
+    EXPECT_EQ(mtp_spec->type, KVCacheSpecType::MultiHeadAttention);
+    EXPECT_EQ(mtp_spec->local_head_num_kv, 1u);
+    EXPECT_EQ(sub->kv_block_stride_bytes, mtp_spec->block_size_bytes());
+    EXPECT_EQ(sub->block_size_bytes, mtp_spec->block_size_bytes());
+
+    ASSERT_FALSE(sub->global_layer_ids.empty());
+    ASSERT_EQ(sub->global_layer_ids[0].size(), 1u);
+    const int global_mtp_layer_id = sub->global_layer_ids[0][0];
+
+    auto allocator = std::make_shared<HybridTypeKVCacheAllocator>(config, AllocationType::DEVICE);
+    ASSERT_TRUE(allocator->init());
+
+    const int block_id = 1;
+    auto      full     = allocator->convertIndexToBuffer(global_mtp_layer_id, block_id);
+    ASSERT_EQ(full.size(), 1u);
+    ASSERT_NE(full[0].addr, nullptr);
+    EXPECT_EQ(full[0].size_bytes, mtp_spec->block_size_bytes());
+
+    // TP=8 and KV heads=2 means each rank owns one duplicated KV head. The MTP layout must expose
+    // full K/V halves for every partition instead of splitting the single local head into invalid slices.
+    for (int partition_id = 0; partition_id < par_cfg.tp_size; ++partition_id) {
+        auto parts = allocator->convertIndexToBuffer(
+            global_mtp_layer_id, block_id, static_cast<int>(par_cfg.tp_size), partition_id);
+        ASSERT_EQ(parts.size(), 2u);
+        EXPECT_EQ(parts[0].size_bytes, mtp_spec->k_block_size_bytes());
+        EXPECT_EQ(parts[1].size_bytes, mtp_spec->v_block_size_bytes());
+        EXPECT_EQ(parts[0].addr, full[0].addr);
+        EXPECT_EQ(parts[1].addr, static_cast<void*>(static_cast<char*>(full[0].addr) + mtp_spec->k_block_size_bytes()));
+    }
+}
+
 TEST_F(HybridTypeKVCacheAllocatorTest, GetNeedBlocksUsesGroupGetNeedBlocksAndReuseFlag) {
     auto config    = makeTinyHybridConfig();
     auto allocator = std::make_shared<HybridTypeKVCacheAllocator>(config, AllocationType::DEVICE);
