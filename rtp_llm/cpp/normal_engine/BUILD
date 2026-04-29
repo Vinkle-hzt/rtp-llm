@@ -23,6 +23,7 @@ cc_library(
         "//rtp_llm/cpp/engine_base/system_prompt:system_prompt_constructor",
         "//rtp_llm/cpp/models:eplb",
         "//rtp_llm/cpp/cuda_graph:cuda_graph_base",
+        "//rtp_llm/cpp/utils:pd_separation_debug",
         "//rtp_llm/cpp/utils:tensor_debug_utils",
         "//rtp_llm/cpp/utils:profiling_scope",
     ] + select({

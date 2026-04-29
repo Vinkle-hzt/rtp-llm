@@ -70,6 +70,7 @@ cc_library(
         "//rtp_llm/cpp/engine_base/stream:complete_token_ids",
         "//rtp_llm/cpp/utils:kv_cache_utils",
         "//rtp_llm/cpp/utils:lru_cache",
+        "//rtp_llm/cpp/utils:pd_separation_debug",
         "//rtp_llm/cpp/utils:profiling_scope",
     ],
 )
@@ -159,6 +160,7 @@ cc_library(
         "//rtp_llm/cpp/model_rpc:rpc_error_code",
         "//rtp_llm/cpp/utils:hash_util",
         "//rtp_llm/cpp/utils:kv_cache_utils",
+        "//rtp_llm/cpp/utils:pd_separation_debug",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
     ] + torch_deps() + select({
@@ -203,6 +205,7 @@ cc_library(
         ":cache_core",
         "//rtp_llm/cpp/cache/connector",
         "//rtp_llm/models_py/bindings/core:exec_ops_hdr",
+        "//rtp_llm/cpp/utils:pd_separation_debug",
         "//rtp_llm/cpp/utils:profiling_scope",
     ] + torch_deps(),
 )

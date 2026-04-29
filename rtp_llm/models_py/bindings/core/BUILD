@@ -125,6 +125,7 @@ cc_library(
         "//rtp_llm/cpp/utils:signal_utils",
         "//rtp_llm/cpp/utils:kv_cache_utils",
         "//rtp_llm/cpp/utils:debug_utils",
+        "//rtp_llm/cpp/utils:pd_separation_debug",
         "//rtp_llm/cpp/config:static_config",
         "//rtp_llm/cpp/model_utils:model_utils",
         "//rtp_llm/cpp/config:config_modules",
@@ -201,6 +202,7 @@ cc_library(
         "//rtp_llm/cpp/utils:signal_utils",
         "//rtp_llm/cpp/utils:kv_cache_utils",
         "//rtp_llm/cpp/utils:debug_utils",
+        "//rtp_llm/cpp/utils:pd_separation_debug",
         "//rtp_llm/cpp/config:static_config",
         "//rtp_llm/cpp/model_utils:model_utils",
         "//rtp_llm/cpp/config:config_modules",
@@ -301,4 +303,3 @@ cc_library(
     visibility = ["//visibility:public"],
     copts = copts(),
 )
-

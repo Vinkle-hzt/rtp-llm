@@ -66,6 +66,7 @@ cc_library(
         "//rtp_llm/cpp/multimodal_processor",
         "//rtp_llm/cpp/normal_engine",
         "//rtp_llm/cpp/utils:atomic_util",
+        "//rtp_llm/cpp/utils:pd_separation_debug",
         "//rtp_llm/cpp/utils:profiling_scope",
     ],
 )

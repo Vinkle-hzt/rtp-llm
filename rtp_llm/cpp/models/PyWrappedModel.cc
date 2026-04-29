@@ -10,10 +10,12 @@
 #include <vector>
 #include "rtp_llm/cpp/pybind/PyUtils.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
+#include "rtp_llm/cpp/utils/PdSeparationDebug.h"
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <numeric>
+#include <sstream>
 #include "rtp_llm/cpp/utils/DevicePerfWrapper.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #if USING_CUDA
@@ -23,6 +25,19 @@
 using namespace std;
 
 namespace rtp_llm {
+
+namespace {
+
+std::string pyWrappedTensorBrief(const torch::Tensor& tensor) {
+    if (!tensor.defined()) {
+        return "undefined";
+    }
+    std::ostringstream oss;
+    oss << "defined dim=" << tensor.dim() << " numel=" << tensor.numel() << " sizes=" << torch::str(tensor.sizes());
+    return oss.str();
+}
+
+}  // namespace
 
 torch::Tensor PyWrappedModel::tensorHoldHostAndToCuda(const torch::Tensor& tensor) {
     if (tensor.device().is_cuda()) {
@@ -259,6 +274,22 @@ GptModelOutputs PyWrappedModel::callForwardPostLayers(torch::Tensor         hidd
 std::optional<PyCacheStoreInputs> PyWrappedModel::prepareWriteCacheParams(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.prepareWriteCacheParams");
     std::optional<PyCacheStoreInputs> params;
+    {
+        std::ostringstream oss;
+        oss << "prepareWriteCacheParams entry model_id=" << model_id_ << " warmup=" << pdBoolString(inputs.warmup)
+            << " pd_separation=" << pdBoolString(inputs.pd_separation)
+            << " decode_entrance=" << pdBoolString(inputs.decode_entrance)
+            << " input_lengths=" << pyWrappedTensorBrief(inputs.input_lengths)
+            << " sequence_lengths=" << pyWrappedTensorBrief(inputs.sequence_lengths)
+            << " prefix_lengths=" << pyWrappedTensorBrief(inputs.prefix_lengths)
+            << " request_id=" << pyWrappedTensorBrief(inputs.request_id)
+            << " request_pd=" << pyWrappedTensorBrief(inputs.request_pd_separation)
+            << " cache_keys=" << pyWrappedTensorBrief(inputs.cache_keys)
+            << " kv_layer_to_group=" << pyWrappedTensorBrief(inputs.kv_cache_layer_to_group)
+            << " kv_group_types=" << pyWrappedTensorBrief(inputs.kv_cache_group_types)
+            << " kv_stride=" << inputs.kv_block_stride_bytes << " scale_stride=" << inputs.kv_scale_stride_bytes;
+        pdMtpDebugLog("PyWrappedModel", oss.str());
+    }
     if (!inputs.warmup && inputs.pd_separation) {
         const size_t         decoder_batch_size = inputs.sequence_lengths.size(0);
         const size_t         context_batch_size = inputs.input_lengths.size(0) - decoder_batch_size;
@@ -290,6 +321,23 @@ std::optional<PyCacheStoreInputs> PyWrappedModel::prepareWriteCacheParams(const 
                                               cache_manager_ ? cache_manager_->getCacheStore() : nullptr,
                                               cache_store_async_writer_.get()};
         params = cache_store_inputs;
+        {
+            std::ostringstream oss;
+            oss << "prepareWriteCacheParams output model_id=" << model_id_
+                << " context_batch_size=" << context_batch_size << " decoder_batch_size=" << decoder_batch_size
+                << " cache_keys_size=" << cache_keys_vec.size() << " tokens_per_block=" << inputs.seq_size_per_block
+                << " kv_stride=" << inputs.kv_block_stride_bytes << " scale_stride=" << inputs.kv_scale_stride_bytes
+                << " use_mla_for_cache_store="
+                << pdBoolString(description_.attention_conf.use_mla && mla_ops_type_ != rtp_llm::MlaOpsType::MHA)
+                << " cache_store=" << (cache_manager_ && cache_manager_->getCacheStore() ? "set" : "null")
+                << " async_writer=" << (cache_store_async_writer_.get() ? "set" : "null");
+            pdMtpDebugLog("PyWrappedModel", oss.str());
+        }
+    } else {
+        std::ostringstream oss;
+        oss << "prepareWriteCacheParams skip model_id=" << model_id_ << " warmup=" << pdBoolString(inputs.warmup)
+            << " pd_separation=" << pdBoolString(inputs.pd_separation);
+        pdMtpDebugLog("PyWrappedModel", oss.str());
     }
     return params;
 }

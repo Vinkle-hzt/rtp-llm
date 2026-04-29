@@ -15,9 +15,11 @@
 #include "rtp_llm/cpp/utils/StringUtil.h"
 #include "rtp_llm/cpp/models/PyWrappedModel.h"
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorFactory.h"
+#include "rtp_llm/cpp/utils/PdSeparationDebug.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "autil/TimeUtility.h"
 #include <memory>
+#include <sstream>
 #include <thread>
 #include <random>
 
@@ -34,6 +36,15 @@ void MtpExecutor::maybePrintModelInput(const GptModelInputs& model_input, const 
     } else {
         RTP_LLM_LOG_DEBUG("%s model_input: %s", prefix.c_str(), model_input.debugString(force).c_str());
     }
+}
+
+static std::string mtpTensorBrief(const torch::Tensor& tensor) {
+    if (!tensor.defined()) {
+        return "undefined";
+    }
+    std::ostringstream oss;
+    oss << "defined dim=" << tensor.dim() << " numel=" << tensor.numel() << " sizes=" << torch::str(tensor.sizes());
+    return oss.str();
 }
 
 static std::shared_ptr<NormalGenerateStream> makeFakeStream(int                    max_new_tokens,
@@ -173,6 +184,15 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
 
     auto target_cache_layer_layout = cache_manager->getMainModelCacheLayerLayout();
     auto draft_cache_layer_layout  = cache_manager->getMTPModuleCacheLayerLayout(0);
+    {
+        std::ostringstream oss;
+        oss << "MtpExecutor ctor role_type=" << static_cast<int>(role_type_) << " propose_step=" << propose_step_
+            << " target_layers=" << target_cache_layer_layout.layers_to_kv_buffer_ptrs.size()
+            << " target_layer_to_groups=" << target_cache_layer_layout.layer_to_groups.size()
+            << " draft_layers=" << draft_cache_layer_layout.layers_to_kv_buffer_ptrs.size()
+            << " draft_layer_to_groups=" << draft_cache_layer_layout.layer_to_groups.size();
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
 
     GptModelInitParams model_init_params(
         {params.gpt_weights,
@@ -272,6 +292,15 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     memcpy(draft_kv_cache_layer_to_group.data_ptr<int>(),
            draft_cache_layer_layout.layer_to_groups.data(),
            draft_cache_layer_layout.layer_to_groups.size() * sizeof(int));
+    {
+        std::ostringstream oss;
+        oss << "MtpExecutor layer_to_group tensors ready target_len=" << target_kv_cache_layer_to_group.numel()
+            << " draft_len=" << draft_kv_cache_layer_to_group.numel();
+        if (draft_kv_cache_layer_to_group.numel() > 0) {
+            oss << " draft_first_group=" << draft_kv_cache_layer_to_group.data_ptr<int>()[0];
+        }
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
 
     const auto& draft_weights = propose_params->getEngineInitParams().gpt_weights;
     d2t_map_                  = draft_model_ ? draft_model_->weights_.d2t_map : draft_weights.d2t_map;
@@ -324,6 +353,13 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
 absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& streams,
                                       MtpMetricsCollector&                metrics_collector) {
     RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.prefill_step(prefill_stream_size=%zu)", streams.size());
+    {
+        std::ostringstream oss;
+        oss << "prefillStep entry streams=" << streams.size() << " role_type=" << static_cast<int>(role_type_)
+            << " propose_step=" << propose_step_ << " warm_up=" << pdBoolString(warm_up_)
+            << " enable_ffn_disaggregate=" << pdBoolString(enable_ffn_disaggregate_);
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
 
     RtpLLMExecutorMetricsCollector& executor_collector = metrics_collector.executor_collector;
     RtpLLMTokenPSMetricsCollector&  tps_collector      = metrics_collector.tps_collector;
@@ -347,6 +383,14 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         RETURN_IF_STATUS_OR_ERROR(model_input_status);
         model_input                              = std::move(model_input_status.value());
         executor_collector.gather_model_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+        std::ostringstream oss;
+        oss << "prefillStep gathered model_input combo_tokens=" << mtpTensorBrief(model_input.combo_tokens)
+            << " input_lengths=" << mtpTensorBrief(model_input.input_lengths)
+            << " sequence_lengths=" << mtpTensorBrief(model_input.sequence_lengths)
+            << " prefix_lengths=" << mtpTensorBrief(model_input.prefix_lengths)
+            << " pd_separation=" << pdBoolString(model_input.pd_separation)
+            << " is_fake_stream=" << pdBoolString(model_input.is_fake_stream);
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
     }
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.prefill_step(tp_sync_input)");
@@ -354,9 +398,15 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         model_input.skip_run  = streams.empty() && !enable_ffn_disaggregate_;
         tpSyncModelInputs(model_input, parallelism_config_);
         if (model_input.skip_run) {
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, "prefillStep skip after tpSyncModelInputs skip_run=true");
             return absl::OkStatus();
         }
         executor_collector.tp_sync_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+        std::ostringstream oss;
+        oss << "prefillStep tpSync done skip_run=" << pdBoolString(model_input.skip_run)
+            << " combo_tokens=" << mtpTensorBrief(model_input.combo_tokens)
+            << " input_lengths=" << mtpTensorBrief(model_input.input_lengths);
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
     }
 
     metrics_collector.not_skip = true;
@@ -370,7 +420,16 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         RTP_LLM_PROFILE_SCOPE("executor.mtp.prefill_step(target_model_forward)");
         maybePrintModelInput(model_input, "prefill target model");
         model_input.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
-        model_output                        = std::move(model_->forward(model_input));
+        {
+            std::ostringstream oss;
+            oss << "prefillStep target forward begin kv_stride=" << model_input.kv_block_stride_bytes
+                << " scale_stride=" << model_input.kv_scale_stride_bytes
+                << " layer_to_group=" << mtpTensorBrief(model_input.kv_cache_layer_to_group)
+                << " group_types=" << mtpTensorBrief(model_input.kv_cache_group_types);
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
+        model_output = std::move(model_->forward(model_input));
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, "prefillStep target forward end");
     }
 
     // eplb
@@ -403,10 +462,29 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         model_input.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
         model_input.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
-        draft_model_output                  = std::move(draft_model_->forward(model_input));
+        {
+            std::ostringstream oss;
+            oss << "prefillStep draft forward begin mtp_layer_num=" << mtp_cache_cfg.layer_num
+                << " mtp_group_nums=" << mtp_cache_cfg.groupNums()
+                << " mtp_group_types_size=" << mtp_cache_cfg.group_types.size()
+                << " mtp_layer_to_group_size=" << mtp_cache_cfg.layer_to_group_id.size()
+                << " mtp_global_layer_modules=" << mtp_cache_cfg.global_layer_ids.size()
+                << " kv_stride=" << model_input.kv_block_stride_bytes
+                << " scale_stride=" << model_input.kv_scale_stride_bytes
+                << " layer_to_group=" << mtpTensorBrief(model_input.kv_cache_layer_to_group)
+                << " group_types=" << mtpTensorBrief(model_input.kv_cache_group_types);
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
+        draft_model_output = std::move(draft_model_->forward(model_input));
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, "prefillStep draft forward end");
     }
 
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || model_input.is_fake_stream) {
+        std::ostringstream oss;
+        oss << "prefillStep early return after draft forward is_tp_rank0=" << pdBoolString(isTpRank0())
+            << " warm_up=" << pdBoolString(warm_up_) << " streams=" << streams.size()
+            << " is_fake_stream=" << pdBoolString(model_input.is_fake_stream);
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
         cudaSyncAndCheck();
         model_->releaseBuffers();
         draft_model_->releaseBuffers();
@@ -444,6 +522,14 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
                                                      {std::move(model_output), std::move(sampler_output)},
                                                      {std::move(draft_model_output), std::move(draft_sampler_output)});
         RTP_LLM_LOG_DEBUG("dispatch done");
+        {
+            std::ostringstream oss;
+            oss << "prefillStep dispatch done status_ok=" << pdBoolString(result.ok());
+            if (!result.ok()) {
+                oss << " status=" << result.ToString();
+            }
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
 
         model_->releaseBuffers();
         draft_model_->releaseBuffers();
@@ -515,6 +601,13 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
 absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams,
                                      MtpMetricsCollector&                metrics_collector) {
     RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(decode_stream_size=%zu)", streams.size());
+    {
+        std::ostringstream oss;
+        oss << "decodeStep entry streams=" << streams.size() << " role_type=" << static_cast<int>(role_type_)
+            << " propose_step=" << propose_step_ << " warm_up=" << pdBoolString(warm_up_)
+            << " enable_ffn_disaggregate=" << pdBoolString(enable_ffn_disaggregate_);
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
 
     RtpLLMExecutorMetricsCollector&          executor_collector  = metrics_collector.executor_collector;
     RtpLLMTokenPSMetricsCollector&           tps_collector       = metrics_collector.tps_collector;
@@ -543,6 +636,19 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     const auto& cache_cfg     = cache_manager_->cacheConfig();
     const auto& mtp_cache_cfg = cache_manager_->getMTPModuleCacheConfig(0);
+    {
+        std::ostringstream oss;
+        oss << "decodeStep cache cfg main_layers=" << cache_cfg.layer_num
+            << " main_layer_all_num=" << cache_cfg.layer_all_num << " main_group_nums=" << cache_cfg.groupNums()
+            << " main_kv_stride=" << cache_cfg.kv_block_stride_bytes
+            << " main_scale_stride=" << cache_cfg.kv_scale_stride_bytes << " mtp_layers=" << mtp_cache_cfg.layer_num
+            << " mtp_group_nums=" << mtp_cache_cfg.groupNums()
+            << " mtp_group_types_size=" << mtp_cache_cfg.group_types.size()
+            << " mtp_layer_to_group_size=" << mtp_cache_cfg.layer_to_group_id.size()
+            << " mtp_kv_stride=" << mtp_cache_cfg.kv_block_stride_bytes
+            << " mtp_scale_stride=" << mtp_cache_cfg.kv_scale_stride_bytes;
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
 
     // clone tensors from grpc
     {
@@ -566,6 +672,14 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         RETURN_IF_STATUS_OR_ERROR(model_input_status);
         model_input = std::move(model_input_status.value());
         executor_collector.gather_model_input_us += autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+        std::ostringstream oss;
+        oss << "decodeStep gathered model_input combo_tokens=" << mtpTensorBrief(model_input.combo_tokens)
+            << " input_lengths=" << mtpTensorBrief(model_input.input_lengths)
+            << " sequence_lengths=" << mtpTensorBrief(model_input.sequence_lengths)
+            << " prefix_lengths=" << mtpTensorBrief(model_input.prefix_lengths)
+            << " pd_separation=" << pdBoolString(model_input.pd_separation)
+            << " is_fake_stream=" << pdBoolString(model_input.is_fake_stream);
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
     }
 
     if (isTpRank0()) {
@@ -574,6 +688,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         model_input.skip_run  = streams.empty() && !enable_ffn_disaggregate_;
         if (model_input.skip_run) {
             tpSyncModelInputs(model_input, parallelism_config_);
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, "decodeStep tp_rank0 skip_run=true");
             return absl::OkStatus();
         }
         executor_collector.tp_sync_input_us += autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
@@ -594,8 +709,16 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         }
         tpSyncModelInputs(model_input, parallelism_config_);
         if (model_input.skip_run) {
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, "decodeStep skip after prepare_decode_input_and_tp_sync");
             return absl::OkStatus();
         }
+        std::ostringstream oss;
+        oss << "decodeStep prepare decode input done skip_run=" << pdBoolString(model_input.skip_run)
+            << " combo_tokens=" << mtpTensorBrief(model_input.combo_tokens)
+            << " input_lengths=" << mtpTensorBrief(model_input.input_lengths)
+            << " sequence_lengths=" << mtpTensorBrief(model_input.sequence_lengths)
+            << " prefix_lengths=" << mtpTensorBrief(model_input.prefix_lengths);
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
     }
     size_t batch_size = model_input.input_lengths.size(0);
 
@@ -632,8 +755,17 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode start");
+        {
+            std::ostringstream oss;
+            oss << "decodeStep draftModelDecode begin kv_stride=" << model_input.kv_block_stride_bytes
+                << " scale_stride=" << model_input.kv_scale_stride_bytes
+                << " layer_to_group=" << mtpTensorBrief(model_input.kv_cache_layer_to_group)
+                << " group_types=" << mtpTensorBrief(model_input.kv_cache_group_types) << " batch_size=" << batch_size;
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
         draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t);
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode end");
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, "decodeStep draftModelDecode end");
     }
 
     {
@@ -646,9 +778,21 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             model_input.input_lengths.size(0),
             model_input.prefix_lengths.size(0),
             model_input.sequence_lengths.size(0));
+        {
+            std::ostringstream oss;
+            oss << "decodeStep target verify forward begin kv_stride=" << model_input.kv_block_stride_bytes
+                << " scale_stride=" << model_input.kv_scale_stride_bytes
+                << " layer_to_group=" << mtpTensorBrief(model_input.kv_cache_layer_to_group)
+                << " group_types=" << mtpTensorBrief(model_input.kv_cache_group_types)
+                << " input_lengths=" << mtpTensorBrief(model_input.input_lengths)
+                << " prefix_lengths=" << mtpTensorBrief(model_input.prefix_lengths)
+                << " sequence_lengths=" << mtpTensorBrief(model_input.sequence_lengths);
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
         target_verify_prepare_runner_.sync(cuda_graph::graphGetCurrentStream());
         model_output = std::move(model_->forward(model_input));
         RTP_LLM_LOG_DEBUG("[MTP decode] target model verify forward end");
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, "decodeStep target verify forward end");
         model_input.is_target_verify = false;
     }
 
@@ -660,6 +804,16 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         model_input_copy.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
         model_input_copy.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
         model_input_copy.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
+        {
+            std::ostringstream oss;
+            oss << "decodeStep draft prefill prepare launch kv_stride=" << model_input_copy.kv_block_stride_bytes
+                << " scale_stride=" << model_input_copy.kv_scale_stride_bytes
+                << " layer_to_group=" << mtpTensorBrief(model_input_copy.kv_cache_layer_to_group)
+                << " group_types=" << mtpTensorBrief(model_input_copy.kv_cache_group_types)
+                << " combo_tokens=" << mtpTensorBrief(model_input_copy.combo_tokens)
+                << " input_lengths=" << mtpTensorBrief(model_input_copy.input_lengths);
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
         draft_prefill_prepare_runner_.launch([prefill_model, model_input_copy = std::move(model_input_copy)]() mutable {
             RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_draft_prefill_input)");
             prefill_model->prepareAttentionInputs(model_input_copy);
@@ -736,22 +890,51 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         model_input.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
         model_input.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
+        {
+            std::ostringstream oss;
+            oss << "decodeStep post rejection sync done mtp kv_stride=" << model_input.kv_block_stride_bytes
+                << " scale_stride=" << model_input.kv_scale_stride_bytes
+                << " layer_to_group=" << mtpTensorBrief(model_input.kv_cache_layer_to_group)
+                << " combo_tokens=" << mtpTensorBrief(model_input.combo_tokens)
+                << " lm_output_indexes=" << mtpTensorBrief(model_input.lm_output_indexes);
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
     }
 
     draft_prefill_prepare_runner_.sync(cuda_graph::graphGetCurrentStream());
+    pdMtpDebugLog("MtpExecutor", parallelism_config_, "decodeStep draft prefill prepare sync done");
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(draft_model_forward)");
         maybePrintModelInput(model_input, "decode post draft model");
+        {
+            std::ostringstream oss;
+            oss << "decodeStep draft prefill forward begin use_cuda_graph_model="
+                << pdBoolString(static_cast<bool>(sp_prefill_draft_model_))
+                << " kv_stride=" << model_input.kv_block_stride_bytes
+                << " scale_stride=" << model_input.kv_scale_stride_bytes
+                << " layer_to_group=" << mtpTensorBrief(model_input.kv_cache_layer_to_group)
+                << " group_types=" << mtpTensorBrief(model_input.kv_cache_group_types)
+                << " combo_tokens=" << mtpTensorBrief(model_input.combo_tokens)
+                << " input_lengths=" << mtpTensorBrief(model_input.input_lengths)
+                << " prefix_lengths=" << mtpTensorBrief(model_input.prefix_lengths);
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
         // Use sp_prefill_draft_model_ if CUDA graph is enabled, otherwise use draft_model_
         if (sp_prefill_draft_model_) {
             draft_prefill_model_output = std::move(sp_prefill_draft_model_->forward(model_input));
         } else {
             draft_prefill_model_output = std::move(draft_model_->forward(model_input));
         }
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, "decodeStep draft prefill forward end");
     }
 
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || model_input.is_fake_stream) {
+        std::ostringstream oss;
+        oss << "decodeStep early return after draft prefill is_tp_rank0=" << pdBoolString(isTpRank0())
+            << " warm_up=" << pdBoolString(warm_up_) << " streams=" << streams.size()
+            << " is_fake_stream=" << pdBoolString(model_input.is_fake_stream);
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
         cudaSyncAndCheck();
         draft_model_->releaseBuffers();
         model_->releaseBuffers();
@@ -808,6 +991,14 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         draft_model_->releaseBuffers();
         model_->releaseBuffers();
 
+        {
+            std::ostringstream oss;
+            oss << "decodeStep dispatch done status_ok=" << pdBoolString(result.ok());
+            if (!result.ok()) {
+                oss << " status=" << result.ToString();
+            }
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
         return result;
     }
 }
@@ -816,6 +1007,11 @@ void MtpExecutor::prepareStreams(const std::list<GenerateStreamPtr>& streams,
                                  std::list<GenerateStreamPtr>&       prefill_streams,
                                  std::list<GenerateStreamPtr>&       decode_streams) {
     RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.prepare_streams(stream_size=%zu)", streams.size());
+    {
+        std::ostringstream oss;
+        oss << "prepareStreams entry streams=" << streams.size() << " propose_step=" << propose_step_;
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
 
     for (auto& stream : streams) {
         // split streams into prefill and decode
@@ -844,10 +1040,22 @@ void MtpExecutor::prepareStreams(const std::list<GenerateStreamPtr>& streams,
         auto sp_output_buffer          = stream->getSPOutputBuffer();
         sp_output_buffer->propose_step = propose_step_;
     }
+    {
+        std::ostringstream oss;
+        oss << "prepareStreams done prefill_streams=" << prefill_streams.size()
+            << " decode_streams=" << decode_streams.size();
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
 }
 
 absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
     RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.process(stream_size=%zu,mtp_step=%zu)", streams.size(), propose_step_);
+    {
+        std::ostringstream oss;
+        oss << "process entry streams=" << streams.size() << " propose_step=" << propose_step_
+            << " role_type=" << static_cast<int>(role_type_) << " warm_up=" << pdBoolString(warm_up_);
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
 
     MtpMetricsCollector metrics_collector;
 
@@ -856,16 +1064,26 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
 
     // prepare streams
     prepareStreams(streams, prefill_streams, decode_streams);
+    {
+        std::ostringstream oss;
+        oss << "process after prepare prefill_streams=" << prefill_streams.size()
+            << " decode_streams=" << decode_streams.size();
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
 
     // step forward
     int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
 
     if (role_type_ == RoleType::PREFILL || role_type_ == RoleType::PDFUSION) {
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, "process call prefillStep");
         THROW_IF_STATUS_ERROR(prefillStep(prefill_streams, metrics_collector));
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, "process prefillStep done");
     }
 
     if (role_type_ == RoleType::DECODE || role_type_ == RoleType::PDFUSION) {
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, "process call decodeStep");
         THROW_IF_STATUS_ERROR(decodeStep(decode_streams, metrics_collector));
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, "process decodeStep done");
     }
 
     metrics_collector.sp_engine_collector.step_latency_us =
@@ -882,6 +1100,12 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
             nullptr, &metrics_collector.sp_engine_collector);
     }
 
+    {
+        std::ostringstream oss;
+        oss << "process done step_latency_us=" << metrics_collector.sp_engine_collector.step_latency_us
+            << " not_skip=" << pdBoolString(metrics_collector.not_skip);
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
     return absl::OkStatus();
 }
 
@@ -897,6 +1121,15 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
                                    std::vector<torch::Tensor>& draft_probs_list,
                                    torch::Tensor&              draft_token_ids_t) {
     RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.draft_model_decode(batch_size=%zu)", model_input.combo_tokens.size(0));
+    {
+        std::ostringstream oss;
+        oss << "draftModelDecode entry combo_tokens=" << mtpTensorBrief(model_input.combo_tokens)
+            << " input_lengths=" << mtpTensorBrief(model_input.input_lengths)
+            << " sequence_lengths=" << mtpTensorBrief(model_input.sequence_lengths)
+            << " prefix_lengths=" << mtpTensorBrief(model_input.prefix_lengths) << " propose_step=" << propose_step_
+            << " streams=" << stream_groups.size();
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
 
     // clear host buffers holder
     buffer_holder_.release();
@@ -904,6 +1137,17 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     const auto& mtp_cache_cfg         = cache_manager_->getMTPModuleCacheConfig(0);
     model_input.kv_block_stride_bytes = mtp_cache_cfg.kv_block_stride_bytes;
     model_input.kv_scale_stride_bytes = mtp_cache_cfg.kv_scale_stride_bytes;
+    {
+        std::ostringstream oss;
+        oss << "draftModelDecode use mtp cache strides kv_stride=" << model_input.kv_block_stride_bytes
+            << " scale_stride=" << model_input.kv_scale_stride_bytes << " mtp_layer_num=" << mtp_cache_cfg.layer_num
+            << " mtp_group_nums=" << mtp_cache_cfg.groupNums()
+            << " mtp_layer_to_group_size=" << mtp_cache_cfg.layer_to_group_id.size()
+            << " mtp_group_types_size=" << mtp_cache_cfg.group_types.size()
+            << " layer_to_group=" << mtpTensorBrief(model_input.kv_cache_layer_to_group)
+            << " group_types=" << mtpTensorBrief(model_input.kv_cache_group_types);
+        pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+    }
 
     GptModelOutputs            draft_decode_model_output;
     std::vector<torch::Tensor> draft_token_ids_list;
@@ -936,8 +1180,23 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     for (int i = 0; i < propose_step_ - 1; i++) {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.draft_model_decode(loop_iter=%d)", i);
         RTP_LLM_LOG_DEBUG("[MTP draftDecode] loop step %d/%d start, batch_size %zu", i, propose_step_ - 1, batch_size);
+        {
+            std::ostringstream oss;
+            oss << "draftModelDecode loop begin iter=" << i << "/" << (propose_step_ - 1)
+                << " batch_size=" << batch_size << " combo_tokens=" << mtpTensorBrief(model_input.combo_tokens)
+                << " input_lengths=" << mtpTensorBrief(model_input.input_lengths)
+                << " sequence_lengths=" << mtpTensorBrief(model_input.sequence_lengths);
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
         draft_decode_model_output = std::move(draft_model_->forward(model_input));
         RTP_LLM_LOG_DEBUG("[MTP draftDecode] loop step %d forward done", i);
+        {
+            std::ostringstream oss;
+            oss << "draftModelDecode loop forward done iter=" << i
+                << " logits=" << mtpTensorBrief(draft_decode_model_output.logits)
+                << " hidden=" << mtpTensorBrief(draft_decode_model_output.all_hidden_states);
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
 
         // sample
         auto fast_topk_sampler_output = fast_topk_sampler_->forward(draft_decode_model_output.logits, 1);
@@ -958,6 +1217,12 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         if (i != propose_step_ - 2) {
             batch_stream_processor_->updateDecodeDraftModelInput(
                 model_input, draft_decode_model_output, draft_token_ids);
+            std::ostringstream oss;
+            oss << "draftModelDecode loop update model_input iter=" << i
+                << " combo_tokens=" << mtpTensorBrief(model_input.combo_tokens)
+                << " input_lengths=" << mtpTensorBrief(model_input.input_lengths)
+                << " sequence_lengths=" << mtpTensorBrief(model_input.sequence_lengths);
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
         }
     }
 
@@ -997,6 +1262,17 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         const auto& cache_cfg             = cache_manager_->cacheConfig();
         model_input.kv_block_stride_bytes = cache_cfg.kv_block_stride_bytes;
         model_input.kv_scale_stride_bytes = cache_cfg.kv_scale_stride_bytes;
+        {
+            std::ostringstream oss;
+            oss << "draftModelDecode build spec input done draft_token_ids=" << mtpTensorBrief(draft_token_ids_t)
+                << " combo_tokens=" << mtpTensorBrief(model_input.combo_tokens)
+                << " input_lengths=" << mtpTensorBrief(model_input.input_lengths)
+                << " prefix_lengths=" << mtpTensorBrief(model_input.prefix_lengths)
+                << " sequence_lengths=" << mtpTensorBrief(model_input.sequence_lengths)
+                << " switched_to_main_kv_stride=" << model_input.kv_block_stride_bytes
+                << " switched_to_main_scale_stride=" << model_input.kv_scale_stride_bytes;
+            pdMtpDebugLog("MtpExecutor", parallelism_config_, oss.str());
+        }
     }
 }
 

@@ -55,6 +55,18 @@ cc_library(
 )
 
 cc_library(
+    name = "pd_separation_debug",
+    hdrs = [
+        "PdSeparationDebug.h",
+    ],
+    deps = [
+        "//rtp_llm/cpp/config:config_modules",
+    ],
+    copts = copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "error_code",
     hdrs = [
         "ErrorCode.h",

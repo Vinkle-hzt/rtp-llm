@@ -2,6 +2,9 @@
 #include "rtp_llm/models_py/bindings/core/torch_utils/TypeConvert.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/cache/KVCacheSpec.h"
+#include "rtp_llm/cpp/utils/PdSeparationDebug.h"
+
+#include <sstream>
 
 namespace rtp_llm {
 
@@ -20,6 +23,17 @@ bool MemoryLayoutStrategy::init(const MemoryLayoutConfig& config,
     processKVTensor(kv_cache_tensor);
     processScaleTensor(kv_scale_tensor);
 
+    {
+        std::ostringstream oss;
+        oss << "MemoryLayoutStrategy init layer_num=" << config_.layer_num << " block_num=" << config_.block_num
+            << " seq_size_per_block=" << config_.seq_size_per_block << " kv_stride=" << config_.kv_block_stride_bytes
+            << " scale_stride=" << config_.kv_scale_stride_bytes << " local_head_num_kv=" << config_.local_head_num_kv
+            << " use_mla=" << pdBoolString(config_.use_mla) << " is_mla=" << pdBoolString(config_.is_mla)
+            << " enable_hybrid_attention=" << pdBoolString(config_.enable_hybrid_attention)
+            << " has_scale=" << pdBoolString(config_.hasScale()) << " kv_tensor_bytes=" << kv_cache_tensor.nbytes()
+            << " scale_tensor_bytes=" << (kv_scale_tensor.defined() ? kv_scale_tensor.nbytes() : 0);
+        pdMtpDebugLog("MemoryLayoutStrategy", oss.str());
+    }
     RTP_LLM_LOG_INFO("MemoryLayoutStrategy initialized successfully");
     return true;
 }
@@ -186,16 +200,51 @@ std::vector<BlockInfo> MemoryLayoutStrategy::convertIndexToBuffer(int layer_id, 
 
 std::vector<BlockInfo>
 MemoryLayoutStrategy::convertIndexToBuffer(int layer_id, int block_id, int partition_count, int partition_id) const {
+    {
+        std::ostringstream oss;
+        oss << "convertIndexToBuffer partition entry layer_id=" << layer_id << " block_id=" << block_id
+            << " partition_count=" << partition_count << " partition_id=" << partition_id
+            << " is_mla=" << pdBoolString(config_.is_mla) << " use_mla=" << pdBoolString(config_.use_mla)
+            << " enable_hybrid_attention=" << pdBoolString(config_.enable_hybrid_attention)
+            << " local_head_num_kv=" << config_.local_head_num_kv << " kv_stride=" << config_.kv_block_stride_bytes
+            << " scale_stride=" << config_.kv_scale_stride_bytes << " has_scale=" << pdBoolString(config_.hasScale());
+        pdMtpDebugLog("MemoryLayoutStrategy", oss.str());
+    }
     // Hybrid attention models are not support asymmetric TP, thus transfer the whole kvache blocks
     if (config_.is_mla || config_.enable_hybrid_attention) {
         // For MLA models and hybrid attention models, use the same logic as the simpler convertIndexToBuffer function
-        return createBasicBlockInfo(layer_id, block_id);
+        auto               blocks = createBasicBlockInfo(layer_id, block_id);
+        std::ostringstream oss;
+        oss << "convertIndexToBuffer use basic whole-block path layer_id=" << layer_id << " block_id=" << block_id
+            << " parts_size=" << blocks.size() << " part_bytes=[";
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            if (i != 0) {
+                oss << ",";
+            }
+            oss << blocks[i].size_bytes;
+        }
+        oss << "]";
+        pdMtpDebugLog("MemoryLayoutStrategy", oss.str());
+        return blocks;
     }
 
     // TODO(xinfei.sxf) deal with linear attention
 
     // For non-MLA models with partitioning
-    return createPartitionedBlockInfo(layer_id, block_id, partition_count, partition_id);
+    auto               blocks = createPartitionedBlockInfo(layer_id, block_id, partition_count, partition_id);
+    std::ostringstream oss;
+    oss << "convertIndexToBuffer partition output layer_id=" << layer_id << " block_id=" << block_id
+        << " partition_count=" << partition_count << " partition_id=" << partition_id << " parts_size=" << blocks.size()
+        << " part_bytes=[";
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << blocks[i].size_bytes;
+    }
+    oss << "]";
+    pdMtpDebugLog("MemoryLayoutStrategy", oss.str());
+    return blocks;
 }
 
 static inline void* getBlockPtr(const torch::Tensor& layer_tensor, int block_id) {
@@ -249,20 +298,36 @@ std::vector<BlockInfo> MemoryLayoutStrategy::createPartitionedBlockInfo(int laye
                                                           partition_count,
                                                           partition_id,
                                                           "kv_cache");
+    {
+        std::ostringstream oss;
+        oss << "createPartitionedBlockInfo kv_parts layer_id=" << layer_id << " block_id=" << block_id
+            << " heads=" << heads << " partition_count=" << partition_count << " partition_id=" << partition_id
+            << " k_off=" << kv_parts.k_off << " k_sz=" << kv_parts.k_sz << " v_off=" << kv_parts.v_off
+            << " v_sz=" << kv_parts.v_sz;
+        pdMtpDebugLog("MemoryLayoutStrategy", oss.str());
+    }
 
     std::vector<BlockInfo> out = createPartitionedSubBlocks(layer_tensor, kv_addr, kv_parts);
 
     if (config_.hasScale()) {
         auto& layer_scale_tensor = layer_kv_scale_tensors_[layer_id];
         void* scale_addr         = getBlockPtr(layer_scale_tensor, block_id);
-        auto  sc_parts     = MHAKVCacheSpec::splitKVPartitionBytes(static_cast<size_t>(config_.kv_scale_stride_bytes),
+        auto  sc_parts = MHAKVCacheSpec::splitKVPartitionBytes(static_cast<size_t>(config_.kv_scale_stride_bytes),
                                                               static_cast<size_t>(config_.kv_scale_stride_bytes / 2),
                                                               static_cast<size_t>(config_.kv_scale_stride_bytes / 2),
                                                               heads,
                                                               partition_count,
                                                               partition_id,
                                                               "kv_cache_scale");
-        auto  scale_blocks = createPartitionedSubBlocks(layer_scale_tensor, scale_addr, sc_parts);
+        {
+            std::ostringstream oss;
+            oss << "createPartitionedBlockInfo scale_parts layer_id=" << layer_id << " block_id=" << block_id
+                << " heads=" << heads << " partition_count=" << partition_count << " partition_id=" << partition_id
+                << " k_off=" << sc_parts.k_off << " k_sz=" << sc_parts.k_sz << " v_off=" << sc_parts.v_off
+                << " v_sz=" << sc_parts.v_sz;
+            pdMtpDebugLog("MemoryLayoutStrategy", oss.str());
+        }
+        auto scale_blocks = createPartitionedSubBlocks(layer_scale_tensor, scale_addr, sc_parts);
         out.insert(out.end(), scale_blocks.begin(), scale_blocks.end());
     }
 

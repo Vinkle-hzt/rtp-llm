@@ -3,12 +3,14 @@
 #include <unistd.h>
 #include <limits.h>
 #include <condition_variable>
+#include <sstream>
 
 #include "rtp_llm/cpp/cache/CacheGroupType.h"
 #include "rtp_llm/cpp/utils/KVCacheUtils.h"
 #include "rtp_llm/cpp/model_rpc/QueryConverter.h"
 #include "rtp_llm/cpp/model_rpc/DecodeRpcServer.h"
 #include "rtp_llm/cpp/utils/DebugUtils.h"
+#include "rtp_llm/cpp/utils/PdSeparationDebug.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "autil/LockFreeThreadPool.h"
 
@@ -35,6 +37,98 @@ string makeRequestKey(const string& client_id, size_t request_id) {
 }
 
 namespace rtp_llm {
+
+namespace {
+
+template<typename T>
+std::string debugVectorToString(const std::vector<T>& values) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << values[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string debugPeerAddrsToString(const std::vector<std::string>& peer_addrs) {
+    return debugVectorToString(peer_addrs);
+}
+
+std::string debugCacheKeysToString(const std::vector<CacheKeyType>& cache_keys) {
+    return debugVectorToString(cache_keys);
+}
+
+std::string debugGroupBlocksToString(const GroupBlockIds& block_ids_by_group) {
+    std::ostringstream oss;
+    oss << "group_count=" << block_ids_by_group.size() << " groups=[";
+    for (size_t gid = 0; gid < block_ids_by_group.size(); ++gid) {
+        if (gid != 0) {
+            oss << ";";
+        }
+        oss << "gid=" << gid << ":";
+        if (block_ids_by_group[gid] == nullptr) {
+            oss << "null";
+            continue;
+        }
+        const auto& blocks = block_ids_by_group[gid]->blocks();
+        oss << "size=" << blocks.size() << " blocks=" << debugVectorToString(blocks);
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string debugRepeatedPeerAddrsToString(const google::protobuf::RepeatedPtrField<std::string>& peer_addrs) {
+    std::ostringstream oss;
+    oss << "[";
+    for (int i = 0; i < peer_addrs.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << peer_addrs.Get(i);
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string debugRequestGroupBlocksToString(const BroadcastLoadRequestPB& request) {
+    std::ostringstream oss;
+    oss << "rows=" << request.group_block_ids_size() << " groups=[";
+    for (int gid = 0; gid < request.group_block_ids_size(); ++gid) {
+        if (gid != 0) {
+            oss << ";";
+        }
+        const auto& row = request.group_block_ids(gid);
+        oss << "gid=" << gid << ":size=" << row.values_size() << " blocks=[";
+        for (int i = 0; i < row.values_size(); ++i) {
+            if (i != 0) {
+                oss << ",";
+            }
+            oss << row.values(i);
+        }
+        oss << "]";
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string debugBlockPartSizes(const std::vector<BlockInfo>& parts) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << parts[i].size_bytes;
+    }
+    oss << "]";
+    return oss.str();
+}
+
+}  // namespace
 
 grpc::Status DecodeRpcServer::init(const EngineInitParams&                                maga_init_params,
                                    py::object                                             mm_process_engine,
@@ -257,6 +351,19 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequestForMla(
         }
     }
     request.set_timeout_ms(load_context.timeout_ms);
+    {
+        std::ostringstream oss;
+        oss << "constructRemoteLoadRequestForMla index=" << index << " request_id=" << load_context.request_id
+            << " request_key=" << load_context.request_key << " workers=" << resource_.workers.size()
+            << " grpc_workers=" << resource_.grpc_workers.size() << " peer_cnt=" << peer_addrs.size()
+            << " selected_peer_addrs=" << debugRepeatedPeerAddrsToString(request.peer_addrs())
+            << " partition_count=" << request.partition_count() << " partition_id=" << request.partition_id()
+            << " cache_key_count=" << request.cache_keys_size()
+            << " cache_keys=" << debugCacheKeysToString(load_context.cache_keys)
+            << " reuse_block_size=" << load_context.reuse_block_size << " timeout_ms=" << request.timeout_ms() << " "
+            << debugRequestGroupBlocksToString(request);
+        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+    }
     return request;
 }
 
@@ -306,6 +413,19 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequest(const LoadKVC
         }
     }
     request.set_timeout_ms(load_context.timeout_ms);
+    {
+        std::ostringstream oss;
+        oss << "constructRemoteLoadRequest index=" << index << " request_id=" << load_context.request_id
+            << " request_key=" << load_context.request_key << " workers=" << resource_.workers.size()
+            << " grpc_workers=" << resource_.grpc_workers.size() << " peer_cnt=" << peer_addrs.size()
+            << " selected_peer_addrs=" << debugRepeatedPeerAddrsToString(request.peer_addrs())
+            << " partition_count=" << request.partition_count() << " partition_id=" << request.partition_id()
+            << " cache_key_count=" << request.cache_keys_size()
+            << " cache_keys=" << debugCacheKeysToString(load_context.cache_keys)
+            << " reuse_block_size=" << load_context.reuse_block_size << " timeout_ms=" << request.timeout_ms() << " "
+            << debugRequestGroupBlocksToString(request);
+        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+    }
     return request;
 }
 
@@ -314,6 +434,21 @@ ErrorInfo DecodeRpcServer::loadCacheForAllRank(DecodeGenerateContext& decode_con
     auto*       generate_stream    = decode_context.getStream().get();
     auto&       cache_keys         = generate_stream->cacheKeys(0);
     const auto& block_ids_by_group = generate_stream->kvCachePtr()->groupBlocks(0);
+    {
+        std::ostringstream oss;
+        oss << "loadCacheForAllRank entry request_id=" << decode_context.request_id
+            << " request_key=" << decode_context.request_key
+            << " peer_addrs=" << debugPeerAddrsToString(decode_context.peer_addrs)
+            << " worker_size=" << resource_.workers.size() << " grpc_worker_size=" << resource_.grpc_workers.size()
+            << " cache_keys=" << debugCacheKeysToString(cache_keys)
+            << " reuse_block_size=" << generate_stream->reuseBlockSize()
+            << " request_timeout_ms=" << decode_context.request_timeout_ms
+            << " use_mla=" << pdBoolString(engine_->resourceContext().cache_manager->cacheConfig().use_mla)
+            << " use_hybrid=" << pdBoolString(engine_->resourceContext().cache_manager->cacheConfig().groupNums() > 1)
+            << " is_mtp_eagle=" << pdBoolString(engine_->isMTPEagle()) << " "
+            << debugGroupBlocksToString(block_ids_by_group);
+        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+    }
 
     if (resource_.workers.size() % decode_context.peer_addrs.size() != 0
         && decode_context.peer_addrs.size() % resource_.workers.size() != 0) {
@@ -342,6 +477,15 @@ ErrorInfo DecodeRpcServer::loadCacheForAllRank(DecodeGenerateContext& decode_con
                                     1,
                                     0,
                                     decode_context.server_context};
+
+    {
+        std::ostringstream oss;
+        oss << "loadCacheForAllRank load_context request_id=" << load_context.request_id
+            << " request_key=" << load_context.request_key << " min_timeout_ms=" << min_timeout_ms
+            << " load_cache_timeout_ms=" << load_cache_timeout_ms << " rpc_timeout_ms=" << rpc_timeout
+            << " partition_count=" << load_context.partition_count << " partition_id=" << load_context.partition_id;
+        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+    }
 
     // Prefill: TP = 1 && Decode: TP = 1
     if (resource_.workers.size() == 1 && decode_context.peer_addrs.size() == 1) {
@@ -386,6 +530,14 @@ ErrorInfo DecodeRpcServer::loadCacheAsyncForTp(DecodeGenerateContext& decode_con
     }
     auto worker_size_per_queue = worker_size / completion_queues.size();
     RTP_LLM_LOG_DEBUG("request:[%s] start to async remote load for all rank", decode_context.request_key.c_str());
+    {
+        std::ostringstream oss;
+        oss << "loadCacheAsyncForTp start request_id=" << load_context.request_id
+            << " request_key=" << load_context.request_key << " worker_size=" << worker_size << " cq_size=" << cq_size
+            << " worker_size_per_queue=" << worker_size_per_queue << " timeout_ms=" << load_context.timeout_ms
+            << " peer_addrs=" << debugPeerAddrsToString(decode_context.peer_addrs);
+        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+    }
     for (int i = 0; i < worker_size; i++) {
         auto& worker         = resource_.grpc_workers[i];
         auto  connect_status = resource_.rpc_pool.getConnection(worker);
@@ -402,6 +554,16 @@ ErrorInfo DecodeRpcServer::loadCacheAsyncForTp(DecodeGenerateContext& decode_con
             load_request = constructRemoteLoadRequestForMla(load_context, i, decode_context.peer_addrs);
         } else {
             load_request = constructRemoteLoadRequest(load_context, i, decode_context.peer_addrs);
+        }
+        {
+            std::ostringstream oss;
+            oss << "loadCacheAsyncForTp send worker_index=" << i << " worker=" << worker
+                << " request_id=" << load_request.request_id() << " request_key=" << load_request.request_key()
+                << " partition_count=" << load_request.partition_count()
+                << " partition_id=" << load_request.partition_id()
+                << " selected_peer_addrs=" << debugRepeatedPeerAddrsToString(load_request.peer_addrs())
+                << " timeout_ms=" << load_request.timeout_ms() << " " << debugRequestGroupBlocksToString(load_request);
+            pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
         }
         std::unique_ptr<ClientAsyncResponseReader<BroadcastLoadResponsePB>> reader(rpc_context.stub->AsyncRemoteLoad(
             rpc_context.client_context.get(), load_request, &completion_queues[i % completion_queues.size()]));
@@ -459,6 +621,17 @@ ErrorInfo DecodeRpcServer::loadCacheAsyncForTp(DecodeGenerateContext& decode_con
             min_response_done_time_us    = std::min(min_response_done_time_us, response.done_time_us());
             max_response_done_time_us    = std::max(max_response_done_time_us, response.done_time_us());
             RTP_LLM_LOG_DEBUG("request [%s] load cache for rank [%d] done", decode_context.request_key.c_str(), rank);
+            {
+                std::ostringstream oss;
+                oss << "loadCacheAsyncForTp done rank=" << rank << " grpc_ok=" << pdBoolString(status.ok())
+                    << " pb_error_code=" << pb_error_code << " pb_error_message=" << pb_error_message
+                    << " done_time_us=" << response.done_time_us() << " finished_count=" << (finished_count + 1) << "/"
+                    << worker_size;
+                if (!status.ok()) {
+                    oss << " grpc_error=" << status.error_message();
+                }
+                pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+            }
             if (!status.ok()) {
                 all_success = false;
                 error_code  = ErrorCode::LOAD_KV_CACHE_FAILED;
@@ -508,6 +681,14 @@ ErrorInfo DecodeRpcServer::loadCacheSyncForTp(DecodeGenerateContext& decode_cont
     int64_t                                               max_response_done_time_us = 0;
     std::vector<autil::ThreadPoolBase::Future<ErrorInfo>> futures;
     auto                                                  local_task = [&] { return this->loadCache(load_context); };
+    {
+        std::ostringstream oss;
+        oss << "loadCacheSyncForTp start request_id=" << load_context.request_id
+            << " request_key=" << load_context.request_key << " grpc_worker_size=" << resource_.grpc_workers.size()
+            << " peer_addrs=" << debugPeerAddrsToString(decode_context.peer_addrs)
+            << " timeout_ms=" << load_context.timeout_ms;
+        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+    }
     futures.emplace_back(thread_pool_->async(local_task));
 
     for (int i = 0; i < resource_.grpc_workers.size(); i++) {
@@ -527,15 +708,37 @@ ErrorInfo DecodeRpcServer::loadCacheSyncForTp(DecodeGenerateContext& decode_cont
             } else {
                 load_request = constructRemoteLoadRequest(load_context, i, decode_context.peer_addrs);
             }
+            {
+                std::ostringstream oss;
+                oss << "loadCacheSyncForTp send worker_index=" << i << " worker=" << worker
+                    << " partition_count=" << load_request.partition_count()
+                    << " partition_id=" << load_request.partition_id()
+                    << " selected_peer_addrs=" << debugRepeatedPeerAddrsToString(load_request.peer_addrs())
+                    << " timeout_ms=" << load_request.timeout_ms();
+                pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+            }
             BroadcastLoadResponsePB response;
             auto                    grpc_status      = stub->RemoteLoad(&client_context, load_request, &response);
             const auto&             pb_error_code    = response.error_info().error_code();
             const auto&             pb_error_message = response.error_info().error_message();
             if (!grpc_status.ok()) {
+                std::ostringstream oss;
+                oss << "loadCacheSyncForTp grpc failed worker=" << worker << " error=" << grpc_status.error_message();
+                pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
                 return ErrorInfo(ErrorCode::LOAD_KV_CACHE_FAILED, grpc_status.error_message());
             } else if (pb_error_code != ErrorCodePB::NONE_ERROR) {
-                auto error_code = transRPCErrorCode(pb_error_code);
+                auto               error_code = transRPCErrorCode(pb_error_code);
+                std::ostringstream oss;
+                oss << "loadCacheSyncForTp response failed worker=" << worker << " pb_error_code=" << pb_error_code
+                    << " pb_error_message=" << pb_error_message;
+                pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
                 return ErrorInfo(error_code, pb_error_message);
+            }
+            {
+                std::ostringstream oss;
+                oss << "loadCacheSyncForTp response ok worker=" << worker
+                    << " done_time_us=" << response.done_time_us();
+                pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
             }
             min_response_done_time_us = std::min(min_response_done_time_us, response.done_time_us());
             max_response_done_time_us = std::max(max_response_done_time_us, response.done_time_us());
@@ -587,6 +790,22 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
     const auto&  spec          = cache_config.cache_specs[0];
     const size_t k_total_bytes = spec->k_block_size_bytes();
     const size_t v_total_bytes = spec->v_block_size_bytes();
+    {
+        std::ostringstream oss;
+        oss << "loadCache entry request_id=" << load_context.request_id << " request_key=" << request_key
+            << " peer_cnt=" << peer_cnt << " peer_addrs=" << debugPeerAddrsToString(load_context.peer_addrs)
+            << " partition_count=" << load_context.partition_count << " partition_id=" << load_context.partition_id
+            << " timeout_ms=" << load_context.timeout_ms << " reuse_block_size=" << load_context.reuse_block_size
+            << " use_hybrid=" << pdBoolString(use_hybrid) << " use_mla=" << pdBoolString(use_mla)
+            << " layer_num=" << layer_num << " cache_layer_num=" << cache_config.layer_num
+            << " cache_layer_all_num=" << cache_config.layer_all_num << " model_id=" << maga_init_params_.model_id
+            << " group_nums=" << cache_config.groupNums() << " group_types_size=" << cache_config.group_types.size()
+            << " layer_to_group_size=" << cache_config.layer_to_group_id.size() << " k_total_bytes=" << k_total_bytes
+            << " v_total_bytes=" << v_total_bytes << " is_mtp_eagle=" << pdBoolString(engine_->isMTPEagle())
+            << " cache_keys=" << debugCacheKeysToString(load_context.cache_keys) << " "
+            << debugGroupBlocksToString(load_context.block_ids_by_group);
+        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+    }
 
     if (!use_mla && peer_cnt > 1) {
         RTP_LLM_CHECK_WITH_INFO(k_total_bytes % static_cast<size_t>(peer_cnt) == 0,
@@ -606,6 +825,13 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
         auto&                                            peer_addr = load_context.peer_addrs[i];
         std::vector<std::shared_ptr<RequestBlockBuffer>> layer_caches;
         RTP_LLM_LOG_DEBUG("load context request id is %d", load_context.request_id);
+        {
+            std::ostringstream oss;
+            oss << "loadCache peer begin peer_index=" << i << " peer_addr=" << peer_addr
+                << " request_id=" << load_context.request_id << " partition_count=" << load_context.partition_count
+                << " partition_id=" << load_context.partition_id;
+            pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+        }
 
         for (size_t layer_id = 0; layer_id < layer_num; layer_id++) {
             auto request_key = std::to_string(load_context.request_id) + "-" + std::to_string(layer_id);
@@ -630,8 +856,8 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
             // Hybrid cache: Linear group only needs the last block; Full group needs all blocks.
             std::vector<size_t> block_pos_list;
             block_pos_list.reserve(block_num);
+            CacheGroupType group_type = CacheGroupType::FULL;
             if (use_hybrid && block_num > 0) {
-                CacheGroupType group_type = CacheGroupType::FULL;
                 if (layer_id < cache_config.layer_to_group_id.size() && !cache_config.group_types.empty()) {
                     const int gid = cache_config.layer_to_group_id[layer_id];
                     if (gid >= 0 && static_cast<size_t>(gid) < cache_config.group_types.size()) {
@@ -651,6 +877,15 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                     block_pos_list.push_back(block_pos);
                 }
             }
+            {
+                std::ostringstream oss;
+                oss << "loadCache main layer layer_id=" << layer_id << " gid=" << gid
+                    << " group_type=" << pdCacheGroupTypeString(static_cast<int32_t>(group_type)) << "("
+                    << static_cast<int32_t>(group_type) << ")"
+                    << " block_num=" << block_num << " block_pos_list=" << debugVectorToString(block_pos_list)
+                    << " model_id=" << model_id << " peer_index=" << i;
+                pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+            }
 
             for (size_t block_pos : block_pos_list) {
                 auto cache_key = makeCacheKey(model_id, std::to_string(load_context.cache_keys[block_pos]), layer_id);
@@ -660,12 +895,27 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                 const int local_part_cnt = peer_cnt;
                 const int local_part_id  = i;
                 auto parts = cache_manager->convertIndexToBuffer(block_id, layer_id, local_part_cnt, local_part_id);
+                {
+                    std::ostringstream oss;
+                    oss << "loadCache main block layer_id=" << layer_id << " gid=" << gid << " block_pos=" << block_pos
+                        << " block_id=" << block_id << " cache_key=" << cache_key
+                        << " local_part_cnt=" << local_part_cnt << " local_part_id=" << local_part_id
+                        << " parts_size=" << parts.size() << " part_bytes=" << debugBlockPartSizes(parts)
+                        << " key_mode=" << ((use_mla || use_hybrid) ? "kv_combined" : "k_v_split")
+                        << " peer_index=" << i;
+                    pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+                }
 
                 auto addBufBlock = [&](const std::string& key, const BlockInfo& block) {
                     RTP_LLM_CHECK_WITH_INFO(block.addr != nullptr, "null block addr for key=%s", key.c_str());
                     RTP_LLM_CHECK_WITH_INFO(block.size_bytes > 0, "zero block size for key=%s", key.c_str());
                     std::shared_ptr<void> addr(block.addr, [](void*) {});
                     load_layer_cache->addBlock(key, addr, static_cast<uint32_t>(block.size_bytes), true, true);
+                    std::ostringstream oss;
+                    oss << "loadCache main addBufBlock key=" << key << " bytes=" << block.size_bytes
+                        << " layer_id=" << layer_id << " block_pos=" << block_pos << " block_id=" << block_id
+                        << " peer_index=" << i;
+                    pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
                 };
 
                 // Hybrid Attention not support asymmetric TP, thus transfer the whole kvache blocks
@@ -707,6 +957,19 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
 
                     const auto&  mtp_cache_cfg = cache_manager->getMTPModuleCacheConfig(static_cast<int>(mtp_model_id));
                     const size_t layer_num     = mtp_engine_init_params->model_config_.num_layers;
+                    {
+                        std::ostringstream oss;
+                        oss << "loadCache mtp module begin mtp_model_id=" << mtp_model_id
+                            << " mtp_base_model_id=" << mtp_base_model_id
+                            << " mtp_engine_model_id=" << mtp_engine_init_params->model_id
+                            << " mtp_layer_num=" << layer_num << " mtp_cache_layer_num=" << mtp_cache_cfg.layer_num
+                            << " mtp_group_nums=" << mtp_cache_cfg.groupNums()
+                            << " mtp_group_types_size=" << mtp_cache_cfg.group_types.size()
+                            << " mtp_layer_to_group_size=" << mtp_cache_cfg.layer_to_group_id.size()
+                            << " mtp_global_layer_id_modules=" << mtp_cache_cfg.global_layer_ids.size()
+                            << " mtp_use_mla=" << pdBoolString(mtp_cache_cfg.use_mla) << " peer_index=" << i;
+                        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+                    }
 
                     RTP_LLM_CHECK_WITH_INFO(layer_num == mtp_cache_cfg.layer_num,
                                             "mtp layer_num mismatch: engine=" + std::to_string(layer_num)
@@ -744,8 +1007,8 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                         // Hybrid cache: Linear group only needs the last block; Full group needs all blocks.
                         std::vector<size_t> block_pos_list;
                         block_pos_list.reserve(block_num);
+                        CacheGroupType group_type = CacheGroupType::FULL;
                         if (mtp_use_hybrid && block_num > 0) {
-                            CacheGroupType group_type = CacheGroupType::FULL;
                             if (layer_id < mtp_cache_cfg.layer_to_group_id.size()
                                 && !mtp_cache_cfg.group_types.empty()) {
                                 const int gid = mtp_cache_cfg.layer_to_group_id[layer_id];
@@ -767,6 +1030,18 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                                 block_pos_list.push_back(block_pos);
                             }
                         }
+                        {
+                            std::ostringstream oss;
+                            oss << "loadCache mtp layer mtp_model_id=" << mtp_model_id << " local_layer_id=" << layer_id
+                                << " global_layer_id=" << global_layer_id << " gid=" << gid
+                                << " group_type=" << pdCacheGroupTypeString(static_cast<int32_t>(group_type)) << "("
+                                << static_cast<int32_t>(group_type) << ")"
+                                << " mtp_use_hybrid=" << pdBoolString(mtp_use_hybrid)
+                                << " mtp_use_mla=" << pdBoolString(mtp_cache_cfg.use_mla) << " block_num=" << block_num
+                                << " block_pos_list=" << debugVectorToString(block_pos_list)
+                                << " key_model_id=" << model_id << " peer_index=" << i;
+                            pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+                        }
 
                         for (size_t block_pos : block_pos_list) {
                             auto cache_key =
@@ -777,6 +1052,18 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                             const int  local_part_id  = i;
                             auto       parts          = cache_manager->convertIndexToBuffer(
                                 block_id, global_layer_id, local_part_cnt, local_part_id);
+                            {
+                                std::ostringstream oss;
+                                oss << "loadCache mtp block mtp_model_id=" << mtp_model_id
+                                    << " local_layer_id=" << layer_id << " global_layer_id=" << global_layer_id
+                                    << " gid=" << gid << " block_pos=" << block_pos << " block_id=" << block_id
+                                    << " cache_key=" << cache_key << " local_part_cnt=" << local_part_cnt
+                                    << " local_part_id=" << local_part_id << " parts_size=" << parts.size()
+                                    << " part_bytes=" << debugBlockPartSizes(parts)
+                                    << " key_mode=" << ((mtp_use_mla || mtp_use_hybrid) ? "kv_combined" : "k_v_split")
+                                    << " peer_index=" << i;
+                                pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+                            }
 
                             auto addBufBlock = [&](const std::string& key, const BlockInfo& block) {
                                 RTP_LLM_CHECK_WITH_INFO(
@@ -786,6 +1073,12 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                                 std::shared_ptr<void> addr(block.addr, [](void*) {});
                                 load_layer_cache->addBlock(
                                     key, addr, static_cast<uint32_t>(block.size_bytes), true, true);
+                                std::ostringstream oss;
+                                oss << "loadCache mtp addBufBlock key=" << key << " bytes=" << block.size_bytes
+                                    << " mtp_model_id=" << mtp_model_id << " local_layer_id=" << layer_id
+                                    << " global_layer_id=" << global_layer_id << " block_pos=" << block_pos
+                                    << " block_id=" << block_id << " peer_index=" << i;
+                                pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
                             };
 
                             if (mtp_use_mla || mtp_use_hybrid) {
@@ -811,6 +1104,10 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                         layer_caches.push_back(load_layer_cache);
                     }
                 }
+            } else {
+                pdMtpDebugLog("DecodeRpcServer",
+                              maga_init_params_.parallelism_config,
+                              "loadCache isMTPEagle=true but mtp_model_params is null/empty");
             }
         }
 
@@ -818,6 +1115,25 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
         if (ip_parts.size() != 3) {
             RTP_LLM_LOG_WARNING("invalid peer ip to load [%s]", peer_addr.c_str());
             return ErrorInfo(ErrorCode::LOAD_KV_CACHE_FAILED, "invalid peer ip");
+        }
+
+        {
+            size_t total_block_count = 0;
+            size_t total_bytes       = 0;
+            for (const auto& layer_cache : layer_caches) {
+                if (layer_cache) {
+                    total_block_count += layer_cache->getBlocksCount();
+                    total_bytes += layer_cache->getBlocksSize();
+                }
+            }
+            std::ostringstream oss;
+            oss << "loadCache call loadBuffers request_id=" << load_context.request_id << " request_key=" << request_key
+                << " peer_index=" << i << " peer_ip=" << ip_parts[0] << " tcp_port=" << ip_parts[1]
+                << " rdma_port=" << ip_parts[2] << " layer_caches=" << layer_caches.size()
+                << " total_block_count=" << total_block_count << " total_bytes=" << total_bytes
+                << " timeout_ms=" << load_context.timeout_ms << " partition_count=" << load_context.partition_count
+                << " partition_id=" << load_context.partition_id;
+            pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
         }
 
         auto layer_cache_load_context =
@@ -838,9 +1154,18 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
     }
 
     for (auto& layer_cache_load_context : load_contexts) {
+        {
+            std::ostringstream oss;
+            oss << "loadCache waitDone begin request_id=" << load_context.request_id << " request_key=" << request_key;
+            pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+        }
         layer_cache_load_context->waitDone();
         if (layer_cache_load_context->success()) {
             RTP_LLM_LOG_DEBUG("request [%s] load kv cache success", request_key.c_str());
+            std::ostringstream oss;
+            oss << "loadCache waitDone success request_id=" << load_context.request_id << " request_key=" << request_key
+                << " cost_ms=" << (currentTimeUs() - start_load_time_us) / 1000;
+            pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
         } else {
             // TODO(xinfei.sxf) add retry for part failed blocks.
             auto load_done_time_us = currentTimeUs();
@@ -848,10 +1173,22 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                                 request_key.c_str(),
                                 layer_cache_load_context->getErrorInfoString().c_str(),
                                 (load_done_time_us - start_load_time_us) / 1000);
+            std::ostringstream oss;
+            oss << "loadCache waitDone failed request_id=" << load_context.request_id << " request_key=" << request_key
+                << " error=" << layer_cache_load_context->getErrorInfoString()
+                << " cost_ms=" << (load_done_time_us - start_load_time_us) / 1000;
+            pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
             return layer_cache_load_context->getErrorInfo();
         }
     }
 
+    {
+        std::ostringstream oss;
+        oss << "loadCache success request_id=" << load_context.request_id << " request_key=" << request_key
+            << " total_contexts=" << load_contexts.size()
+            << " cost_ms=" << (currentTimeUs() - start_load_time_us) / 1000;
+        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+    }
     return ErrorInfo::OkStatus();
 }
 
@@ -859,8 +1196,22 @@ grpc::Status DecodeRpcServer::RemoteLoad(grpc::ServerContext*          server_co
                                          const BroadcastLoadRequestPB* request,
                                          BroadcastLoadResponsePB*      response) {
     RTP_LLM_PROFILE_FUNCTION();
+    {
+        std::ostringstream oss;
+        oss << "RemoteLoad received request_id=" << request->request_id() << " request_key=" << request->request_key()
+            << " request_dp_rank=" << request->dp_rank()
+            << " local_dp_rank=" << maga_init_params_.parallelism_config.dp_rank
+            << " partition_count=" << request->partition_count() << " partition_id=" << request->partition_id()
+            << " timeout_ms=" << request->timeout_ms() << " reuse_block_size=" << request->reuse_block_size()
+            << " peer_addrs=" << debugRepeatedPeerAddrsToString(request->peer_addrs())
+            << " cache_key_count=" << request->cache_keys_size() << " " << debugRequestGroupBlocksToString(*request);
+        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+    }
     if (request->dp_rank() != maga_init_params_.parallelism_config.dp_rank) {
         RTP_LLM_LOG_WARNING("only load when in dp group, skip load for dp rank %d", request->dp_rank());
+        pdMtpDebugLog("DecodeRpcServer",
+                      maga_init_params_.parallelism_config,
+                      "RemoteLoad skip because request dp_rank does not match local dp_rank");
         return grpc::Status::OK;
     }
 
@@ -875,6 +1226,14 @@ grpc::Status DecodeRpcServer::RemoteLoad(grpc::ServerContext*          server_co
     }
 
     std::vector<std::string> peer_addrs(request->peer_addrs().begin(), request->peer_addrs().end());
+    {
+        std::ostringstream oss;
+        oss << "RemoteLoad decoded request_id=" << request->request_id()
+            << " peer_addrs=" << debugPeerAddrsToString(peer_addrs)
+            << " cache_keys=" << debugCacheKeysToString(cache_keys) << " "
+            << debugGroupBlocksToString(block_ids_by_group);
+        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+    }
 
     // TODO(xinfei.sxf) add retry
     auto error_info = loadCache({request->request_id(),
@@ -891,6 +1250,13 @@ grpc::Status DecodeRpcServer::RemoteLoad(grpc::ServerContext*          server_co
     response->mutable_error_info()->set_error_message(error_info.ToString());
     response->set_done_time_us(currentTimeUs());
     RTP_LLM_LOG_DEBUG("request: %s, remote load cache grpc done", request->request_key().c_str());
+    {
+        std::ostringstream oss;
+        oss << "RemoteLoad done request_id=" << request->request_id() << " request_key=" << request->request_key()
+            << " error_code=" << static_cast<int>(error_info.code()) << " error_info=" << error_info.ToString()
+            << " done_time_us=" << response->done_time_us();
+        pdMtpDebugLog("DecodeRpcServer", maga_init_params_.parallelism_config, oss.str());
+    }
     return grpc::Status::OK;
 }
 

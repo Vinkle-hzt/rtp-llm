@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/cache/CacheConfigCreator.h"
 
 #include <numeric>
+#include <sstream>
 
 #include "rtp_llm/cpp/cache/HybridConfigCreator.h"
 #include "rtp_llm/cpp/cache/KVCacheSpec.h"
@@ -8,6 +9,7 @@
 #include "rtp_llm/cpp/cache/SingleConfigCreator.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
+#include "rtp_llm/cpp/utils/PdSeparationDebug.h"
 
 namespace rtp_llm {
 namespace {
@@ -102,6 +104,17 @@ CacheConfig CacheConfigCreator::createSpConfig(const ModelConfig&               
     CacheConfig score_config = CacheConfigCreator::createBasicConfig(score_model_config, parallelism_config, false);
     CacheConfig propose_config =
         CacheConfigCreator::createBasicConfig(propose_model_config, parallelism_config, is_mtp);
+    {
+        std::ostringstream oss;
+        oss << "createSpConfig entry is_mtp=" << is_mtp << " is_eagle=" << is_eagle
+            << " sp_type=" << static_cast<int>(sp_config.type) << " gen_num_per_cycle=" << sp_config.gen_num_per_cycle
+            << " score_layers=" << score_config.layer_num << " propose_layers=" << propose_config.layer_num
+            << " score_groups=" << score_config.groupNums() << " propose_groups=" << propose_config.groupNums()
+            << " tp_size=" << parallelism_config.tp_size << " attn_tp_size=" << parallelism_config.get_attn_tp_size()
+            << " score_kv_heads=" << score_model_config.attn_config.kv_head_num
+            << " propose_kv_heads=" << propose_model_config.attn_config.kv_head_num;
+        pdMtpDebugLog("CacheConfigCreator", parallelism_config, oss.str());
+    }
     KVCacheSpecPtr mtp_full_spec;
     if (is_mtp) {
         mtp_full_spec = createFullAttentionSpecForMtp(propose_model_config, parallelism_config, propose_config.dtype);
@@ -231,6 +244,13 @@ CacheConfig CacheConfigCreator::createSpConfig(const ModelConfig&               
             sub_cfg->layer_to_block_stride_bytes.assign(
                 static_cast<size_t>(mtp_layer_num),
                 static_cast<int>(mtp_kv_block_stride_bytes + mtp_kv_scale_stride_bytes));
+            std::ostringstream oss;
+            oss << "normalize mtp sub config module=" << m << " mtp_layer_num=" << mtp_layer_num
+                << " spec_type=" << KVCacheSpecTypeToString(mtp_full_spec->type)
+                << " local_head_num_kv=" << mtp_full_spec->local_head_num_kv
+                << " kv_stride=" << mtp_kv_block_stride_bytes << " scale_stride=" << mtp_kv_scale_stride_bytes
+                << " module_block_size=" << mtp_module_block_size_bytes << " group_types=FULL layer_to_group_id=0";
+            pdMtpDebugLog("CacheConfigCreator", parallelism_config, oss.str());
         }
 
         sub_cfg->global_layer_ids.clear();
@@ -249,6 +269,10 @@ CacheConfig CacheConfigCreator::createSpConfig(const ModelConfig&               
             const int stride_bytes = sub_cfg->layer_to_block_stride_bytes[static_cast<size_t>(l)];
             config.layer_to_block_stride_bytes[static_cast<size_t>(global_layer_id)] = stride_bytes;
             config.layer_attn_types[static_cast<size_t>(global_layer_id)]            = CacheGroupType::FULL;
+            std::ostringstream oss;
+            oss << "map mtp layer module=" << m << " local_layer=" << l << " global_layer_id=" << global_layer_id
+                << " parent_full_gid=" << full_gid << " stride_bytes=" << stride_bytes;
+            pdMtpDebugLog("CacheConfigCreator", parallelism_config, oss.str());
         }
 
         if (!is_mtp) {

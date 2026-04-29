@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <sstream>
 #include <unordered_set>
 
 #include "rtp_llm/cpp/cache/SingleTypeKVCacheAllocator.h"
@@ -13,6 +14,7 @@
 #include "rtp_llm/cpp/engine_base/stream/CompleteTokenIds.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
+#include "rtp_llm/cpp/utils/PdSeparationDebug.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 
 namespace rtp_llm {
@@ -45,6 +47,13 @@ KVCacheManager::KVCacheManager(const CacheConfig&                 config,
                      config_.block_num,
                      config_.block_size_bytes,
                      config_.seq_size_per_block);
+    std::ostringstream oss;
+    oss << "KVCacheManager ctor warmup=" << warmup << " layer_num=" << config_.layer_num
+        << " layer_all_num=" << config_.layer_all_num << " group_nums=" << config_.groupNums()
+        << " block_num=" << config_.block_num << " block_size_bytes=" << config_.block_size_bytes
+        << " seq_size_per_block=" << config_.seq_size_per_block
+        << " mtp_sub_configs=" << config_.mtp_sub_configs.size();
+    pdMtpDebugLog("KVCacheManager", parallelism_config_, oss.str());
 }
 
 KVCacheManager::~KVCacheManager() {
@@ -233,12 +242,37 @@ BlockAddrInfo KVCacheManager::convertIndexToAddr(int block_index, int layer_id) 
 }
 
 std::vector<BlockInfo> KVCacheManager::convertIndexToBuffer(int block_index, int layer_id) const {
-    return allocator_->convertIndexToBuffer(layer_id, block_index);
+    auto               blocks = allocator_->convertIndexToBuffer(layer_id, block_index);
+    std::ostringstream oss;
+    oss << "convertIndexToBuffer block_index=" << block_index << " layer_id=" << layer_id
+        << " parts_size=" << blocks.size() << " part_bytes=[";
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << blocks[i].size_bytes;
+    }
+    oss << "]";
+    pdMtpDebugLog("KVCacheManager", parallelism_config_, oss.str());
+    return blocks;
 }
 
 std::vector<BlockInfo>
 KVCacheManager::convertIndexToBuffer(int block_index, int layer_id, int partition_count, int partition_id) const {
-    return allocator_->convertIndexToBuffer(layer_id, block_index, partition_count, partition_id);
+    auto               blocks = allocator_->convertIndexToBuffer(layer_id, block_index, partition_count, partition_id);
+    std::ostringstream oss;
+    oss << "convertIndexToBuffer partition block_index=" << block_index << " layer_id=" << layer_id
+        << " partition_count=" << partition_count << " partition_id=" << partition_id << " parts_size=" << blocks.size()
+        << " part_bytes=[";
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        if (i != 0) {
+            oss << ",";
+        }
+        oss << blocks[i].size_bytes;
+    }
+    oss << "]";
+    pdMtpDebugLog("KVCacheManager", parallelism_config_, oss.str());
+    return blocks;
 }
 
 CacheLayerLayout KVCacheManager::allLayerCacheBase() const {
@@ -287,6 +321,12 @@ CacheLayerLayout KVCacheManager::getMainModelCacheLayerLayout() const {
         }
     }
 
+    std::ostringstream oss;
+    oss << "getMainModelCacheLayerLayout layer_num=" << config_.layer_num
+        << " group_types=" << layout.group_types.size() << " layer_to_groups=" << layout.layer_to_groups.size()
+        << " kv_tensors=" << layout.layers_to_kv_buffer_ptrs.size()
+        << " scale_tensors=" << layout.layers_to_scale_buffer_ptrs.size();
+    pdMtpDebugLog("KVCacheManager", parallelism_config_, oss.str());
     return layout;
 }
 
@@ -346,6 +386,17 @@ CacheLayerLayout KVCacheManager::getMTPModuleCacheLayerLayout(int mtp_module_id)
         }
     }
 
+    std::ostringstream oss;
+    oss << "getMTPModuleCacheLayerLayout mtp_module_id=" << mtp_module_id << " mtp_layer_num=" << mtp_layer_num
+        << " mtp_group_nums=" << mtp_sub_config->groupNums()
+        << " mtp_group_types=" << mtp_sub_config->group_types.size()
+        << " layer_to_groups=" << layout.layer_to_groups.size()
+        << " kv_tensors=" << layout.layers_to_kv_buffer_ptrs.size()
+        << " scale_tensors=" << layout.layers_to_scale_buffer_ptrs.size();
+    if (!mtp_global_layer_ids.empty()) {
+        oss << " first_global_layer=" << mtp_global_layer_ids[0];
+    }
+    pdMtpDebugLog("KVCacheManager", parallelism_config_, oss.str());
     return layout;
 }
 

@@ -6,6 +6,7 @@
 #include "rtp_llm/cpp/utils/KVCacheUtils.h"
 #include "rtp_llm/cpp/utils/ErrorCode.h"
 #include "rtp_llm/cpp/utils/StackTrace.h"
+#include "rtp_llm/cpp/utils/PdSeparationDebug.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/ErrorCodeUtil.h"
 #include "autil/StackTracer.h"
 #include "autil/EnvUtil.h"
@@ -54,6 +55,19 @@ using namespace std;
 namespace py = pybind11;
 
 namespace rtp_llm {
+
+namespace {
+
+std::string debugTensorBrief(const torch::Tensor& tensor) {
+    if (!tensor.defined()) {
+        return "undefined";
+    }
+    std::ostringstream oss;
+    oss << "defined dim=" << tensor.dim() << " numel=" << tensor.numel() << " sizes=" << torch::str(tensor.sizes());
+    return oss.str();
+}
+
+}  // namespace
 
 // ============================================================
 // Module-level init guards (minimal state - no cache_store here)
@@ -139,18 +153,46 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
                             bool                        mla_kvcache,
                             std::shared_ptr<CacheStore> cache_store) {
     auto& param = cache_store_inputs;
+    {
+        std::ostringstream oss;
+        oss << "runtimeWriteCacheStore entry warmup=" << pdBoolString(param.warmup)
+            << " pd_separation=" << pdBoolString(param.pd_separation)
+            << " context_batch_size=" << param.context_batch_size << " decoder_batch_size=" << param.decoder_batch_size
+            << " layer_id=" << param.layer_id << " model_id=" << param.model_id
+            << " mla_kvcache=" << pdBoolString(mla_kvcache)
+            << " decode_entrance=" << pdBoolString(param.decode_entrance)
+            << " cache_store=" << (cache_store ? "set" : "null") << " tokens_per_block=" << param.tokens_per_block
+            << " kv_stride=" << param.kv_block_stride_bytes << " scale_stride=" << param.kv_scale_stride_bytes
+            << " input_lengths=" << debugTensorBrief(param.input_lengths_host)
+            << " prefix_lengths=" << debugTensorBrief(param.prefix_lengths_host)
+            << " host_offset=" << debugTensorBrief(param.host_kv_cache_offset)
+            << " layer_to_group=" << debugTensorBrief(param.kv_cache_layer_to_group_host)
+            << " group_types=" << debugTensorBrief(param.kv_cache_group_types_host)
+            << " request_id=" << debugTensorBrief(param.request_id)
+            << " request_pd=" << debugTensorBrief(param.request_pd_separation)
+            << " cache_keys=" << param.cache_keys.size()
+            << " kv_cache_buffer=" << debugTensorBrief(kv_cache.kv_cache_buffer)
+            << " kv_scale_buffer=" << debugTensorBrief(kv_cache.kv_scale_buffer);
+        pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
+    }
     if (param.warmup) {
         RTP_LLM_LOG_DEBUG("is warmup, so ignore writeCacheStore");
+        pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", "skip writeCacheStore because warmup=true");
         return;
     }
     if (!param.pd_separation || param.context_batch_size == 0) {
         RTP_LLM_LOG_DEBUG("pd_separation = %d, context_batch_size = %d, so ignore writeCacheStore",
                           param.pd_separation,
                           param.context_batch_size);
+        std::ostringstream oss;
+        oss << "skip writeCacheStore pd_separation=" << pdBoolString(param.pd_separation)
+            << " context_batch_size=" << param.context_batch_size;
+        pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
         return;
     }
     if (!cache_store) {
         RTP_LLM_LOG_DEBUG("cache_store is null, skip writeCacheStore");
+        pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", "skip writeCacheStore because cache_store is null");
         return;
     }
 
@@ -159,7 +201,8 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
     size_t         max_blocks_per_batch = 0;
 
     bool is_hybrid = false;
-    if (param.kv_cache_group_types_host.defined() && param.kv_cache_group_types_host.size(0) > 1) {
+    if (param.kv_cache_group_types_host.defined() && param.kv_cache_group_types_host.size(0) > 1
+        && param.kv_cache_layer_to_group_host.defined() && param.kv_cache_layer_to_group_host.numel() > 0) {
         is_hybrid =
             !torch::all(param.kv_cache_group_types_host.index({param.kv_cache_layer_to_group_host}) == 1).item<bool>();
     }
@@ -174,6 +217,12 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
 
     RTP_LLM_CHECK_WITH_INFO(gid >= 0 && gid < static_cast<int32_t>(group_num), "invalid kv cache group id [%d]", gid);
 
+    int32_t group_type_value = static_cast<int32_t>(CacheGroupType::FULL);
+    if (param.kv_cache_group_types_host.defined()
+        && static_cast<size_t>(gid) < static_cast<size_t>(param.kv_cache_group_types_host.numel())) {
+        group_type_value = param.kv_cache_group_types_host.data_ptr<int32_t>()[gid];
+    }
+
     if (param.host_kv_cache_offset.dim() == 3) {
         const auto group_offset_view = param.host_kv_cache_offset[static_cast<int64_t>(gid)];
         max_blocks_per_batch         = group_offset_view.size(1);
@@ -181,6 +230,17 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
     } else {
         max_blocks_per_batch = param.host_kv_cache_offset.size(1);
         offset_addr          = param.host_kv_cache_offset.data_ptr<int32_t>();
+    }
+
+    {
+        std::ostringstream oss;
+        oss << "runtimeWriteCacheStore resolved hybrid=" << pdBoolString(is_hybrid) << " group_num=" << group_num
+            << " gid=" << gid << " group_type=" << pdCacheGroupTypeString(group_type_value) << "(" << group_type_value
+            << ")"
+            << " host_offset_dim=" << param.host_kv_cache_offset.dim()
+            << " max_blocks_per_batch=" << max_blocks_per_batch
+            << " offset_addr=" << static_cast<const void*>(offset_addr);
+        pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
     }
 
     const auto seq_size_per_block = param.tokens_per_block;
@@ -196,6 +256,9 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
 
     for (size_t batch_id = 0; batch_id < param.context_batch_size; batch_id++) {
         if (*(param.request_pd_separation.data_ptr<bool>() + batch_id) == false) {
+            std::ostringstream oss;
+            oss << "skip batch because request_pd_separation=false batch_id=" << batch_id;
+            pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
             continue;
         }
         RTP_LLM_CHECK_WITH_INFO(param.prefix_lengths_host.defined() && param.input_lengths_host.defined(),
@@ -212,11 +275,25 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
         RTP_LLM_LOG_DEBUG(
             "write cache store, request id is %ld, blocks num is %ld", request_id, block_num + reuse_block_num);
 
-        CacheGroupType group_type = CacheGroupType::FULL;
-        group_type = static_cast<CacheGroupType>(param.kv_cache_group_types_host.data_ptr<int32_t>()[gid]);
+        CacheGroupType group_type = static_cast<CacheGroupType>(group_type_value);
 
         const int total_blocks = block_num + reuse_block_num;
+        {
+            std::ostringstream oss;
+            oss << "batch begin batch_id=" << batch_id << " request_id=" << request_id << " layer_id=" << param.layer_id
+                << " prefix_len=" << param.prefix_lengths_host.data_ptr<int>()[batch_id]
+                << " input_len=" << param.input_lengths_host.data_ptr<int>()[param.decoder_batch_size + batch_id]
+                << " reuse_block_num=" << reuse_block_num << " block_num=" << block_num
+                << " total_blocks=" << total_blocks << " max_blocks_per_batch=" << max_blocks_per_batch
+                << " group_type=" << pdCacheGroupTypeString(group_type_value) << "(" << group_type_value << ")"
+                << " write_mode=" << ((is_hybrid || mla_kvcache) ? "kv_combined" : "k_v_split")
+                << " kv_scale_present=" << pdBoolString(kv_scale_data != nullptr);
+            pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
+        }
         if (total_blocks <= 0) {
+            std::ostringstream oss;
+            oss << "skip batch because total_blocks<=0 batch_id=" << batch_id << " request_id=" << request_id;
+            pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
             continue;
         }
 
@@ -233,8 +310,25 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
             void*                 kv_addr = (void*)((int8_t*)kv_cache_data + block_id * param.kv_block_stride_bytes);
             std::shared_ptr<void> kv_block_addr(kv_addr, [](void* p) {});
 
+            {
+                std::ostringstream oss;
+                oss << "addBlock logical batch_id=" << batch_id << " request_id=" << request_id
+                    << " layer_id=" << param.layer_id << " index=" << index << " block_id=" << block_id
+                    << " cache_key=" << cache_key
+                    << " group_type=" << pdCacheGroupTypeString(static_cast<int32_t>(group_type)) << "("
+                    << static_cast<int32_t>(group_type) << ")"
+                    << " write_mode=" << ((is_hybrid || mla_kvcache) ? "kv_combined" : "k_v_split")
+                    << " kv_bytes=" << param.kv_block_stride_bytes << " scale_bytes=" << param.kv_scale_stride_bytes
+                    << " kv_scale_present=" << pdBoolString(kv_scale_data != nullptr);
+                pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
+            }
+
             if (is_hybrid || mla_kvcache) {
                 request_blocks->addBlock("kv_" + cache_key, kv_block_addr, param.kv_block_stride_bytes, true, true);
+                std::ostringstream oss;
+                oss << "addBlock actual key=kv_" << cache_key << " bytes=" << param.kv_block_stride_bytes
+                    << " request_id=" << request_id << " layer_id=" << param.layer_id;
+                pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
             } else {
                 const uint32_t        kv_half = static_cast<uint32_t>(param.kv_block_stride_bytes / 2);
                 void*                 k_addr  = kv_addr;
@@ -243,6 +337,10 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
                 std::shared_ptr<void> v_block_addr(v_addr, [](void* p) {});
                 request_blocks->addBlock("k_" + cache_key, k_block_addr, kv_half, true, true);
                 request_blocks->addBlock("v_" + cache_key, v_block_addr, kv_half, true, true);
+                std::ostringstream oss;
+                oss << "addBlock actual keys=k_" << cache_key << ",v_" << cache_key << " bytes_each=" << kv_half
+                    << " request_id=" << request_id << " layer_id=" << param.layer_id;
+                pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
             }
 
             if (kv_scale_data) {
@@ -251,6 +349,10 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
                 if (is_hybrid || mla_kvcache) {
                     request_blocks->addBlock(
                         "kv_scale_" + cache_key, kv_scale_block_addr, param.kv_scale_stride_bytes, true, true);
+                    std::ostringstream oss;
+                    oss << "addBlock actual key=kv_scale_" << cache_key << " bytes=" << param.kv_scale_stride_bytes
+                        << " request_id=" << request_id << " layer_id=" << param.layer_id;
+                    pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
                 } else {
                     const uint32_t        sc_half = static_cast<uint32_t>(param.kv_scale_stride_bytes / 2);
                     void*                 k_sc    = kv_scale_addr;
@@ -259,6 +361,10 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
                     std::shared_ptr<void> v_scale_block_addr(v_sc, [](void* p) {});
                     request_blocks->addBlock("k_scale_" + cache_key, k_scale_block_addr, sc_half, true, true);
                     request_blocks->addBlock("v_scale_" + cache_key, v_scale_block_addr, sc_half, true, true);
+                    std::ostringstream oss;
+                    oss << "addBlock actual keys=k_scale_" << cache_key << ",v_scale_" << cache_key
+                        << " bytes_each=" << sc_half << " request_id=" << request_id << " layer_id=" << param.layer_id;
+                    pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
                 }
             }
         };
@@ -271,7 +377,21 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
             }
         }
 
+        {
+            std::ostringstream oss;
+            oss << "store request_blocks request_id=" << request_id << " layer_id=" << param.layer_id
+                << " logical_total_blocks=" << total_blocks
+                << " stored_block_count=" << request_blocks->getBlocksCount()
+                << " stored_bytes=" << request_blocks->getBlocksSize();
+            pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
+        }
+
         auto storeCallback = [layer_id = param.layer_id, request_id](bool success, CacheStoreErrorCode ec) {
+            std::ostringstream oss;
+            oss << "store callback request_id=" << request_id << " layer_id=" << layer_id
+                << " success=" << pdBoolString(success) << " ec=" << static_cast<int>(ec)
+                << " error=" << ErrorCodeToString(transCacheStoreErrorCode(ec));
+            pdMtpDebugLog("ExecOps::runtimeWriteCacheStore", oss.str());
             if (!success) {
                 RTP_LLM_LOG_WARNING(
                     "query [%ld], layer id [%d], call store kv cache failed, ec is %d, error msg is [%s]",
@@ -284,7 +404,6 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
         cache_store->store(request_blocks, storeCallback);
     }
 }
-
 // ============================================================
 // Static ops (weight preprocessing)
 // ============================================================

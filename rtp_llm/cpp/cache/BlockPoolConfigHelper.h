@@ -1,7 +1,10 @@
 #pragma once
 
+#include <sstream>
+
 #include "rtp_llm/cpp/cache/CacheConfig.h"
 #include "rtp_llm/cpp/cache/BlockPoolConfig.h"
+#include "rtp_llm/cpp/utils/PdSeparationDebug.h"
 
 namespace rtp_llm {
 
@@ -29,6 +32,15 @@ public:
                                                                   cache_config.kv_scale_stride_bytes,
                                                                   main_spec,
                                                                   cache_config);
+        {
+            std::ostringstream oss;
+            oss << "create block pool main layout is_hybrid=" << is_hybrid << " group_nums=" << cache_config.groupNums()
+                << " layer_num=" << layer_num << " layer_all_num=" << cache_config.layer_all_num
+                << " kv_stride=" << cache_config.kv_block_stride_bytes
+                << " scale_stride=" << cache_config.kv_scale_stride_bytes << " block_num=" << cache_config.block_num
+                << " mtp_sub_configs=" << cache_config.mtp_sub_configs.size();
+            pdMtpDebugLog("BlockPoolConfigHelper", oss.str());
+        }
 
         main_layout.kv_cache_offset_bytes = 0;
         main_layout.kv_scale_offset_bytes = main_layout.kv_cache_offset_bytes + main_layout.kv_block_pool_size_bytes;
@@ -55,6 +67,16 @@ public:
                                                                      mtp_spec->scale_block_size_bytes(),
                                                                      mtp_spec,
                                                                      cache_config);
+            {
+                std::ostringstream oss;
+                oss << "create block pool mtp layout idx=" << i << " mtp_layer_num=" << mtp_layer_num
+                    << " spec_type=" << KVCacheSpecTypeToString(mtp_spec->type)
+                    << " local_head_num_kv=" << mtp_spec->local_head_num_kv
+                    << " kv_stride=" << mtp_spec->block_size_bytes()
+                    << " scale_stride=" << mtp_spec->scale_block_size_bytes() << " current_offset=" << current_offset
+                    << " enable_hybrid_attention=false";
+                pdMtpDebugLog("BlockPoolConfigHelper", oss.str());
+            }
 
             mtp_layout.kv_cache_offset_bytes = current_offset;
             RTP_LLM_LOG_INFO("mtp_layout.kv_block_pool_size_bytes = %ld", mtp_layout.kv_block_pool_size_bytes);
