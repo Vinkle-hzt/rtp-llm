@@ -10,6 +10,7 @@
 #include <vector>
 #include "rtp_llm/cpp/pybind/PyUtils.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -79,9 +80,41 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs");
     DevicePerfWrapper            wrapper(enable_device_perf_, "py model buildPyAttentionInputs");
     torch_ext::PyAttentionInputs py_attn_inputs;
-    py_attn_inputs.prefix_lengths   = inputs.prefix_lengths;
-    py_attn_inputs.sequence_lengths = inputs.sequence_lengths;
-    py_attn_inputs.input_lengths    = inputs.input_lengths;
+    auto normalize_length_host = [this](const torch::Tensor& tensor) -> torch::Tensor {
+        if (!tensor.defined() || tensor.device().is_cpu()) {
+            return tensor;
+        }
+        // TODO(async): Python/CUDA-graph attention metadata still has CPU
+        // consumers. Materialize an explicit host mirror until those consumers
+        // accept device-resident lengths.
+        auto host_tensor = tensor.numel() == 0 ?
+                               torch::empty(tensor.sizes(),
+                                            torch::TensorOptions(tensor.dtype()).device(torch::kCPU).pinned_memory(true)) :
+                               tensor.cpu().pin_memory();
+        buffer_holder_.hold_host(host_tensor);
+        return host_tensor;
+    };
+    auto length_plus_one_device = [this](const torch::Tensor& tensor) -> torch::Tensor {
+        if (!tensor.defined()) {
+            return tensor;
+        }
+        if (tensor.device().is_cuda()) {
+            return (tensor + 1).to(torch::kInt32);
+        }
+        auto tensor_plus_1 = (tensor + 1).pin_memory();
+        return tensorHoldHostAndToCuda(tensor_plus_1);
+    };
+
+    const auto prefix_lengths_src   = inputs.prefix_lengths;
+    const auto sequence_lengths_src = inputs.sequence_lengths;
+    const auto input_lengths_src    = inputs.input_lengths;
+
+    // PyAttentionInputs still carries CPU mirrors for CUDA graph H2H updates
+    // and legacy Python attention code, while *_d fields below preserve the
+    // device-first GptModelInputs contract.
+    py_attn_inputs.prefix_lengths   = normalize_length_host(prefix_lengths_src);
+    py_attn_inputs.sequence_lengths = normalize_length_host(sequence_lengths_src);
+    py_attn_inputs.input_lengths    = normalize_length_host(input_lengths_src);
 
     if (inputs.kv_cache_kernel_block_id.defined()) {
         py_attn_inputs.kv_cache_kernel_block_id_host = inputs.kv_cache_kernel_block_id.clone().pin_memory();
@@ -156,16 +189,14 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     }
 
     // create device tensors
-    py_attn_inputs.prefix_lengths_d = tensorHoldHostAndToCuda(py_attn_inputs.prefix_lengths);
-    py_attn_inputs.input_lengths_d  = tensorHoldHostAndToCuda(py_attn_inputs.input_lengths);
+    py_attn_inputs.prefix_lengths_d = tensorHoldHostAndToCuda(prefix_lengths_src);
+    py_attn_inputs.input_lengths_d  = tensorHoldHostAndToCuda(input_lengths_src);
 
     // In qwen3-next target verify mode, sequence_lengths_plus_1_d uses prefix_lengths
     if (py_attn_inputs.is_target_verify) {
-        auto sequence_lengths_plus_1             = (py_attn_inputs.prefix_lengths + 1).pin_memory();
-        py_attn_inputs.sequence_lengths_plus_1_d = tensorHoldHostAndToCuda(sequence_lengths_plus_1);
+        py_attn_inputs.sequence_lengths_plus_1_d = length_plus_one_device(prefix_lengths_src);
     } else {
-        auto sequence_lengths_plus_1             = (py_attn_inputs.sequence_lengths + 1).pin_memory();
-        py_attn_inputs.sequence_lengths_plus_1_d = tensorHoldHostAndToCuda(sequence_lengths_plus_1);
+        py_attn_inputs.sequence_lengths_plus_1_d = length_plus_one_device(sequence_lengths_src);
     }
 
     return py_attn_inputs;
@@ -656,12 +687,16 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
     if (lm_head) {
         printTorchTensorData(lm_output_indexes, "lm_output_indexes");
 
-        buffer_holder_.hold_host(lm_output_indexes);
-        auto lm_output_indexes_device = lm_output_indexes.to(torch::kCUDA, /*non_blocking=*/true);
+        RTP_LLM_CHECK_WITH_INFO(lm_output_indexes.defined() && lm_output_indexes.is_cuda(),
+                                "lm_output_indexes must be a CUDA tensor before forwardPostLayers, got defined=%d "
+                                "device=%s",
+                                static_cast<int>(lm_output_indexes.defined()),
+                                lm_output_indexes.defined() ? lm_output_indexes.device().str().c_str() : "undefined");
+        auto lm_output_indexes_device = lm_output_indexes.to(torch::kLong).contiguous();
 
         torch::Tensor last_hidden;
         if (has_context_request && !need_all_logits) {
-            last_hidden = torch::index_select(hidden, 0, lm_output_indexes_device.to(torch::kLong));
+            last_hidden = torch::index_select(hidden, 0, lm_output_indexes_device);
         } else {
             last_hidden = hidden;
         }
@@ -679,7 +714,7 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
         }
         torch::Tensor softmax_result_t;
         if (need_all_logits) {
-            auto last_logits = torch::index_select(logits, 0, lm_output_indexes_device.to(torch::kLong));
+            auto last_logits = torch::index_select(logits, 0, lm_output_indexes_device);
             return {last_logits, last_hidden, hidden, logits, softmax_result_t};
         }
 
@@ -813,17 +848,12 @@ PyWrappedModel::splitInputsIntoMicroBatches(const GptModelInputs& inputs, const 
                     inputs.attention_mask.defined() ?
                         inputs.attention_mask.narrow(0, sliced_batch_idx, total_batch_size) :
                         torch::Tensor();
-                micro_model_inputs.lm_output_lengths =
-                    inputs.lm_output_lengths.narrow(0, sliced_batch_idx, total_batch_size);
                 int32_t slice_token_num =
                     std::accumulate(micro_model_inputs.input_lengths.data_ptr<int32_t>() + d_micro_batch_size,
                                     micro_model_inputs.input_lengths.data_ptr<int32_t>() + total_batch_size,
                                     0)
                     + d_micro_batch_size;
-                int32_t slice_lm_output_num =
-                    std::accumulate(micro_model_inputs.lm_output_lengths.data_ptr<int32_t>(),
-                                    micro_model_inputs.lm_output_lengths.data_ptr<int32_t>() + total_batch_size,
-                                    0);
+                int32_t slice_lm_output_num = total_batch_size;
                 micro_model_inputs.lm_output_indexes =
                     inputs.lm_output_indexes.narrow(0, sliced_lm_output_index, slice_lm_output_num);
                 micro_model_inputs.combo_tokens = inputs.combo_tokens.narrow(0, sliced_token_idx, slice_token_num);
@@ -902,16 +932,11 @@ PyWrappedModel::splitInputsIntoMicroBatches(const GptModelInputs& inputs, const 
                         torch::Tensor();
                 micro_model_inputs.sequence_lengths =
                     torch::empty({0}, torch::TensorOptions(torch::kInt32).device(torch::kCPU));
-                micro_model_inputs.lm_output_lengths =
-                    inputs.lm_output_lengths.narrow(0, sliced_batch_idx, p_micro_batch_size);
                 int32_t slice_token_num =
                     std::accumulate(micro_model_inputs.input_lengths.data_ptr<int32_t>(),
                                     micro_model_inputs.input_lengths.data_ptr<int32_t>() + p_micro_batch_size,
                                     0);
-                int32_t slice_lm_output_num =
-                    std::accumulate(micro_model_inputs.lm_output_lengths.data_ptr<int32_t>(),
-                                    micro_model_inputs.lm_output_lengths.data_ptr<int32_t>() + p_micro_batch_size,
-                                    0);
+                int32_t slice_lm_output_num = p_micro_batch_size;
                 micro_model_inputs.lm_output_indexes =
                     inputs.lm_output_indexes.narrow(0, sliced_lm_output_index, slice_lm_output_num);
                 micro_model_inputs.combo_tokens = inputs.combo_tokens.narrow(0, sliced_token_idx, slice_token_num);
@@ -948,7 +973,6 @@ void PyWrappedModel::holdInputsHostBuffers(const GptModelInputs& inputs) {
     buffer_holder_.hold_host(inputs.input_lengths);
     buffer_holder_.hold_host(inputs.sequence_lengths);
     buffer_holder_.hold_host(inputs.lm_output_indexes);
-    buffer_holder_.hold_host(inputs.lm_output_lengths);
     buffer_holder_.hold_host(inputs.prefix_lengths);
 
     buffer_holder_.hold_host(inputs.combo_position_ids);

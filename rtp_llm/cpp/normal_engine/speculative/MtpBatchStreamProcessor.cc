@@ -4,10 +4,36 @@
 #include "rtp_llm/cpp/utils/TensorDebugUtils.h"
 #include "rtp_llm/cpp/utils/StringUtil.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
+#include <cstdlib>
 #include <numeric>
+#include <string>
 #include <cstring>
 
 namespace rtp_llm {
+
+namespace {
+
+bool useMtpDeviceInput() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_MTP_DEVICE_INPUT");
+        bool        on  = (env != nullptr && std::string(env) == "1");
+        RTP_LLM_LOG_INFO("[mtp-device-input] RTP_LLM_MTP_DEVICE_INPUT=%s -> processor enabled=%d",
+                         env ? env : "(unset)",
+                         static_cast<int>(on));
+        return on;
+    }();
+    return enabled;
+}
+
+torch::Tensor emptyInt32OnPreferredDevice(std::initializer_list<int64_t> shape) {
+    auto options = torch::TensorOptions().dtype(torch::kInt32).device(useMtpDeviceInput() ? torch::kCUDA : torch::kCPU);
+    if (!useMtpDeviceInput()) {
+        options = options.pinned_memory(true);
+    }
+    return torch::empty(shape, options);
+}
+
+}  // namespace
 
 absl::Status MtpBatchStreamProcessor::dispatchPrefill(const StreamGroups& stream_groups,
                                                       const MergedOutput& prefill_output,
@@ -106,6 +132,8 @@ absl::StatusOr<SamplerInputs> MtpBatchStreamProcessor::gatherSpecSamplerInput(
 
     sampler_inputs.logits = model_output.logits.clone();
 
+    // TODO(async): debug formatting is CPU-only. Keep the .cpu() explicit
+    // and do not route this through the model-input fast path.
     RTP_LLM_LOG_DEBUG("sampler inputs logits [%s]",
                       tensorDebugStringWithData<float>(sampler_inputs.logits.cpu(), 10).c_str());
 
@@ -129,8 +157,9 @@ void MtpBatchStreamProcessor::updateProposeTokens(const StreamGroups&           
     const int          token_stride = propose_token_ids.size(1);
     const torch::Dtype dtype        = propose_token_ids.scalar_type();
 
-    // Lazy CPU mirror: only built when at least one stream needs the int draft_token
-    // (i.e. when we cannot rely on draft_token_gpu downstream).
+    // TODO(async): lazy CPU mirror is only built when at least one stream
+    // needs the legacy int draft_token. Remove after downstream paths consume
+    // draft_token_gpu exclusively.
     torch::Tensor propose_token_ids_h;
     auto          ensure_cpu_mirror = [&]() -> const torch::Tensor& {
         if (!propose_token_ids_h.defined()) {
@@ -194,7 +223,7 @@ void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& s
     if (batch_size == 0) {
         model_input.combo_tokens = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
         model_input.lm_output_indexes =
-            torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+            torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
         return;
     }
 
@@ -216,11 +245,17 @@ void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& s
         }
         if (stream_async_eligible) {
             std::vector<torch::Tensor> propose_slices_gpu;
+            std::vector<torch::Tensor> sequence_lengths_gpu;
             propose_slices_gpu.reserve(batch_size);
+            sequence_lengths_gpu.reserve(batch_size);
             for (const auto& stream : all_streams) {
                 const auto& gpu_t    = stream->getProposeTokensGpu();
                 const int   last_col = static_cast<int>(gpu_t.size(-1)) - 1;
                 propose_slices_gpu.push_back(gpu_t.select(-1, last_col).reshape({-1}));
+                const auto& next_seq_len = stream->getNextSeqLenGpu();
+                if (next_seq_len.defined() && next_seq_len.is_cuda()) {
+                    sequence_lengths_gpu.push_back(next_seq_len);
+                }
             }
             auto combo_tokens_gpu = torch::cat(propose_slices_gpu, 0).to(torch::kInt32);
             auto lm_output_indexes_gpu =
@@ -229,6 +264,12 @@ void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& s
                               torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
             model_input.combo_tokens      = std::move(combo_tokens_gpu);
             model_input.lm_output_indexes = std::move(lm_output_indexes_gpu);
+            model_input.prefix_lengths    = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+            if (sequence_lengths_gpu.size() == batch_size) {
+                model_input.sequence_lengths = (torch::cat(sequence_lengths_gpu, 0) - 1).to(torch::kInt32);
+            } else if (model_input.sequence_lengths.defined() && !model_input.sequence_lengths.is_cuda()) {
+                model_input.sequence_lengths = model_input.sequence_lengths.to(torch::kCUDA);
+            }
             return;
         }
     }
@@ -260,20 +301,21 @@ void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& s
         return;
     }
 
-    // Legacy CPU fallback path (unchanged behaviour).
+    // TODO(async): legacy fallback still reads propose tokens from CPU stream
+    // buffers. lm_output_indexes itself is device-only because the model only
+    // needs it for CUDA-side index_select.
     int  batch_idx         = 0;
     auto combo_tokens      = torch::empty({(int64_t)batch_size}, torch::kInt32).pin_memory();
-    auto lm_output_indexes = torch::empty({(int64_t)batch_size}, torch::kInt32).pin_memory();
 
     for (const auto& stream : stream_groups.allStreams()) {
-        int propose_token                            = stream->getSPOutputBuffer()->tokens.data_ptr<int>()[1];
-        combo_tokens.data_ptr<int>()[batch_idx]      = propose_token;
-        lm_output_indexes.data_ptr<int>()[batch_idx] = batch_idx;
+        int propose_token                       = stream->getSPOutputBuffer()->tokens.data_ptr<int>()[1];
+        combo_tokens.data_ptr<int>()[batch_idx] = propose_token;
         batch_idx++;
     }
 
     model_input.combo_tokens      = std::move(combo_tokens);
-    model_input.lm_output_indexes = std::move(lm_output_indexes);
+    model_input.lm_output_indexes = torch::arange(
+        0, static_cast<int64_t>(batch_size), torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
 }
 
 void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGroups& stream_groups,
@@ -348,7 +390,7 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
             // Kept on GPU; downstream forward must handle device-resident
             // prefix_lengths or sync as needed (Commit 4+ refines this).
             model_input.prefix_lengths     = (next_seq_len_gpu_concat - 1).to(torch::kInt32);
-            model_input.sequence_lengths   = torch::empty({0}, torch::kInt32);
+            model_input.sequence_lengths   = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
             model_input.last_hidden_states = torch::Tensor();
             model_input.input_lengths      = torch::full({(int64_t)batch_size},
                                                     static_cast<int64_t>(propose_step_ + 1),
@@ -395,7 +437,9 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
         model_input.prefix_lengths     = model_input.sequence_lengths.is_cuda() ?
                                              model_input.sequence_lengths.clone() :
                                              model_input.sequence_lengths.clone().pin_memory();
-        model_input.sequence_lengths   = torch::empty({0}, torch::kInt32);
+        model_input.sequence_lengths   = useMtpDeviceInput() ?
+                                             torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA)) :
+                                             torch::empty({0}, torch::kInt32);
         model_input.last_hidden_states = torch::Tensor();
 
         // input_lengths and lm_output_indexes can be assembled fully on GPU.
@@ -408,7 +452,9 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
         return;
     }
 
-    // Legacy CPU fallback (unchanged).
+    // TODO(async): legacy fallback still rebuilds verify input through CPU
+    // stream buffers. Keep the forced .cpu() explicit until every stream has
+    // accept/propose device state.
     auto target_prefix_lengths = model_input.sequence_lengths.cpu().clone().pin_memory();
     auto target_combo_tokens =
         torch::empty({(int64_t)(stream_groups.size() * (propose_step_ + 1))}, torch::kInt32).pin_memory();
@@ -432,11 +478,10 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
         model_input.input_lengths.data_ptr<int>()[i] = propose_step_ + 1;
     }
 
-    auto lm_output_indexes = torch::empty({(int64_t)(batch_size * (propose_step_ + 1))}, torch::kInt32).pin_memory();
-    for (int i = 0; i < batch_size * (propose_step_ + 1); i++) {
-        lm_output_indexes.data_ptr<int>()[i] = i;
-    }
-    model_input.lm_output_indexes = std::move(lm_output_indexes);
+    model_input.lm_output_indexes =
+        torch::arange(0,
+                      static_cast<int64_t>(batch_size * (propose_step_ + 1)),
+                      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
 }
 
 void MtpBatchStreamProcessor::updateDecodeDraftModelInput(GptModelInputs&        model_input,
@@ -448,9 +493,17 @@ void MtpBatchStreamProcessor::updateDecodeDraftModelInput(GptModelInputs&       
     // here combo_tokens is a device buffer
     model_input.combo_tokens = draft_token_ids.reshape({batch_size});
 
-    model_input.sequence_lengths = model_input.sequence_lengths.cpu().clone().pin_memory();
-    for (int i = 0; i < batch_size; i++) {
-        model_input.sequence_lengths.data_ptr<int>()[i]++;
+    if (useMtpDeviceInput() || model_input.sequence_lengths.is_cuda()) {
+        auto seq_lengths_d =
+            model_input.sequence_lengths.is_cuda() ? model_input.sequence_lengths : model_input.sequence_lengths.to(torch::kCUDA);
+        model_input.sequence_lengths = (seq_lengths_d + 1).to(torch::kInt32);
+    } else {
+        // TODO(async): legacy draft-decode update mutates sequence lengths on
+        // CPU. The device-input path above avoids this host dependency.
+        model_input.sequence_lengths = model_input.sequence_lengths.cpu().clone().pin_memory();
+        for (int i = 0; i < batch_size; i++) {
+            model_input.sequence_lengths.data_ptr<int>()[i]++;
+        }
     }
 }
 
@@ -463,7 +516,8 @@ void MtpBatchStreamProcessor::updatePrefillPostDraftModelInput(GptModelInputs&  
     // set model_input.combo_tokens
     const size_t batch_size   = new_all_token_ids.size(0);
     const size_t token_stride = new_all_token_ids.size(1);
-    // token_ids may be a CUDA tensor; move to CPU for data_ptr access.
+    // TODO(async): data_ptr iteration below is CPU-only; keep the .cpu()
+    // explicit until prefill post-draft update is device-native.
     const torch::Tensor new_all_token_ids_cpu =
         new_all_token_ids.is_cuda() ? new_all_token_ids.cpu() : new_all_token_ids;
 
@@ -510,17 +564,45 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
                                                               SamplerOutput&      draft_sampler_output,
                                                               torch::Tensor&      draft_token_probs_d_t) {
     const size_t batch_size      = stream_groups.size();
-    auto         draft_token_ids = torch::empty({(int64_t)batch_size, (int64_t)propose_step_}, torch::kInt32);
+    auto         draft_token_ids = emptyInt32OnPreferredDevice({(int64_t)batch_size, (int64_t)propose_step_});
 
     std::vector<torch::Tensor> draft_token_probs_list;
+    std::vector<torch::Tensor> draft_token_id_slices_gpu;
     int                        batch_idx = 0;
+    bool                       all_gpu_tokens = useMtpDeviceInput() && batch_size > 0;
 
     for (const auto& stream : stream_groups.allStreams()) {
         auto sp_output_buffer                                      = stream->getSPOutputBuffer();
         auto propose_tokens                                        = sp_output_buffer->tokens.data_ptr<int>();
-        draft_token_ids.data_ptr<int>()[batch_idx * propose_step_] = propose_tokens[1];
+        const auto& propose_tokens_gpu                             = sp_output_buffer->propose_tokens_gpu;
+        if (all_gpu_tokens && propose_tokens_gpu.defined() && propose_tokens_gpu.is_cuda()) {
+            const int last_col = static_cast<int>(propose_tokens_gpu.size(-1)) - 1;
+            draft_token_id_slices_gpu.push_back(propose_tokens_gpu.select(-1, last_col).reshape({-1}));
+        } else {
+            all_gpu_tokens = false;
+        }
+        if (!draft_token_ids.is_cuda()) {
+            draft_token_ids.data_ptr<int>()[batch_idx * propose_step_] = propose_tokens[1];
+        }
         draft_token_probs_list.push_back(sp_output_buffer->all_probs);
         batch_idx++;
+    }
+
+    if (all_gpu_tokens) {
+        draft_token_ids = torch::cat(draft_token_id_slices_gpu, 0).to(torch::kInt32).reshape(
+            {(int64_t)batch_size, (int64_t)propose_step_});
+    } else if (draft_token_ids.is_cuda()) {
+        auto draft_token_ids_cpu =
+            torch::empty({(int64_t)batch_size, (int64_t)propose_step_},
+                         torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+        batch_idx = 0;
+        for (const auto& stream : stream_groups.allStreams()) {
+            auto sp_output_buffer = stream->getSPOutputBuffer();
+            auto propose_tokens   = sp_output_buffer->tokens.data_ptr<int>();
+            draft_token_ids_cpu.data_ptr<int>()[batch_idx * propose_step_] = propose_tokens[1];
+            batch_idx++;
+        }
+        draft_token_ids = draft_token_ids_cpu.to(torch::kCUDA);
     }
 
     draft_token_probs_d_t          = torch::stack(draft_token_probs_list, 0).contiguous();
@@ -571,7 +653,9 @@ void MtpBatchStreamProcessor::preparePrefillSpecUpdateInfo(const StreamGroups&  
     RTP_LLM_CHECK(total_batch_size_out == (size_t)new_all_token_ids.size(0));
     const size_t token_stride = new_all_token_ids.size(1);
 
-    // token_ids and success may be CUDA tensors; move to CPU once before iterating.
+    // TODO(async): stream bookkeeping below still iterates token_ids/success
+    // on CPU. Keep the .cpu() explicit until spec-update assembly is
+    // device-native.
     const torch::Tensor new_all_token_ids_cpu =
         new_all_token_ids.is_cuda() ? new_all_token_ids.cpu() : new_all_token_ids;
     const torch::Tensor success_cpu = sampler_output.success.defined() ? sampler_output.success.cpu() : torch::Tensor();
