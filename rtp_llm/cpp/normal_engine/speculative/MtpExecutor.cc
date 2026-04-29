@@ -27,6 +27,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <ATen/cuda/CUDAContext.h>
 
 namespace rtp_llm {
 
@@ -830,9 +831,15 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             target_verify_prepare_runner_.launch(
                 [this, input_ready_event, model_input_copy = std::move(model_input_copy)]() mutable {
                     RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_verify_prepare_attention_inputs)");
-                    input_ready_event->block(cuda_graph::graphGetCurrentStream());
+                    {
+                        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_verify_prepare_wait_input)");
+                        input_ready_event->block(cuda_graph::graphGetCurrentStream());
+                    }
                     checkMtpModelInputsOnCuda(model_input_copy, "decode.target_prepare.forwarded");
-                    model_->prepareAttentionInputs(model_input_copy);
+                    {
+                        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_verify_prepare_model_inputs)");
+                        model_->prepareAttentionInputs(model_input_copy);
+                    }
                 });
         }
 
@@ -1169,11 +1176,19 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     model_input.kv_scale_stride_bytes = mtp_cache_cfg.kv_scale_stride_bytes;
 
     GptModelOutputs            draft_decode_model_output;
-    std::vector<torch::Tensor> draft_token_ids_list;
+    std::vector<torch::Tensor> draft_token_columns;
     torch::Tensor              spec_prefix_lengths;
 
     // update TP > 0 batch_size
     size_t batch_size = model_input.combo_tokens.size(0);
+    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    auto       to_cuda_i32_flat = [&cuda_i32, batch_size](const torch::Tensor& tensor) -> torch::Tensor {
+        auto tensor_d = (tensor.is_cuda() && tensor.scalar_type() == torch::kInt32) ?
+                            tensor :
+                            tensor.to(cuda_i32, /*non_blocking=*/true);
+        tensor_d = tensor_d.reshape({static_cast<int64_t>(batch_size)});
+        return tensor_d.is_contiguous() ? tensor_d : tensor_d.contiguous();
+    };
     spec_prefix_lengths =
         model_input.sequence_lengths.defined() ?
             (model_input.sequence_lengths.is_cuda() ?
@@ -1181,11 +1196,18 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
                  model_input.sequence_lengths.to(torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA))) :
             torch::Tensor();
 
-    auto       pre_propose_token_t_raw = model_input.combo_tokens.to(torch::kCUDA, true).clone();
+    torch::Tensor pre_propose_token_t_raw;
+    {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(pre_propose_token)");
+        // Keep the original propose token tensor alive without cloning; later
+        // model_input.combo_tokens assignments do not mutate this storage.
+        pre_propose_token_t_raw = to_cuda_i32_flat(model_input.combo_tokens);
+    }
     const auto all_streams             = stream_groups.allStreams();
 
     torch::Tensor pre_target_token_t;
     if (useMtpDeviceInput()) {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(pre_target_device_gather)");
         std::vector<torch::Tensor> pre_target_slices_gpu;
         pre_target_slices_gpu.reserve(batch_size);
         bool all_device_state = true;
@@ -1212,6 +1234,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     }
 
     if (!pre_target_token_t.defined()) {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(pre_target_host_fallback)");
         auto pre_target_token =
             torch::empty({(int64_t)batch_size}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
         int batch_idx = 0;
@@ -1223,11 +1246,8 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         buffer_holder_.hold(pre_target_token);
         pre_target_token_t = pre_target_token.to(torch::kCUDA, true);
     }
-    auto pre_target_token_t_reshape = pre_target_token_t.reshape({(int)batch_size, 1});
-    draft_token_ids_list.push_back(pre_target_token_t_reshape);
-
-    auto pre_propose_token_t_reshape = pre_propose_token_t_raw.reshape({(int)batch_size, 1});
-    draft_token_ids_list.push_back(pre_propose_token_t_reshape);
+    draft_token_columns.push_back(to_cuda_i32_flat(pre_target_token_t));
+    draft_token_columns.push_back(pre_propose_token_t_raw);
 
     // n-1 steps draft model decode
     for (int i = 0; i < propose_step_ - 1; i++) {
@@ -1248,8 +1268,8 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
             draft_decode_model_output.all_hidden_states.zero_();
         }
 
-        draft_token_ids = draft_token_ids.to(torch::kInt32).to(torch::kCUDA);
-        draft_token_ids_list.push_back(draft_token_ids);
+        draft_token_ids = to_cuda_i32_flat(draft_token_ids);
+        draft_token_columns.push_back(draft_token_ids);
         draft_probs_list.push_back(draft_probs_reshape);
 
         // update model input
@@ -1262,18 +1282,47 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(build_spec_decode_input)");
         // prepare spec decode input
-        draft_token_ids_t =
-            torch::cat(draft_token_ids_list, 1).reshape({(int)batch_size, (int)(propose_step_ + 1)}).contiguous();
-
+        const auto tokens_per_batch = static_cast<int32_t>(propose_step_ + 1);
         torch::Tensor input_lengths;
-        input_lengths = torch::full({(int64_t)batch_size},
-                                    static_cast<int64_t>(propose_step_ + 1),
-                                    torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+#if USING_CUDA
+        if (tokens_per_batch <= 8) {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(build_spec_tokens_metadata_fused)");
+            draft_token_ids_t =
+                torch::empty({static_cast<int64_t>(batch_size), static_cast<int64_t>(tokens_per_batch)}, cuda_i32);
+            input_lengths = torch::empty({static_cast<int64_t>(batch_size)}, cuda_i32);
+            model_input.lm_output_indexes =
+                torch::empty({static_cast<int64_t>(batch_size * tokens_per_batch)}, cuda_i32);
+            invokeMtpSpecDecodeTokensMetadataPrepare(draft_token_columns,
+                                                     draft_token_ids_t,
+                                                     input_lengths,
+                                                     model_input.lm_output_indexes,
+                                                     tokens_per_batch,
+                                                     at::cuda::getCurrentCUDAStream().stream());
+        } else {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(build_spec_cat_tokens)");
+            draft_token_ids_t = torch::stack(draft_token_columns, 1).contiguous();
+            {
+                RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(build_spec_metadata_fused)");
+                input_lengths = torch::empty({static_cast<int64_t>(batch_size)}, cuda_i32);
+                model_input.lm_output_indexes =
+                    torch::empty({static_cast<int64_t>(batch_size * tokens_per_batch)}, cuda_i32);
+                invokeMtpSpecDecodeMetadataPrepare(input_lengths,
+                                                   model_input.lm_output_indexes,
+                                                   tokens_per_batch,
+                                                   at::cuda::getCurrentCUDAStream().stream());
+            }
+        }
+#else
+        {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(build_spec_lengths_indexes)");
+            draft_token_ids_t = torch::stack(draft_token_columns, 1).contiguous();
+            input_lengths = torch::full({(int64_t)batch_size}, static_cast<int64_t>(propose_step_ + 1), cuda_i32);
+            model_input.lm_output_indexes =
+                torch::arange(0, static_cast<int64_t>(batch_size * (propose_step_ + 1)), cuda_i32);
+        }
+#endif
 
         model_input.input_lengths      = std::move(input_lengths);
-        model_input.lm_output_indexes  = torch::arange(0,
-                                                      static_cast<int64_t>(batch_size * (propose_step_ + 1)),
-                                                      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
         model_input.prefix_lengths     = spec_prefix_lengths;
         model_input.combo_tokens       = draft_token_ids_t.reshape({(int64_t)(batch_size * (propose_step_ + 1))});
         model_input.sequence_lengths   = torch::empty({0}, torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
@@ -1283,6 +1332,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         // Since other tp ranks don't have streams, its combo_tokens' first token is not correct.
         // Thus, we need to broadcast the combo_tokens to other tp ranks.
         if (parallelism_config_.tp_size > 1) {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(build_spec_tp_broadcast)");
             execBroadcast({{model_input.combo_tokens}, 0});
         }
 

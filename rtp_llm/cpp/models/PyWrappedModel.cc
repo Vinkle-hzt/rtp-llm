@@ -106,14 +106,36 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
         auto tensor_d = to_device_i32(tensor);
         return tensor_d.numel() == 0 ? tensor_d : (tensor_d + 1).to(torch::kInt32);
     };
+    auto pinned_host_i32 = [this](const torch::Tensor& tensor) -> torch::Tensor {
+        if (!tensor.defined()) {
+            return tensor;
+        }
+        torch::Tensor host_tensor = tensor;
+        if (host_tensor.device().is_cuda()) {
+            // TODO(async): legacy cache-store and attention params still require a CPU block table.
+            host_tensor = host_tensor.cpu();
+        }
+        if (host_tensor.dtype() != torch::kInt32) {
+            host_tensor = host_tensor.to(torch::kInt32);
+        }
+        host_tensor = host_tensor.contiguous().pin_memory();
+        buffer_holder_.hold_host(host_tensor);
+        return host_tensor;
+    };
 
-    const auto prefix_lengths_src   = inputs.prefix_lengths;
-    const auto sequence_lengths_src = inputs.sequence_lengths;
-    const auto input_lengths_src    = inputs.input_lengths;
-    const auto prefix_lengths       = to_device_i32(prefix_lengths_src);
-    const auto sequence_lengths     = to_device_i32(sequence_lengths_src);
-    const auto input_lengths        = to_device_i32(input_lengths_src);
-    const auto cuda_i32             = torch::TensorOptions(torch::kInt32).device(torch::kCUDA);
+    const auto    prefix_lengths_src   = inputs.prefix_lengths;
+    const auto    sequence_lengths_src = inputs.sequence_lengths;
+    const auto    input_lengths_src    = inputs.input_lengths;
+    torch::Tensor prefix_lengths;
+    torch::Tensor sequence_lengths;
+    torch::Tensor input_lengths;
+    {
+        RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs(lengths_to_device)");
+        prefix_lengths   = to_device_i32(prefix_lengths_src);
+        sequence_lengths = to_device_i32(sequence_lengths_src);
+        input_lengths    = to_device_i32(input_lengths_src);
+    }
+    const auto cuda_i32 = torch::TensorOptions(torch::kInt32).device(torch::kCUDA);
 
     // Keep all length tensors device-resident on the model boundary. Legacy CPU
     // consumers must opt in to an explicit .cpu() with TODO(async) at the call site.
@@ -121,11 +143,13 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     py_attn_inputs.sequence_lengths = sequence_lengths;
     py_attn_inputs.input_lengths    = input_lengths;
 
-    if (inputs.kv_cache_kernel_block_id.defined()) {
-        py_attn_inputs.kv_cache_kernel_block_id_host = inputs.kv_cache_kernel_block_id.clone().pin_memory();
+    if (inputs.kv_cache_kernel_block_id.defined() && inputs.kv_cache_kernel_block_id.dim() != 3) {
+        RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs(kv_kernel_block_host)");
+        py_attn_inputs.kv_cache_kernel_block_id_host = pinned_host_i32(inputs.kv_cache_kernel_block_id);
     }
     if (inputs.kv_cache_block_id.defined()) {
-        py_attn_inputs.kv_cache_block_id_host = inputs.kv_cache_block_id.clone().pin_memory();
+        RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs(kv_block_host)");
+        py_attn_inputs.kv_cache_block_id_host = pinned_host_i32(inputs.kv_cache_block_id);
     }
     if (inputs.kv_cache_layer_to_group.defined()) {
         py_attn_inputs.kv_cache_layer_to_group = inputs.kv_cache_layer_to_group;
@@ -162,6 +186,7 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
                             decode_batch_size);
 
     if (context_batch_size > 0) {
+        RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs(context_metadata)");
         py_attn_inputs.total_tokens = inputs.combo_tokens.defined() ? static_cast<int>(inputs.combo_tokens.size(0)) : 0;
         // TODO(async): context_total_kv_length is still a legacy CPU scalar.
         // The exact value for non-zero prefix lengths is available as
@@ -189,12 +214,15 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     }
 
     // In qwen3-next target verify mode, sequence_lengths_plus_1_d uses prefix_lengths
-    if (py_attn_inputs.is_target_verify && inputs.sequence_lengths_plus_1.defined()) {
-        py_attn_inputs.sequence_lengths_plus_1_d = to_device_i32(inputs.sequence_lengths_plus_1);
-    } else if (py_attn_inputs.is_target_verify) {
-        py_attn_inputs.sequence_lengths_plus_1_d = length_plus_one_device(prefix_lengths_src);
-    } else {
-        py_attn_inputs.sequence_lengths_plus_1_d = length_plus_one_device(sequence_lengths_src);
+    {
+        RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs(sequence_lengths_plus_1)");
+        if (py_attn_inputs.is_target_verify && inputs.sequence_lengths_plus_1.defined()) {
+            py_attn_inputs.sequence_lengths_plus_1_d = to_device_i32(inputs.sequence_lengths_plus_1);
+        } else if (py_attn_inputs.is_target_verify) {
+            py_attn_inputs.sequence_lengths_plus_1_d = length_plus_one_device(prefix_lengths_src);
+        } else {
+            py_attn_inputs.sequence_lengths_plus_1_d = length_plus_one_device(sequence_lengths_src);
+        }
     }
 
     return py_attn_inputs;
