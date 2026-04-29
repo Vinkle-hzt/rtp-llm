@@ -913,17 +913,19 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     size_t batch_size   = model_input.combo_tokens.size(0);
     spec_prefix_lengths = model_input.sequence_lengths.cpu().clone().pin_memory();
 
-    auto pre_propose_token_t_raw = model_input.combo_tokens.to(torch::kCUDA).clone();
+    auto pre_propose_token_t_raw = model_input.combo_tokens.to(torch::kCUDA, true).clone();
 
-    auto pre_target_token = torch::empty({(int64_t)batch_size}, torch::kInt32);
-    int  batch_idx        = 0;
+    auto pre_target_token =
+        torch::empty({(int64_t)batch_size}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+    int batch_idx = 0;
     for (const auto& stream : stream_groups.allStreams()) {
         int* propose_tokens                         = stream->getSPOutputBuffer()->tokens.data_ptr<int>();
         pre_target_token.data_ptr<int>()[batch_idx] = propose_tokens[0];
         batch_idx++;
     }
 
-    auto pre_target_token_t         = pre_target_token.to(torch::kCUDA);
+    buffer_holder_.hold(pre_target_token);
+    auto pre_target_token_t         = pre_target_token.to(torch::kCUDA, true);
     auto pre_target_token_t_reshape = pre_target_token_t.reshape({(int)batch_size, 1});
     draft_token_ids_list.push_back(pre_target_token_t_reshape);
 
