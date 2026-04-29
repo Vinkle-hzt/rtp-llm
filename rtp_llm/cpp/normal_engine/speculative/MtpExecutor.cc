@@ -778,6 +778,11 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                               batch_size * (propose_step_ + 1),
                               propose_step_ + 1,
                               torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+            // Async prepare only needs the token count for metadata/cudagraph sizing.
+            // The actual target-verify token ids are produced by draftModelDecode below.
+            model_input_copy.combo_tokens = torch::empty(
+                {static_cast<int64_t>(batch_size * (propose_step_ + 1))},
+                torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
             model_input_copy.prefix_lengths =
                 model_input.sequence_lengths.is_cuda() ?
                     model_input.sequence_lengths.clone() :
