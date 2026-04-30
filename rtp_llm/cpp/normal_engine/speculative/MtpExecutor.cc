@@ -69,9 +69,8 @@ void MtpExecutor::ensureMtpModelInputsOnCuda(GptModelInputs& model_input, const 
             return;
         }
         if (!tensor.is_pinned()) {
-            RTP_LLM_LOG_WARNING("[mtp-device-input] %s.%s is CPU but not pinned; H2D falls back to blocking copy",
-                                tag,
-                                name);
+            RTP_LLM_LOG_WARNING(
+                "[mtp-device-input] %s.%s is CPU but not pinned; H2D falls back to blocking copy", tag, name);
             tensor = tensor.to(torch::kCUDA);
             return;
         }
@@ -773,35 +772,33 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             model_input_copy.input_lengths =
                 torch::full({(long)batch_size},
                             (long)(propose_step_ + 1),
-                            torch::TensorOptions().dtype(torch::kInt32).device(useMtpDeviceInput() ? torch::kCUDA :
-                                                                                                      torch::kCPU)
-                                .pinned_memory(!useMtpDeviceInput()));
+                            torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
             model_input_copy.lm_output_indexes =
                 torch::arange(0,
                               batch_size * (propose_step_ + 1),
                               propose_step_ + 1,
                               torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-            model_input_copy.prefix_lengths     = useMtpDeviceInput() ? model_input.sequence_lengths.clone() :
-                                                                        model_input.sequence_lengths.clone().pin_memory();
+            model_input_copy.prefix_lengths =
+                model_input.sequence_lengths.is_cuda() ?
+                    model_input.sequence_lengths.clone() :
+                    model_input.sequence_lengths.to(torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
             model_input_copy.last_hidden_states = torch::Tensor();
-            model_input_copy.sequence_lengths   = torch::empty(
-                {0}, torch::TensorOptions().dtype(torch::kInt32).device(useMtpDeviceInput() ? torch::kCUDA :
-                                                                                               torch::kCPU));
-            model_input_copy.is_target_verify   = true;
+            model_input_copy.sequence_lengths =
+                torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+            model_input_copy.is_target_verify = true;
             ensureMtpModelInputsOnCuda(model_input_copy, "decode.target_prepare");
 
             // Device-first inputs are produced on the main stream; the async
             // prepare stream must wait before it materializes CPU mirrors.
             auto input_ready_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
             input_ready_event->record(cuda_graph::graphGetCurrentStream());
-            target_verify_prepare_runner_.launch([this,
-                                                  input_ready_event,
-                                                  model_input_copy = std::move(model_input_copy)]() mutable {
-                RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_verify_prepare_attention_inputs)");
-                input_ready_event->block(cuda_graph::graphGetCurrentStream());
-                checkMtpModelInputsOnCuda(model_input_copy, "decode.target_prepare.forwarded");
-                model_->prepareAttentionInputs(model_input_copy);
-            });
+            target_verify_prepare_runner_.launch(
+                [this, input_ready_event, model_input_copy = std::move(model_input_copy)]() mutable {
+                    RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_verify_prepare_attention_inputs)");
+                    input_ready_event->block(cuda_graph::graphGetCurrentStream());
+                    checkMtpModelInputsOnCuda(model_input_copy, "decode.target_prepare.forwarded");
+                    model_->prepareAttentionInputs(model_input_copy);
+                });
         }
 
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
@@ -829,15 +826,13 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         // prepare stream must wait before it materializes CPU mirrors.
         auto input_ready_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
         input_ready_event->record(cuda_graph::graphGetCurrentStream());
-        draft_prefill_prepare_runner_.launch([this,
-                                              prefill_model,
-                                              input_ready_event,
-                                              model_input_copy = std::move(model_input_copy)]() mutable {
-            RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_draft_prefill_input)");
-            input_ready_event->block(cuda_graph::graphGetCurrentStream());
-            checkMtpModelInputsOnCuda(model_input_copy, "decode.draft_prefill_prepare.forwarded");
-            prefill_model->prepareAttentionInputs(model_input_copy);
-        });
+        draft_prefill_prepare_runner_.launch(
+            [this, prefill_model, input_ready_event, model_input_copy = std::move(model_input_copy)]() mutable {
+                RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_draft_prefill_input)");
+                input_ready_event->block(cuda_graph::graphGetCurrentStream());
+                checkMtpModelInputsOnCuda(model_input_copy, "decode.draft_prefill_prepare.forwarded");
+                prefill_model->prepareAttentionInputs(model_input_copy);
+            });
     }
 
     {
@@ -1143,11 +1138,16 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     torch::Tensor              spec_prefix_lengths;
 
     // update TP > 0 batch_size
-    size_t batch_size   = model_input.combo_tokens.size(0);
-    spec_prefix_lengths = model_input.sequence_lengths.defined() ? model_input.sequence_lengths.clone() : torch::Tensor();
+    size_t batch_size = model_input.combo_tokens.size(0);
+    spec_prefix_lengths =
+        model_input.sequence_lengths.defined() ?
+            (model_input.sequence_lengths.is_cuda() ?
+                 model_input.sequence_lengths.clone() :
+                 model_input.sequence_lengths.to(torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA))) :
+            torch::Tensor();
 
-    auto pre_propose_token_t_raw = model_input.combo_tokens.to(torch::kCUDA, true).clone();
-    const auto all_streams = stream_groups.allStreams();
+    auto       pre_propose_token_t_raw = model_input.combo_tokens.to(torch::kCUDA, true).clone();
+    const auto all_streams             = stream_groups.allStreams();
 
     torch::Tensor pre_target_token_t;
     if (useMtpDeviceInput()) {
@@ -1157,7 +1157,8 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         for (const auto& stream : all_streams) {
             const auto& accept_tokens = stream->getAcceptTokensGpu();
             const auto& accept_len    = stream->getAcceptLenGpu();
-            if (!accept_tokens.defined() || !accept_tokens.is_cuda() || !accept_len.defined() || !accept_len.is_cuda()) {
+            if (!accept_tokens.defined() || !accept_tokens.is_cuda() || !accept_len.defined()
+                || !accept_len.is_cuda()) {
                 all_device_state = false;
                 break;
             }
@@ -1230,31 +1231,17 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
             torch::cat(draft_token_ids_list, 1).reshape({(int)batch_size, (int)(propose_step_ + 1)}).contiguous();
 
         torch::Tensor input_lengths;
-        if (useMtpDeviceInput()) {
-            input_lengths = torch::full({(int64_t)batch_size},
-                                        static_cast<int64_t>(propose_step_ + 1),
-                                        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-        } else {
-            input_lengths = torch::empty({(int64_t)batch_size},
-                                         torch::TensorOptions(torch::kInt32).device(torch::kCPU).pinned_memory(true));
+        input_lengths = torch::full({(int64_t)batch_size},
+                                    static_cast<int64_t>(propose_step_ + 1),
+                                    torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
 
-            for (int i = 0; i < batch_size; i++) {
-                input_lengths.data_ptr<int>()[i] = propose_step_ + 1;
-            }
-        }
-
-        model_input.input_lengths     = std::move(input_lengths);
-        model_input.lm_output_indexes =
-            torch::arange(0,
-                          static_cast<int64_t>(batch_size * (propose_step_ + 1)),
-                          torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-        model_input.prefix_lengths    = spec_prefix_lengths;
-        model_input.combo_tokens      = draft_token_ids_t.reshape({(int64_t)(batch_size * (propose_step_ + 1))});
-        model_input.sequence_lengths =
-            torch::empty({0},
-                         torch::TensorOptions(torch::kInt32)
-                             .device(useMtpDeviceInput() ? torch::kCUDA : torch::kCPU)
-                             .pinned_memory(!useMtpDeviceInput()));
+        model_input.input_lengths      = std::move(input_lengths);
+        model_input.lm_output_indexes  = torch::arange(0,
+                                                      static_cast<int64_t>(batch_size * (propose_step_ + 1)),
+                                                      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+        model_input.prefix_lengths     = spec_prefix_lengths;
+        model_input.combo_tokens       = draft_token_ids_t.reshape({(int64_t)(batch_size * (propose_step_ + 1))});
+        model_input.sequence_lengths   = torch::empty({0}, torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
         model_input.last_hidden_states = torch::Tensor();
         ensureMtpModelInputsOnCuda(model_input, "draft_decode.build_spec_decode_input");
 
