@@ -672,25 +672,31 @@ sliceKvCacheBlockIdByBatch(const torch::Tensor& kv_cache_block_id, size_t batch_
 }
 
 torch::Tensor PyWrappedModel::tpSyncEmbeddingOrLogits(const torch::Tensor& input) {
-    const auto tp_size     = device_props_.tp_size;
-    const auto tp_rank     = device_props_.tp_rank;
-    const auto rows        = input.size(0);
-    const auto cols        = input.size(1);
-    const auto local_numel = input.numel();
-    auto       all_data    = torch::empty({rows, cols * (int64_t)tp_size}, input.options());
-    // Copy local data into the correct rank position
-    auto all_data_flat = all_data.reshape({rows * cols * (int64_t)tp_size});
-    auto input_flat    = input.reshape({local_numel});
-    all_data_flat.slice(0, local_numel * tp_rank, local_numel * (tp_rank + 1)).copy_(input_flat);
-    execAllGather({{all_data}});
-    cudaCheckLastError();
+    RTP_LLM_PROFILE_SCOPE("py_model.tpSyncEmbeddingOrLogits");
+    const auto    tp_size = device_props_.tp_size;
+    const auto    rows    = input.size(0);
+    const auto    cols    = input.size(1);
+    torch::Tensor all_data;
+    {
+        RTP_LLM_PROFILE_SCOPE("py_model.tpSyncEmbeddingOrLogits(alloc)");
+        all_data = torch::empty({rows * (int64_t)tp_size, cols}, input.options());
+    }
+    {
+        RTP_LLM_PROFILE_SCOPE("py_model.tpSyncEmbeddingOrLogits(all_gather)");
+        auto send = input.is_contiguous() ? input : input.contiguous();
+        execAllGather({{all_data}, ParallelMode::TP, {send}, false});
+        cudaCheckLastError();
+    }
     // Transpose [tp_size, batch, hidden] -> [batch, tp_size, hidden] -> [batch, hidden * tp_size]
-    auto transposed = all_data.reshape({(int64_t)tp_size, rows, cols})
-                          .permute({1, 0, 2})
-                          .contiguous()
-                          .reshape({rows, cols * (int64_t)tp_size});
-    cudaCheckLastError();
-    return transposed;
+    {
+        RTP_LLM_PROFILE_SCOPE("py_model.tpSyncEmbeddingOrLogits(transpose_concat)");
+        auto transposed = all_data.reshape({(int64_t)tp_size, rows, cols})
+                              .permute({1, 0, 2})
+                              .contiguous()
+                              .reshape({rows, cols * (int64_t)tp_size});
+        cudaCheckLastError();
+        return transposed;
+    }
 }
 
 GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
@@ -704,6 +710,7 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
                                                   bool                  skip_final_layernorm) {
     DevicePerfWrapper wrapper(enable_device_perf_, "forwardPostLayers");
     if (enable_sp && device_props_.tp_size > 1) {
+        RTP_LLM_PROFILE_SCOPE("py_model.forwardPostLayers(sp_all_gather)");
         auto ag_tensor =
             torch::empty({(int64_t)(hidden.size(0) * device_props_.tp_size), hidden.size(1)}, hidden.options());
         size_t m                 = ag_tensor.size(0);
@@ -738,6 +745,7 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
     }
 
     if (weights_.final_layernorm && !skip_final_layernorm) {
+        RTP_LLM_PROFILE_SCOPE("py_model.forwardPostLayers(final_layernorm)");
         const auto& norm_w = *weights_.final_layernorm;
         const auto  eps    = description_.layernorm_eps;
         if (description_.norm_type == NormType::rmsnorm) {
@@ -757,6 +765,7 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
     const auto& lm_head = weights_.lm_head;
 
     if (lm_head) {
+        RTP_LLM_PROFILE_SCOPE("py_model.forwardPostLayers(lm_head)");
         printTorchTensorData(lm_output_indexes, "lm_output_indexes");
 
         RTP_LLM_CHECK_WITH_INFO(lm_output_indexes.defined() && lm_output_indexes.is_cuda(),
@@ -764,10 +773,15 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
                                 "device=%s",
                                 static_cast<int>(lm_output_indexes.defined()),
                                 lm_output_indexes.defined() ? lm_output_indexes.device().str().c_str() : "undefined");
-        auto lm_output_indexes_device = lm_output_indexes.to(torch::kLong).contiguous();
+        torch::Tensor lm_output_indexes_device;
+        {
+            RTP_LLM_PROFILE_SCOPE("py_model.forwardPostLayers(lm_output_indexes_to_long)");
+            lm_output_indexes_device = lm_output_indexes.to(torch::kLong).contiguous();
+        }
 
         torch::Tensor last_hidden;
         if (has_context_request && !need_all_logits) {
+            RTP_LLM_PROFILE_SCOPE("py_model.forwardPostLayers(index_select_last_hidden)");
             last_hidden = torch::index_select(hidden, 0, lm_output_indexes_device);
         } else {
             last_hidden = hidden;
@@ -775,9 +789,14 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
 
         printTorchTensorData(last_hidden, "last_hidden");
 
-        auto logits = torch::mm(last_hidden.to(lm_head->kernel.dtype()), lm_head->kernel.t()).to(torch::kFloat32);
+        torch::Tensor logits;
+        {
+            RTP_LLM_PROFILE_SCOPE("py_model.forwardPostLayers(lm_head_mm)");
+            logits = torch::mm(last_hidden.to(lm_head->kernel.dtype()), lm_head->kernel.t()).to(torch::kFloat32);
+        }
         printTorchTensorData(logits, "logits");
         if (device_props_.tp_size > 1) {
+            RTP_LLM_PROFILE_SCOPE("py_model.forwardPostLayers(tp_sync_logits)");
             logits = tpSyncEmbeddingOrLogits(logits);
         }
         if (check_nan_) {
@@ -786,6 +805,7 @@ GptModelOutputs PyWrappedModel::forwardPostLayers(torch::Tensor         hidden,
         }
         torch::Tensor softmax_result_t;
         if (need_all_logits) {
+            RTP_LLM_PROFILE_SCOPE("py_model.forwardPostLayers(need_all_logits_index)");
             auto last_logits = torch::index_select(logits, 0, lm_output_indexes_device);
             return {last_logits, last_hidden, hidden, logits, softmax_result_t};
         }
