@@ -131,6 +131,16 @@ protected:
     bool useAsyncHostMirror() const;
     bool useAsyncStopExtra() const;
 
+    // N8: opt-in gate to skip the broad spec_bookkeeping_runner_.sync() at
+    // the start of decodeStep. Default OFF — reading is a no-op unless
+    // RTP_LLM_MTP_DROP_BROAD_SYNC=1 is set on server start. When ON, the
+    // worker bookkeeping runs fully concurrently with the next step's main
+    // thread up until the next dispatchDecodeAsync's launch() (which has
+    // its own per-task wait). N4's epoch-guarded clear and N1's device
+    // state contract are load-bearing here — the broad sync was their
+    // safety net.
+    bool useDropBroadSync() const;
+
     // Stream-async (Phase 3.2 lite) dispatch. Caller records two events on
     // the main stream BEFORE calling: rejection_event right after the
     // rejection_sampling kernel launch (earliest signal that

@@ -672,7 +672,43 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     // No-op when stream-async is off (useStreamAsync() == false today;
     // Commit 5 will gate this on RTP_LLM_MTP_STREAM_ASYNC). AsyncRunner.sync
     // is also a no-op on the very first decodeStep (task_done_ starts true).
-    if (useStreamAsync()) {
+    //
+    // N8 escape hatch: when RTP_LLM_MTP_DROP_BROAD_SYNC=1, skip this CPU
+    // block entirely. The next step's main thread proceeds in parallel
+    // with the previous step's worker; AsyncRunner::launch() at the end
+    // of dispatchDecodeAsync still single-slots the worker, so the
+    // 1-step buffer invariant is preserved (step N+2 cannot fork its
+    // worker until step N+1's worker is done; in turn step N+1's worker
+    // cannot start until step N's worker is done). What this drops is
+    // the front-loaded CPU stall: step N+1's main-thread work
+    // (gather/prepare/verify/forward) overlaps with step N's worker
+    // bookkeeping. With worker ~6.5ms vs main step ~16ms, the worker
+    // has ample window to finish before step N+1's launch() reaches
+    // the next dispatchDecodeAsync.
+    //
+    // Race surface (audited): NormalModelInputGatherer reads
+    // stream->seqLength() / kvCachePtr() / currentExecuteTokens() at
+    // the very start of step N+1, before worker N has finished
+    // specUpdate (host mutations land near the end of the worker, after
+    // its D2H wait). For the MTP stream-async path used in production
+    // (RTP_LLM_MTP_STREAM_ASYNC=1 + RTP_LLM_MTP_DEVICE_INPUT=1), the
+    // stream-async fast block in
+    // MtpBatchStreamProcessor::prepareDecodeDraftModelInput
+    // (and gatherMtpDecodeModelInputFromDeviceState for propose_step==1)
+    // OVERWRITES sequence_lengths / combo_tokens / lm_output_indexes
+    // from device-state (next_seq_len_gpu / propose_tokens_gpu) before
+    // the model forward consumes them — making the stale host reads
+    // immaterial. KV block ids are managed via MtpAsyncDeviceState
+    // (next_seq_len_gpu) for the MTP path; linear-attention swap is
+    // protected by the per-stream pending_swap_done_event_ recorded
+    // at the end of the worker (consumed in
+    // wait_pending_linear_attn_swaps below).
+    //
+    // Empirically validated by N8 perf test (mtp_stream_async/perf_data/
+    // N8_drop_broad_sync_*). Default OFF until we have a wider model
+    // coverage matrix; flip on per-deployment after smoke + tok/iter
+    // verification.
+    if (useStreamAsync() && !useDropBroadSync()) {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(wait_prev_bookkeeping,stream_count=%zu)",
                                       streams.size());
         spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
@@ -1411,6 +1447,18 @@ bool MtpExecutor::useAsyncHostMirror() const {
         const char* env = std::getenv("RTP_LLM_MTP_ASYNC_HOST_MIRROR");
         bool        on  = (env != nullptr && std::string(env) == "1");
         RTP_LLM_LOG_INFO("[async-host-mirror] RTP_LLM_MTP_ASYNC_HOST_MIRROR=%s -> enabled=%d",
+                         env ? env : "(unset)",
+                         static_cast<int>(on));
+        return on;
+    }();
+    return enabled;
+}
+
+bool MtpExecutor::useDropBroadSync() const {
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_MTP_DROP_BROAD_SYNC");
+        bool        on  = (env != nullptr && std::string(env) == "1");
+        RTP_LLM_LOG_INFO("[drop-broad-sync] RTP_LLM_MTP_DROP_BROAD_SYNC=%s -> enabled=%d",
                          env ? env : "(unset)",
                          static_cast<int>(on));
         return on;
