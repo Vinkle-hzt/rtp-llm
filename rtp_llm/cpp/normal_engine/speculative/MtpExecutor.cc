@@ -1385,6 +1385,17 @@ bool MtpExecutor::useAsyncHostMirror() const {
 }
 
 bool MtpExecutor::useAsyncStopExtra() const {
+    // Plan N5: this gate is intended for non-MTP async paths (propose_step
+    // == 0) where the host stop-word matcher could lag the launch by one
+    // token. The MTP decode path does NOT need this gate: rejection
+    // sampling already produces propose_step + 1 tokens per step, the
+    // bookkeeping worker calls GenerateStream::specUpdate (which invokes
+    // updateOutput -> needFinish -> matchStopWordsList) on the worker
+    // thread before the next decode step starts, and the optimistic
+    // accept-then-clip pipeline (§6.0) terminates the stream at the
+    // first stop/EOS hit within the speculative window. Leave this env
+    // off for MTP — it is plumbing for hypothetical future
+    // single-token async paths.
     static const bool enabled = []() {
         const char* env = std::getenv("RTP_LLM_MTP_ASYNC_STOP_EXTRA");
         bool        on  = (env != nullptr && std::string(env) == "1");
