@@ -347,6 +347,85 @@ void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& s
     model_input.lm_output_indexes = torch::arange(0, static_cast<int64_t>(batch_size), cudaInt32Options());
 }
 
+bool MtpBatchStreamProcessor::gatherMtpDecodeModelInputFromDeviceState(const StreamGroups& stream_groups,
+                                                                       GptModelInputs&     model_input) const {
+    // Plan N3 named entry: device-state target-verify gather. Builds the
+    // [target_last, propose] verify input entirely on GPU using the four
+    // tensors published by MtpExecutor::dispatchDecodeAsync:
+    //
+    //   accept_tokens_gpu  : [1, propose+1]   — accepted token ids per stream
+    //   accept_len_gpu     : [1]              — count of valid accepted tokens
+    //   propose_tokens_gpu : [1, token_stride]— next-step propose tokens
+    //   next_seq_len_gpu   : [1]              — committed seq len after step
+    //
+    // Returns true and fully populates model_input on success. Returns
+    // false (without touching model_input) if any stream is missing a
+    // piece, so the caller can fall through to the legacy CPU/GPU mixed
+    // path. Failing closed is the safe choice — a partial fast path
+    // would publish device tensors only for some streams and the
+    // downstream verify would mix CPU and GPU offsets per stream.
+    const size_t batch_size = stream_groups.size();
+    if (batch_size == 0) {
+        return false;
+    }
+    const auto all_streams = stream_groups.allStreams();
+    for (const auto& stream : all_streams) {
+        if (!stream->getAcceptTokensGpu().defined() || !stream->getAcceptLenGpu().defined()
+            || !stream->getProposeTokensGpu().defined() || !stream->getNextSeqLenGpu().defined()) {
+            return false;
+        }
+    }
+
+    std::vector<torch::Tensor> target_last_slices_gpu;
+    std::vector<torch::Tensor> propose_slices_gpu;
+    std::vector<torch::Tensor> next_seq_len_slices_gpu;
+    target_last_slices_gpu.reserve(batch_size);
+    propose_slices_gpu.reserve(batch_size);
+    next_seq_len_slices_gpu.reserve(batch_size);
+
+    for (const auto& stream : all_streams) {
+        const auto& accept_tokens  = stream->getAcceptTokensGpu();   // [1, propose+1]
+        const auto& accept_len     = stream->getAcceptLenGpu();      // [1]
+        const auto& propose_tokens = stream->getProposeTokensGpu();  // [1, token_stride]
+        const auto& next_seq_len   = stream->getNextSeqLenGpu();     // [1]
+
+        // target_last = accept_tokens[0, accept_len[0] - 1]. Use
+        // index_select on dim 0 of the squeezed [propose+1] view so the
+        // indexing stays on GPU without a host round-trip.
+        auto idx_t       = (accept_len - 1).to(torch::kLong);
+        auto target_last = accept_tokens.squeeze(0).index_select(/*dim=*/0, idx_t);
+
+        const int last_col = static_cast<int>(propose_tokens.size(-1)) - 1;
+        auto      propose  = propose_tokens.select(-1, last_col).reshape({-1});
+
+        target_last_slices_gpu.push_back(target_last);
+        propose_slices_gpu.push_back(propose);
+        next_seq_len_slices_gpu.push_back(next_seq_len);
+    }
+
+    auto target_last_gpu = torch::cat(target_last_slices_gpu, 0).to(torch::kInt32);
+    auto propose_gpu     = torch::cat(propose_slices_gpu, 0).to(torch::kInt32);
+    // Interleave [target_last, propose] per stream.
+    auto pair_gpu                = torch::stack({target_last_gpu, propose_gpu}, /*dim=*/1).reshape({-1});
+    auto next_seq_len_gpu_concat = torch::cat(next_seq_len_slices_gpu, 0);
+
+    model_input.combo_tokens = std::move(pair_gpu);
+    // prefix_lengths = next_seq_len - 1 (last committed position). Stays
+    // on GPU; downstream forward handles device-resident prefix_lengths
+    // via the existing useMtpDeviceInput() path.
+    model_input.prefix_lengths = (next_seq_len_gpu_concat - 1).to(torch::kInt32);
+    // sequence_lengths is intentionally empty for the verify pair: the
+    // forward derives per-token positions from prefix_lengths +
+    // intra-pair offset. Plan §3.2 notes this — for verify, prefix is
+    // the load-bearing length, not sequence_lengths.
+    model_input.sequence_lengths   = emptyInt32OnCuda({0});
+    model_input.last_hidden_states = torch::Tensor();
+    model_input.input_lengths      = fullInt32OnCuda({(int64_t)batch_size}, propose_step_ + 1);
+    model_input.lm_output_indexes =
+        torch::arange(0, static_cast<int64_t>(batch_size * (propose_step_ + 1)), cudaInt32Options());
+    return true;
+}
+
 void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGroups& stream_groups,
                                                                  GptModelInputs&     model_input) {
     // Phase 3.1: GPU-resident assembly when every stream has a GPU mirror of
@@ -362,70 +441,14 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
         return;
     }
 
-    // Phase 3.2 lite (stream-async): when dispatchDecodeAsync has attached
-    // device-resident state, build the [target_last, propose] verify input
-    // entirely on GPU. target_last comes from accept_tokens_gpu indexed by
-    // accept_len_gpu - 1; propose comes from propose_tokens_gpu's last column;
-    // prefix_lengths comes from next_seq_len_gpu - 1 (the seq position of the
-    // last committed token before this step's verify). Activated per-stream
-    // by getAcceptTokensGpu().defined() so the first decode step falls
-    // through to the existing path.
-    {
-        const auto all_streams           = stream_groups.allStreams();
-        bool       stream_async_eligible = !all_streams.empty();
-        for (const auto& stream : all_streams) {
-            if (!stream->getAcceptTokensGpu().defined() || !stream->getAcceptLenGpu().defined()
-                || !stream->getProposeTokensGpu().defined() || !stream->getNextSeqLenGpu().defined()) {
-                stream_async_eligible = false;
-                break;
-            }
-        }
-        if (stream_async_eligible) {
-            std::vector<torch::Tensor> target_last_slices_gpu;
-            std::vector<torch::Tensor> propose_slices_gpu;
-            std::vector<torch::Tensor> next_seq_len_slices_gpu;
-            target_last_slices_gpu.reserve(batch_size);
-            propose_slices_gpu.reserve(batch_size);
-            next_seq_len_slices_gpu.reserve(batch_size);
-
-            for (const auto& stream : all_streams) {
-                const auto& accept_tokens  = stream->getAcceptTokensGpu();   // [1, propose+1]
-                const auto& accept_len     = stream->getAcceptLenGpu();      // [1]
-                const auto& propose_tokens = stream->getProposeTokensGpu();  // [1, token_stride]
-                const auto& next_seq_len   = stream->getNextSeqLenGpu();     // [1]
-
-                // target_last = accept_tokens[0, accept_len[0] - 1]. Use
-                // index_select on dim 0 of the squeezed [propose+1] view so
-                // the indexing happens on GPU without a host round-trip.
-                auto idx_t       = (accept_len - 1).to(torch::kLong);
-                auto target_last = accept_tokens.squeeze(0).index_select(/*dim=*/0, idx_t);
-
-                const int last_col = static_cast<int>(propose_tokens.size(-1)) - 1;
-                auto      propose  = propose_tokens.select(-1, last_col).reshape({-1});
-
-                target_last_slices_gpu.push_back(target_last);
-                propose_slices_gpu.push_back(propose);
-                next_seq_len_slices_gpu.push_back(next_seq_len);
-            }
-
-            auto target_last_gpu = torch::cat(target_last_slices_gpu, 0).to(torch::kInt32);
-            auto propose_gpu     = torch::cat(propose_slices_gpu, 0).to(torch::kInt32);
-            // Interleave [target_last, propose] per stream.
-            auto pair_gpu                = torch::stack({target_last_gpu, propose_gpu}, /*dim=*/1).reshape({-1});
-            auto next_seq_len_gpu_concat = torch::cat(next_seq_len_slices_gpu, 0);
-
-            model_input.combo_tokens = std::move(pair_gpu);
-            // prefix_lengths = next_seq_len - 1 (last committed position).
-            // Kept on GPU; downstream forward must handle device-resident
-            // prefix_lengths or sync as needed (Commit 4+ refines this).
-            model_input.prefix_lengths     = (next_seq_len_gpu_concat - 1).to(torch::kInt32);
-            model_input.sequence_lengths   = emptyInt32OnCuda({0});
-            model_input.last_hidden_states = torch::Tensor();
-            model_input.input_lengths      = fullInt32OnCuda({(int64_t)batch_size}, propose_step_ + 1);
-            model_input.lm_output_indexes =
-                torch::arange(0, static_cast<int64_t>(batch_size * (propose_step_ + 1)), cudaInt32Options());
-            return;
-        }
+    // Plan N3: try the device-state fast path. The eligibility check + the
+    // tensor assembly are now factored into a named method so future
+    // commits (N4 epoch-guarded clears, N7 .item() removal) can extend it
+    // without re-inlining. Falls through to the legacy paths below when
+    // any stream is missing a complete MtpAsyncDeviceState — failing
+    // closed to the CPU/GPU mixed code is the safe behaviour.
+    if (gatherMtpDecodeModelInputFromDeviceState(stream_groups, model_input)) {
+        return;
     }
 
     bool                       all_gpu = (static_cast<int64_t>(batch_size) >= kPhase31MinBatchForGpu);
