@@ -595,6 +595,20 @@ void MtpBatchStreamProcessor::updateDecodePostDraftModelInput(
     // input_lengths at propose_step_+1 for CUDA graph reuse; lm_output_indexes below selects
     // only the last accepted position per sequence, so padding positions are not surfaced as
     // next-step last_hidden_states.
+    //
+    // Plan N6 propose_step > 1 device-resident contract: every output of
+    // this function is on CUDA and stays on CUDA across the next decode
+    // step's prepare/forward.
+    //   - combo_tokens   : toCudaInt32(...) on accept_tokens (already CUDA from sampler)
+    //   - lm_output_indexes : torch::arange + accept_len_d (both CUDA i32)
+    //   - last_hidden_states / hidden_states_d_t : alias of model_output.all_hidden_states,
+    //     which is the target verify forward output and never round-trips to host.
+    // This is load-bearing for the stream-async path: the worker thread's
+    // specUpdate uses CPU mirrors of these tensors via async D2H, but the
+    // main thread launches the next decode step from these device tensors
+    // alone. Do not introduce a `.cpu()` here without first auditing the
+    // next-step gather path (currently MtpBatchStreamProcessor::
+    // gatherMtpDecodeModelInputFromDeviceState — see N3).
     int total_tokens         = (propose_step_ + 1) * batch_size;
     model_input.combo_tokens = toCudaInt32(speculative_sampler_output.accept_tokens.reshape({(int64_t)total_tokens}));
     auto accept_len_d        = toCudaInt32(speculative_sampler_output.accept_len);

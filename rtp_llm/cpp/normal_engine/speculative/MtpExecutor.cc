@@ -694,6 +694,17 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     // so this is effectively a no-op stream dependency. Kept as a separate
     // step so future Phase 3.3 ultimate (where wait_prev_bookkeeping moves
     // off the hot path) keeps the verify-side correctness guarantee.
+    //
+    // Plan N6 linear/hybrid contract: this loop is the *only* guarantee
+    // that target verify reads post-swap KV blocks once the broad
+    // spec_bookkeeping_runner_.sync() above is removed. Today the broad
+    // sync drains all worker activity (including swap_done_event.record),
+    // so this block is a no-op verifier. Once the broad sync moves off the
+    // hot path (a follow-up commit beyond this plan), the per-stream
+    // event becomes load-bearing for linear-attention correctness — the
+    // worker will still be in flight when we arrive here, and only the
+    // event-block prevents target verify from reading stale KV. Do NOT
+    // delete this loop without first deleting the broad sync above.
     {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.decode_step(wait_pending_linear_attn_swaps,stream_count=%zu)",
                                       streams.size());
@@ -967,6 +978,18 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(tp_sync_post_rejection)");
         // only broadcast combo_tokens, last_hidden_states, and lm_output_indexes
         // because these are the only fields updated by updateDecodePostDraftModelInput after rejection sampling
+        //
+        // Plan N6: all three tensors are device-resident at this point.
+        // - combo_tokens: produced on GPU by toCudaInt32(accept_tokens.reshape(...))
+        //   inside updateDecodePostDraftModelInput.
+        // - last_hidden_states: aliased from model_output.all_hidden_states
+        //   (target verify forward output, never round-trips to host).
+        // - lm_output_indexes: produced on GPU by torch::arange + accept_len_d
+        //   inside updateDecodePostDraftModelInput.
+        // The broadcast therefore stays NCCL-only with no implicit D2H/H2D.
+        // Non-root TP ranks fill last_hidden_states from their local target
+        // verify output above; this NCCL broadcast lets rank 0's
+        // rejection-sampled view replace it across ranks.
         if (parallelism_config_.tp_size > 1) {
             execBroadcast({{model_input.combo_tokens}, 0});
             execBroadcast({{model_input.last_hidden_states}, 0});
@@ -1349,6 +1372,17 @@ bool MtpExecutor::useStreamAsync() const {
     // needed since the flag is process-wide and the AsyncRunner objects (and
     // the underlying CUDA streams / worker threads) are eagerly constructed
     // in the MtpExecutor ctor whether or not the path is taken.
+    //
+    // Plan N6 TP-coordination contract: this gate (and its peers
+    // useAsyncDeviceState/useAsyncHostMirror/useAsyncStopExtra) all use the
+    // same `static const bool` lambda pattern reading process env. Every TP
+    // rank starts from the same `RTP_LLM_MTP_*` env (server launcher
+    // exports them before fork), so all ranks make the *identical*
+    // async/fallback decision without an extra cross-rank handshake. If a
+    // future fallback decision needs to depend on per-request state (e.g.
+    // structured-output presence), it MUST go through tpSyncModelInputs or
+    // an explicit broadcast — local short-circuiting on a single rank
+    // would deadlock the others.
     static const bool enabled = []() {
         const char* env = std::getenv("RTP_LLM_MTP_STREAM_ASYNC");
         bool        on  = (env != nullptr && std::string(env) == "1");
