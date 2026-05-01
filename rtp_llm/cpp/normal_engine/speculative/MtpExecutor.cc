@@ -1429,11 +1429,24 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
     // caller lets us hit the earliest point each tensor becomes valid on
     // the main stream, instead of waiting for the queue tail at this point.)
 
-    // Step 2: compute per-stream device-resident state and attach via setter.
-    // accept_len has shape [batch_size]; accept_tokens has shape [batch_size,
-    // propose_step + 1]. next_seq_len_gpu is computed on GPU as
-    // (cur_seq_len_t + accept_len_slice) so the next decode step's prepare
-    // can build sequence_lengths without waiting on a CPU value.
+    // Step 2: compute per-stream device-resident state and attach via the
+    // N1 setMtpAsyncDeviceState API. The returned epochs are captured into
+    // a vector and forwarded to the worker so it can issue
+    // clearMtpAsyncDeviceState(epoch) (plan N4 epoch-guarded clear). This
+    // is forward-looking protection: today the broad
+    // spec_bookkeeping_runner_.sync() at the next decode step entry
+    // serialises workers, so the epoch can never mismatch in production.
+    // Once that broad sync moves off the hot path, the epoch guard
+    // becomes load-bearing — a slow worker for step N waking after step
+    // N+1 published a fresh state will skip the clear and not race the
+    // next gather reading getNextSeqLenGpu() / etc.
+    //
+    // accept_len has shape [batch_size]; accept_tokens has shape
+    // [batch_size, propose_step + 1]. next_seq_len_gpu is computed on GPU
+    // as (cur_seq_len_t + accept_len_slice) so the next decode step's
+    // prepare can build sequence_lengths without waiting on a CPU value.
+    std::vector<uint64_t> mtp_async_epochs;
+    mtp_async_epochs.reserve(all_streams.size());
     int64_t idx = 0;
     for (auto& stream : all_streams) {
         torch::Tensor accept_len_slice =
@@ -1450,10 +1463,13 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
                                              torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
             next_seq_len_gpu   = (cur_seq_len_t + accept_len_slice).to(torch::kInt32);
         }
-        stream->setSpecDecodeDeviceState(std::move(accept_len_slice),
-                                         std::move(accept_tokens_slice),
-                                         std::move(next_seq_len_gpu),
-                                         std::move(propose_tokens_slice));
+        GenerateStream::MtpAsyncDeviceState state;
+        state.accept_len_gpu     = std::move(accept_len_slice);
+        state.accept_tokens_gpu  = std::move(accept_tokens_slice);
+        state.next_seq_len_gpu   = std::move(next_seq_len_gpu);
+        state.propose_tokens_gpu = std::move(propose_tokens_slice);
+        const uint64_t epoch     = stream->setMtpAsyncDeviceState(std::move(state));
+        mtp_async_epochs.push_back(epoch);
         ++idx;
     }
 
@@ -1484,7 +1500,8 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
                                      spec_decode_copy   = std::move(spec_decode_copy),
                                      draft_prefill_copy = std::move(draft_prefill_copy),
                                      rejection_event,
-                                     draft_event]() mutable {
+                                     draft_event,
+                                     mtp_async_epochs = std::move(mtp_async_epochs)]() mutable {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_bookkeeping_worker)");
 
         // Wait via cudaStreamWaitEvent (NOT cudaEventSynchronize) — the
@@ -1509,13 +1526,30 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
             draft_event->block(cuda_graph::graphGetCurrentStream());
         }
 
-        // Clear device-resident handles before specUpdate runs. seqLength
-        // was never bumped (plan N2), so there is nothing to roll back;
-        // specUpdate will advance seqLength by the actual num_new_tokens
-        // (= accept_len) on top of the committed base.
-        auto worker_streams = stream_groups_copy.allStreams();
+        // Clear device-resident handles via the N1 epoch-guarded API.
+        // Each stream's clearMtpAsyncDeviceState(epoch) returns false if
+        // the current epoch on the stream no longer matches the one this
+        // worker captured (a newer dispatchDecodeAsync has already
+        // published a fresh state). Today the broad
+        // spec_bookkeeping_runner_.sync() at the next decode step entry
+        // serialises workers so mismatch never fires; the warning log
+        // arms us to detect regressions when that broad sync moves off
+        // the hot path. seqLength was never bumped (plan N2) so there
+        // is nothing to roll back; specUpdate below advances seqLength
+        // by the actual num_new_tokens (= accept_len).
+        auto   worker_streams = stream_groups_copy.allStreams();
+        size_t worker_idx     = 0;
         for (auto& stream : worker_streams) {
-            stream->clearSpecDecodeDeviceState();
+            const uint64_t expected_epoch = (worker_idx < mtp_async_epochs.size()) ? mtp_async_epochs[worker_idx] : 0;
+            if (!stream->clearMtpAsyncDeviceState(expected_epoch)) {
+                RTP_LLM_LOG_WARNING(
+                    "[stream-async] stale clear epoch=%lu current_epoch=%lu stream=%ld — newer dispatchDecodeAsync "
+                    "published while this worker was in flight; skipping clear to avoid clobber",
+                    expected_epoch,
+                    stream->getMtpAsyncDeviceState().epoch,
+                    stream->streamId());
+            }
+            ++worker_idx;
         }
 
         // Reuse the original synchronous dispatch logic. .cpu() inside
