@@ -123,6 +123,14 @@ protected:
     // the body with the RTP_LLM_MTP_STREAM_ASYNC env switch.
     bool useStreamAsync() const;
 
+    // NormalBatchStream device-state refactor gates (plan N0). All default
+    // off; consumers land in later commits (N1 device-state struct, N4 host
+    // mirror worker, N5 stop-word one-extra). Reading these here is a no-op
+    // until those consumers wire them.
+    bool useAsyncDeviceState() const;
+    bool useAsyncHostMirror() const;
+    bool useAsyncStopExtra() const;
+
     // Stream-async (Phase 3.2 lite) dispatch. Caller records two events on
     // the main stream BEFORE calling: rejection_event right after the
     // rejection_sampling kernel launch (earliest signal that

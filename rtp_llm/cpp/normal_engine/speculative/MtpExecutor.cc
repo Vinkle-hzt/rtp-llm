@@ -1180,13 +1180,13 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     torch::Tensor              spec_prefix_lengths;
 
     // update TP > 0 batch_size
-    size_t batch_size = model_input.combo_tokens.size(0);
-    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    size_t     batch_size       = model_input.combo_tokens.size(0);
+    const auto cuda_i32         = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
     auto       to_cuda_i32_flat = [&cuda_i32, batch_size](const torch::Tensor& tensor) -> torch::Tensor {
         auto tensor_d = (tensor.is_cuda() && tensor.scalar_type() == torch::kInt32) ?
-                            tensor :
-                            tensor.to(cuda_i32, /*non_blocking=*/true);
-        tensor_d = tensor_d.reshape({static_cast<int64_t>(batch_size)});
+                                  tensor :
+                                  tensor.to(cuda_i32, /*non_blocking=*/true);
+        tensor_d      = tensor_d.reshape({static_cast<int64_t>(batch_size)});
         return tensor_d.is_contiguous() ? tensor_d : tensor_d.contiguous();
     };
     spec_prefix_lengths =
@@ -1203,7 +1203,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         // model_input.combo_tokens assignments do not mutate this storage.
         pre_propose_token_t_raw = to_cuda_i32_flat(model_input.combo_tokens);
     }
-    const auto all_streams             = stream_groups.allStreams();
+    const auto all_streams = stream_groups.allStreams();
 
     torch::Tensor pre_target_token_t;
     if (useMtpDeviceInput()) {
@@ -1282,7 +1282,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(build_spec_decode_input)");
         // prepare spec decode input
-        const auto tokens_per_batch = static_cast<int32_t>(propose_step_ + 1);
+        const auto    tokens_per_batch = static_cast<int32_t>(propose_step_ + 1);
         torch::Tensor input_lengths;
 #if USING_CUDA
         if (tokens_per_batch <= 8) {
@@ -1316,7 +1316,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         {
             RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(build_spec_lengths_indexes)");
             draft_token_ids_t = torch::stack(draft_token_columns, 1).contiguous();
-            input_lengths = torch::full({(int64_t)batch_size}, static_cast<int64_t>(propose_step_ + 1), cuda_i32);
+            input_lengths     = torch::full({(int64_t)batch_size}, static_cast<int64_t>(propose_step_ + 1), cuda_i32);
             model_input.lm_output_indexes =
                 torch::arange(0, static_cast<int64_t>(batch_size * (propose_step_ + 1)), cuda_i32);
         }
@@ -1353,6 +1353,42 @@ bool MtpExecutor::useStreamAsync() const {
         const char* env = std::getenv("RTP_LLM_MTP_STREAM_ASYNC");
         bool        on  = (env != nullptr && std::string(env) == "1");
         RTP_LLM_LOG_INFO("[stream-async] RTP_LLM_MTP_STREAM_ASYNC=%s -> useStreamAsync=%d",
+                         env ? env : "(unset)",
+                         static_cast<int>(on));
+        return on;
+    }();
+    return enabled;
+}
+
+bool MtpExecutor::useAsyncDeviceState() const {
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_MTP_ASYNC_DEVICE_STATE");
+        bool        on  = (env != nullptr && std::string(env) == "1");
+        RTP_LLM_LOG_INFO("[async-device-state] RTP_LLM_MTP_ASYNC_DEVICE_STATE=%s -> enabled=%d",
+                         env ? env : "(unset)",
+                         static_cast<int>(on));
+        return on;
+    }();
+    return enabled;
+}
+
+bool MtpExecutor::useAsyncHostMirror() const {
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_MTP_ASYNC_HOST_MIRROR");
+        bool        on  = (env != nullptr && std::string(env) == "1");
+        RTP_LLM_LOG_INFO("[async-host-mirror] RTP_LLM_MTP_ASYNC_HOST_MIRROR=%s -> enabled=%d",
+                         env ? env : "(unset)",
+                         static_cast<int>(on));
+        return on;
+    }();
+    return enabled;
+}
+
+bool MtpExecutor::useAsyncStopExtra() const {
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_MTP_ASYNC_STOP_EXTRA");
+        bool        on  = (env != nullptr && std::string(env) == "1");
+        RTP_LLM_LOG_INFO("[async-stop-extra] RTP_LLM_MTP_ASYNC_STOP_EXTRA=%s -> enabled=%d",
                          env ? env : "(unset)",
                          static_cast<int>(on));
         return on;
