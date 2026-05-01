@@ -1414,14 +1414,14 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
 
     auto all_streams = stream_groups.allStreams();
 
-    // Snapshot host-side seqLength per stream BEFORE the conservative bump.
-    // The bookkeeping worker rolls back to this value before specUpdate so
-    // GenerateStream::specUpdate (which increments seqLength by num_new_tokens)
-    // lands on the correct base.
-    std::vector<int> old_seq_lens;
-    old_seq_lens.reserve(all_streams.size());
+    // Snapshot host-side seqLength per stream. Used purely as the base for
+    // computing next_seq_len_gpu = base + accept_len on the device side;
+    // we no longer pass it to the worker because the bump-rollback dance
+    // has been removed (see Step 3 below).
+    std::vector<int> base_seq_lens;
+    base_seq_lens.reserve(all_streams.size());
     for (const auto& stream : all_streams) {
-        old_seq_lens.push_back(stream->seqLength());
+        base_seq_lens.push_back(stream->seqLength());
     }
 
     // (events are recorded by the caller in decodeStep — see the
@@ -1446,7 +1446,7 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         torch::Tensor next_seq_len_gpu;
         if (accept_len_slice.defined()) {
             auto cur_seq_len_t = torch::full({1},
-                                             static_cast<int64_t>(old_seq_lens[idx]),
+                                             static_cast<int64_t>(base_seq_lens[idx]),
                                              torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
             next_seq_len_gpu   = (cur_seq_len_t + accept_len_slice).to(torch::kInt32);
         }
@@ -1457,24 +1457,20 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         ++idx;
     }
 
-    // Step 3: bump host seqLength to the conservative upper bound. The
-    // scheduler / KV manager reads seqLength to size the next step's KV
-    // reservation; reserve_step_ in NormalEngine.cc:104 already pre-reserves
-    // propose_step + 1 blocks, so this bump just makes the reservation
-    // visible. Worker rolls back to old_seq_lens[i] and lets specUpdate set
-    // the actual value (old + accept_len).
+    // Step 3 (plan N2): no host seqLength bump. The previous "bump to
+    // base + propose_step + 1 then have the worker roll back" pattern was
+    // (a) racy with concurrent scheduler/finishCheck reads of seqLength
+    // before the worker's rollback fired, and (b) double-counted KV reserve
+    // because StreamCacheResource::incrKVBlock already passes
+    // reserve_step_ = propose_step + 1 to the allocator, and the allocator
+    // computes blocks needed as (seq_len + reserve_step + ...). Combining
+    // a bumped seq_len with a non-zero reserve_step over-reserved by an
+    // entire propose_step + 1 worth of blocks. Removing the bump leaves
+    // committed seqLength as the single source of truth on the host;
+    // reserve_step_ continues to provide the speculative KV budget; the
+    // device-resident next_seq_len_gpu provides the accurate post-step
+    // length for the next prepare without a host roundtrip.
     //
-    // TODO(phase32): the rollback in the worker is not atomic with respect
-    // to scheduler reads of seqLength; under the env switch (Commit 5+) we
-    // need a per-stream lock or a separate "conservative seqLength" field
-    // that the scheduler reads. For Commit 2 the path is dead so the race
-    // cannot fire.
-    idx = 0;
-    for (auto& stream : all_streams) {
-        stream->setSeqLength(old_seq_lens[idx] + static_cast<int>(propose_step_) + 1);
-        ++idx;
-    }
-
     // Step 4: fork the bookkeeping worker. The worker's stream guard switches
     // the current torch stream to the worker stream, so .cpu() inside
     // prepareDecodeSpecUpdateInfo issues its D2H on the worker stream and
@@ -1488,8 +1484,7 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
                                      spec_decode_copy   = std::move(spec_decode_copy),
                                      draft_prefill_copy = std::move(draft_prefill_copy),
                                      rejection_event,
-                                     draft_event,
-                                     old_seq_lens = std::move(old_seq_lens)]() mutable {
+                                     draft_event]() mutable {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_bookkeeping_worker)");
 
         // Wait via cudaStreamWaitEvent (NOT cudaEventSynchronize) — the
@@ -1514,15 +1509,13 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
             draft_event->block(cuda_graph::graphGetCurrentStream());
         }
 
-        // Roll back the conservative seqLength bump and clear device-resident
-        // handles. specUpdate (called from updateStreams below) will
-        // increment seqLength by the actual num_new_tokens (= accept_len).
+        // Clear device-resident handles before specUpdate runs. seqLength
+        // was never bumped (plan N2), so there is nothing to roll back;
+        // specUpdate will advance seqLength by the actual num_new_tokens
+        // (= accept_len) on top of the committed base.
         auto worker_streams = stream_groups_copy.allStreams();
-        int  i              = 0;
         for (auto& stream : worker_streams) {
-            stream->setSeqLength(old_seq_lens[i]);
             stream->clearSpecDecodeDeviceState();
-            ++i;
         }
 
         // Reuse the original synchronous dispatch logic. .cpu() inside
