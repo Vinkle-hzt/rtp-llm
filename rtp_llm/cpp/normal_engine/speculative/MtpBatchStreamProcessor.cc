@@ -4,6 +4,7 @@
 #include "rtp_llm/cpp/utils/TensorDebugUtils.h"
 #include "rtp_llm/cpp/utils/StringUtil.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
+#include <atomic>
 #include <cstdlib>
 #include <numeric>
 #include <string>
@@ -12,6 +13,25 @@
 namespace rtp_llm {
 
 namespace {
+
+// Plan N7 fallback-hit counters. Each counter is incremented when a hot-path
+// gather/prepare function falls through to the legacy CPU/GPU mixed path.
+// The counters are read by the rate-limited log emitter below; production
+// monitoring should prefer the kmonitor metric `executor.mtp.async_fallback.
+// reason` (plan §9) once it is wired, but this in-process counter provides
+// immediate visibility today without requiring a metrics-schema change.
+std::atomic<uint64_t> g_mtp_device_state_fallback_count{0};
+std::atomic<uint64_t> g_mtp_device_state_success_count{0};
+
+// Rate-limited log emitter — first 5 fallbacks logged in full, then every
+// 1000th hit. Avoids drowning the log when a config keeps hitting the
+// fallback path. Returns true when the caller should emit the log line.
+bool shouldLogFallback(uint64_t count) {
+    if (count <= 5) {
+        return true;
+    }
+    return count % 1000 == 0;
+}
 
 bool useMtpDeviceInput() {
     static const bool enabled = []() {
@@ -372,9 +392,32 @@ bool MtpBatchStreamProcessor::gatherMtpDecodeModelInputFromDeviceState(const Str
     for (const auto& stream : all_streams) {
         if (!stream->getAcceptTokensGpu().defined() || !stream->getAcceptLenGpu().defined()
             || !stream->getProposeTokensGpu().defined() || !stream->getNextSeqLenGpu().defined()) {
+            // Plan N7 fallback-hit accounting. Rate-limited so the log line
+            // surfaces a stuck config (every step taking the legacy path)
+            // without flooding when the fallback is correct (e.g. first
+            // step before any dispatchDecodeAsync has fired).
+            const uint64_t count = g_mtp_device_state_fallback_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (shouldLogFallback(count)) {
+                const char* reason = "device_state_missing";
+                if (!stream->getAcceptTokensGpu().defined()) {
+                    reason = "accept_tokens_gpu_missing";
+                } else if (!stream->getAcceptLenGpu().defined()) {
+                    reason = "accept_len_gpu_missing";
+                } else if (!stream->getProposeTokensGpu().defined()) {
+                    reason = "propose_tokens_gpu_missing";
+                } else if (!stream->getNextSeqLenGpu().defined()) {
+                    reason = "next_seq_len_gpu_missing";
+                }
+                RTP_LLM_LOG_INFO("[mtp-async-fallback] reason=%s stream=%ld fallback_count=%lu success_count=%lu",
+                                 reason,
+                                 stream->streamId(),
+                                 count,
+                                 g_mtp_device_state_success_count.load(std::memory_order_relaxed));
+            }
             return false;
         }
     }
+    g_mtp_device_state_success_count.fetch_add(1, std::memory_order_relaxed);
 
     std::vector<torch::Tensor> target_last_slices_gpu;
     std::vector<torch::Tensor> propose_slices_gpu;
@@ -535,8 +578,14 @@ void MtpBatchStreamProcessor::updateDecodeDraftModelInput(GptModelInputs&       
                                                                                 model_input.sequence_lengths.to(torch::kCUDA);
         model_input.sequence_lengths = (seq_lengths_d + 1).to(torch::kInt32);
     } else {
-        // TODO(async): legacy draft-decode update mutates sequence lengths on
-        // CPU. Republish to CUDA before the tensor reaches the model.
+        // Plan N7: legacy CPU fallback. Reachable only when both
+        // RTP_LLM_MTP_DEVICE_INPUT=0 (the default off path is dead in the
+        // stream-async config we ship today) AND the upstream caller did
+        // not already publish sequence_lengths on CUDA. The MtpExecutor
+        // boot-time log makes the gate decision visible, so a regression
+        // landing here will be obvious in the log. When the device-input
+        // env gate is retired (post-N7 hardening), this branch should be
+        // deleted along with `useMtpDeviceInput()` itself.
         auto sequence_lengths_cpu = model_input.sequence_lengths.cpu().clone().pin_memory();
         for (int i = 0; i < batch_size; i++) {
             sequence_lengths_cpu.data_ptr<int>()[i]++;
@@ -784,6 +833,17 @@ void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
         torch::Tensor propose_all_probs =
             draft_sampler_output.all_probs.narrow(0, batch_idx_out, next_batch_size).to(torch::kCUDA).clone();
 
+        // Plan N7: this `.item<int>()` is the *only* host scalar read in
+        // MTP decode bookkeeping that is correct to keep. It runs on the
+        // bookkeeping worker thread (called from
+        // MtpExecutor::dispatchDecodeAsync's lambda), and `accept_len` is
+        // a CPU-pinned tensor whose H2D-mirroring D2H is already drained
+        // by spec_decode_output.transfer_done_event->synchronize() at the
+        // top of this function. There is no main-thread sync incurred
+        // here. Do NOT move this function into the main thread without
+        // first replacing the .item() with a device-side index — the
+        // intent of the worker fork is precisely to absorb cheap scalar
+        // host reads so the main thread can issue the next decode step.
         int cur_accept_len = accept_len[batch_idx_out].item<int>();
 
         torch::Tensor last_hidden_states;
