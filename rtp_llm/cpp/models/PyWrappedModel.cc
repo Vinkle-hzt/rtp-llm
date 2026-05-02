@@ -491,6 +491,10 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
 }
 
 void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs) {
+    prepareAttentionInputs(inputs, false);
+}
+
+void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs, bool skip_forward_event_sync) {
     RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs");
     d2d_copies_.clear();
     if (pinned_check_remaining_ > 0) {
@@ -541,7 +545,7 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs) {
 
     if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state_)) {
         RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs(cuda_graph_prepare)");
-        graph_runner_->prepareAttentionInputs(py_model_inputs, graph_state_);
+        graph_runner_->prepareAttentionInputs(py_model_inputs, graph_state_, skip_forward_event_sync);
     }
 }
 
@@ -589,7 +593,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         auto bert_embedding_inputs = buildBertEmbeddingInputs(inputs);
 
         if (!prepared_attention_inputs_.load(std::memory_order_acquire)) {
-            prepareAttentionInputs(inputs);
+            prepareAttentionInputs(inputs, /*skip_forward_event_sync=*/true);
         }
 
         if (device_props_.enable_prefill_cp) {

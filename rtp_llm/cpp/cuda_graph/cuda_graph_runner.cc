@@ -107,7 +107,7 @@ int inferTotalTokensNoSync(const PyModelInputs& inputs) {
 void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState& state) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputs");
     prepareInputData(inputs, state);
-    prepareAttentionInputs(inputs, state);
+    prepareAttentionInputs(inputs, state, /*skip_forward_event_sync=*/true);
 }
 
 void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphState& state) {
@@ -123,21 +123,17 @@ void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphSta
                        inputs.input_hiddens.numel() * inputs.input_hiddens.element_size());
 }
 
-void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs, CudaGraphState& state) {
+void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
+                                             CudaGraphState&      state,
+                                             bool                 skip_forward_event_sync) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs");
-    // 1. non spec cuda graph:
-    // is_prefill_cuda_graph_mode_ is set true only when use embedding model
-    // 2. spec cuda graph:
-    // 2.1 spec hold target model and draft model. when the user prompt first comes in, the target model
-    // adn draft model will do real "prefill forward". And for this phase, we don't support cuda graph
-    // 2.2 after real "prefill forward", it is consisted of three parts:
-    // 2.2.1 target model score(verfiy)
-    // 2.2.2 draft model do first forward (input is from 2.2.1)
-    // 2.2.3 draft model do auto-agressive forward
-    // for now we only support 2.2.1 and 2.2.3 in deocode cuda graph, and 2.2.2 will be support in prefill cuda graph.
 
-    // should wait last forward done before prepare inputs
-    {
+    // Wait for the previous graph replay to finish before overwriting input buffers.
+    // When called from an AsyncRunner (cross-stream), the event sync is required for
+    // correctness. When called inline from forward() on the same stream, CUDA stream
+    // ordering already guarantees the previous replay has completed, so the CPU-blocking
+    // sync can be skipped.
+    if (!skip_forward_event_sync) {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(wait_forward_event)");
         forward_event_.synchronize();
     }
