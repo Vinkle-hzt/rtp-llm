@@ -14,10 +14,10 @@ absl::StatusOr<SamplerInputs> NormalSamplerInputGatherer::gather(const StreamGro
     (void)model_inputs;
     RTP_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     RTP_LLM_CHECK(!stream_groups.empty());
-    auto all_streams          = stream_groups.allStreams();
-    auto total_batch_size_in  = stream_groups.totalSamplerBatchSizeIn();
-    auto total_batch_size_out = stream_groups.totalSamplerBatchSizeOut();
-    ReturnAllProbsMode return_all_probs = stream_groups.needReturnAllProbs();
+    auto               all_streams          = stream_groups.allStreams();
+    auto               total_batch_size_in  = stream_groups.totalSamplerBatchSizeIn();
+    auto               total_batch_size_out = stream_groups.totalSamplerBatchSizeOut();
+    ReturnAllProbsMode return_all_probs     = stream_groups.needReturnAllProbs();
 
     SamplerInputs sampler_inputs = allocateSamplerInputs(stream_groups, total_batch_size_in, total_batch_size_out);
     fillSamplerCommonInputs(sampler_inputs, all_streams);
@@ -135,7 +135,7 @@ SamplerInputs NormalSamplerInputGatherer::allocateSamplerInputs(const StreamGrou
         sampler_inputs.cum_log_probs = torch::empty({(int64_t)total_batch_size_in}, torch::kFloat32);
     }
     sampler_inputs.token_ids =
-        torch::empty({(int64_t)total_batch_size_in, (int64_t)(sampler_inputs.step + 1)}, torch::kInt32);
+        torch::empty({(int64_t)total_batch_size_in, (int64_t)(sampler_inputs.step + 1)}, pinned_i32);
     sampler_inputs.generator.resize(total_batch_size_in);
     return sampler_inputs;
 }

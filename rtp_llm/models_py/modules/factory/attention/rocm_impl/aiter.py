@@ -156,7 +156,7 @@ class FMHAParams(ParamsBase):
     ):
         self.sequence_lengths = sequence_lengths
         self.input_lengths = input_lengths
-        self.kv_cache_block_id = kv_cache_block_id_host
+        self.kv_cache_block_id_host = kv_cache_block_id_host
         if kv_cache_block_id_device is not None:
             self.kv_cache_block_id_device = kv_cache_block_id_device
         if self.seq_lens is not None and self.sequence_lengths is not None:
@@ -678,10 +678,10 @@ def _infer_cuda_graph_device(
     fallback_tensor: Optional[torch.Tensor],
 ) -> torch.device:
     candidates = [
-        getattr(attn_inputs, "input_lengths_device", None),
-        getattr(attn_inputs, "prefix_lengths_device", None),
-        getattr(attn_inputs, "decode_cu_seqlens_device", None),
-        getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
+        getattr(attn_inputs, "input_lengths", None),
+        getattr(attn_inputs, "prefix_lengths", None),
+        getattr(attn_inputs, "decode_cu_seqlens_d", None),
+        getattr(attn_inputs, "sequence_lengths_plus_1_d", None),
         getattr(attn_inputs, "kv_cache_kernel_block_id_device", None),
         getattr(attn_inputs, "kv_cache_block_id_device", None),
         getattr(fmha_params, "cu_seqlens_q", None),
@@ -711,6 +711,7 @@ class AiterPrefillAttnOpPaged:
         self.kv_indptr_buf: Optional[torch.Tensor] = None
         self.kv_page_indices_buf: Optional[torch.Tensor] = None
         self.descale_buf: Optional[torch.Tensor] = None
+        self.sanitized_bt_buf: Optional[torch.Tensor] = None
         self._block_positions: Optional[torch.Tensor] = None
 
     def support(self, attn_inputs: PyAttentionInputs) -> bool:
@@ -775,9 +776,29 @@ class AiterPrefillAttnOpPaged:
         bt = fmha_params.kv_cache_block_id_device
         extra_pages = (128 + self.tokens_per_block - 1) // self.tokens_per_block
         max_cols = bt.shape[1] + extra_pages
-        self.sanitized_bt_buf = torch.zeros(
-            batch_size, max_cols, dtype=torch.int32, device=self.graph_device
+        need_new_buf = (
+            self.sanitized_bt_buf is None
+            or self.sanitized_bt_buf.device != self.graph_device
+            or self.sanitized_bt_buf.dtype != torch.int32
+            or self.sanitized_bt_buf.shape[0] < batch_size
+            or self.sanitized_bt_buf.shape[1] < max_cols
         )
+        if need_new_buf:
+            if self.cuda_graph_prepared:
+                current_shape = (
+                    None
+                    if self.sanitized_bt_buf is None
+                    else tuple(self.sanitized_bt_buf.shape)
+                )
+                raise RuntimeError(
+                    "AiterPrefillAttnOpPaged CUDA graph replay requires a stable "
+                    "sanitized block-table buffer address; replay metadata exceeded "
+                    f"capture capacity {current_shape} -> "
+                    f"({batch_size}, {max_cols})"
+                )
+            self.sanitized_bt_buf = torch.zeros(
+                batch_size, max_cols, dtype=torch.int32, device=self.graph_device
+            )
         self.cuda_graph_prepared = True
 
     def forward(self, qkv, kv_cache, fmha_params) -> torch.Tensor:
@@ -839,8 +860,8 @@ class AiterPrefillAttnOpPaged:
             # CUDA graph replay requires stable tensor addresses. Copy the
             # sanitized result into the pre-allocated fixed-address buffer.
             cols = sanitized_bt.shape[1]
-            self.sanitized_bt_buf[:, :cols] = sanitized_bt
-            block_table = self.sanitized_bt_buf[:, :cols]
+            self.sanitized_bt_buf[:batch_size, :cols].copy_(sanitized_bt)
+            block_table = self.sanitized_bt_buf[:batch_size, :cols]
         else:
             block_table = sanitized_bt
 
@@ -1538,8 +1559,8 @@ class AiterPrefillImplPaged(FMHAImplBase):
         fmha_params = self.fmha_params
         expected_batch = fmha_params.cu_seqlens_q.numel() - 1
 
-        live_cu_seqlens_q = getattr(attn_inputs, "cu_seqlens_device", None)
-        live_cu_seqlens_k = getattr(attn_inputs, "cu_kv_seqlens_device", None)
+        live_cu_seqlens_q = getattr(attn_inputs, "cu_seqlens", None)
+        live_cu_seqlens_k = getattr(attn_inputs, "cu_kv_seqlens", None)
         use_live_cu_seqlens = (
             live_cu_seqlens_q is not None
             and live_cu_seqlens_k is not None
@@ -1679,7 +1700,7 @@ class AiterDecodeImplBase(FMHAImplBase):
         self.fmha_params.fillParams(
             attn_inputs.sequence_lengths,
             attn_inputs.input_lengths,
-            attn_inputs.kv_cache_kernel_block_id,
+            attn_inputs.kv_cache_kernel_block_id_host,
             attn_inputs.kv_cache_kernel_block_id_device,
         )
         if attn_inputs.kv_cache_kernel_block_id_device is not None:

@@ -9,6 +9,7 @@
 #include "rtp_llm/cpp/cache/CacheConfig.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/engine_base/stream/StreamGroups.h"
+#include "rtp_llm/cpp/models/ModelTypes.h"
 #include "rtp_llm/cpp/models/SampleInfos.h"
 #include "rtp_llm/cpp/normal_engine/NormalModelInputGatherer.h"
 #include "rtp_llm/cpp/normal_engine/NormalOutputDispatcher.h"
@@ -26,9 +27,17 @@ public:
 
     virtual absl::Status dispatch(const StreamGroups& stream_groups, const MergedOutput& merge_outputs) const;
     virtual absl::StatusOr<GptModelInputs> gatherModelInput(const StreamGroups& stream_groups) const;
+    virtual absl::StatusOr<GptModelInputs> gatherModelInput(const StreamGroups& stream_groups,
+                                                            TensorHolder&       host_holder) const;
     virtual absl::StatusOr<SamplerInputs>  gatherSamplerInput(const StreamGroups&    stream_groups,
                                                               const GptModelInputs&  model_inputs,
                                                               const GptModelOutputs& model_output) const;
+
+    // Build only the CUDA kv_cache_kernel_block_id tensor in 3-D layout.
+    // Read-only over streams: no stream->step() and no other fields.
+    // Empty input returns an undefined tensor.
+    virtual absl::StatusOr<torch::Tensor> gatherKvCacheKernelBlockId(const StreamGroups& stream_groups,
+                                                                     TensorHolder&       host_holder) const;
 
 protected:
     SamplerInputs allocateSamplerInputs(const StreamGroups& stream_groups,
@@ -57,6 +66,7 @@ protected:
     std::unique_ptr<NormalModelInputGatherer>   model_input_gatherer_;
     std::unique_ptr<NormalSamplerInputGatherer> sampler_input_gatherer_;
     std::unique_ptr<NormalOutputDispatcher>     output_dispatcher_;
+    mutable TensorHolder                        compat_host_holder_;
 };
 
 }  // namespace rtp_llm

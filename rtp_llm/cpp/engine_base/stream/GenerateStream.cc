@@ -133,10 +133,50 @@ absl::Status GenerateStream::incrKVBlock() {
 
 void GenerateStream::releaseResource() {
     RTP_LLM_PROFILE_FUNCTION();
+    // Return KV blocks only after all workers that captured this stream finish.
+    // Earlier release could let a worker write into blocks owned by another stream.
+    waitPendingAsyncBookkeeping();
     std::lock_guard<std::mutex> lock(*mutex_);
     if (!stream_cache_resource_->isResourceReleased()) {
         stream_cache_resource_->releaseResource();
     }
+}
+
+void GenerateStream::incPendingAsyncBookkeeping() {
+    async_bookkeeping_->count.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void GenerateStream::decPendingAsyncBookkeepingAndMaybeRelease() {
+    int prev = async_bookkeeping_->count.fetch_sub(1, std::memory_order_acq_rel);
+    RTP_LLM_CHECK(prev >= 1);
+    if (prev == 1) {
+        {
+            std::lock_guard<std::mutex> lk(async_bookkeeping_->mu);
+        }
+        async_bookkeeping_->cv.notify_all();
+        // The last worker performs any deferred release after its update lock
+        // has unwound, so releaseResource() can safely re-enter mutex_.
+        if (async_bookkeeping_->defer_release.exchange(false, std::memory_order_acq_rel)) {
+            releaseResource();
+        }
+    }
+}
+
+bool GenerateStream::hasPendingAsyncBookkeeping() const {
+    return async_bookkeeping_->count.load(std::memory_order_acquire) > 0;
+}
+
+void GenerateStream::waitPendingAsyncBookkeeping() {
+    std::unique_lock<std::mutex> lk(async_bookkeeping_->mu);
+    async_bookkeeping_->cv.wait(lk, [this] { return async_bookkeeping_->count.load(std::memory_order_acquire) == 0; });
+}
+
+void GenerateStream::markDeferredRelease() {
+    async_bookkeeping_->defer_release.store(true, std::memory_order_release);
+}
+
+bool GenerateStream::isDeferredReleasePending() const {
+    return async_bookkeeping_->defer_release.load(std::memory_order_acquire);
 }
 void GenerateStream::setNeedReleaseResource(bool need_release_resource) {
     need_release_resource_ = need_release_resource;
@@ -704,7 +744,6 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
     if (hasError() && !update_info.force_update_info) {
         return;
     }
-
     const auto& new_tokens = update_info.new_tokens;
 
     if (isPerfTest()) {
@@ -791,6 +830,11 @@ void GenerateStream::update(const StreamUpdateInfo& update_info) {
     RTP_LLM_LOG_DEBUG("stream [%ld] update", streamId());
     *is_context_stream_ = false;
     if (hasError() && !update_info.force_update_info) {
+        return;
+    }
+    // Ignore stale worker updates after finish; committing them would duplicate
+    // tokens and touch KV blocks only deferred until this worker exits.
+    if (isFinished() && !update_info.force_update_info) {
         return;
     }
 

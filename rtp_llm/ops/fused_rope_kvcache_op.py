@@ -30,7 +30,6 @@ class FusedRopeAttnParams:
     sequence_lengths: torch.Tensor
     max_seq_len: int
     max_prefix_length: int
-    context_total_kv_length: int
     decode_plan: bool
     attn_type: torch.dtype
 
@@ -41,8 +40,8 @@ class FusedRopeKVCachePrefillOpBase:
 
     def prepare(self, attn_inputs: PyAttentionInputs) -> FusedRopeAttnParams:
         if (
-            attn_inputs.kv_cache_kernel_block_id is not None
-            and attn_inputs.kv_cache_kernel_block_id.numel() > 0
+            attn_inputs.kv_cache_kernel_block_id_device is not None
+            and attn_inputs.kv_cache_kernel_block_id_device.numel() > 0
         ):
             kv_cache_offset = convert_offset_to_block_array(
                 attn_inputs.kv_cache_kernel_block_id_device
@@ -60,14 +59,13 @@ class FusedRopeKVCachePrefillOpBase:
             kv_cache_offset_h,
             attn_inputs.padding_offset,
             position_ids,
-            attn_inputs.cu_seqlens_device,
-            attn_inputs.cu_kv_seqlens_device,
+            attn_inputs.cu_seqlens,
+            attn_inputs.cu_kv_seqlens,
             attn_inputs.input_lengths,
             attn_inputs.prefix_lengths,
             attn_inputs.sequence_lengths,
             attn_inputs.input_lengths.max().item(),
             attn_inputs.prefix_lengths.max().item(),
-            attn_inputs.context_total_kv_length,
             False,
             get_scalar_type(attn_inputs.dtype),
         )
@@ -203,7 +201,7 @@ class FusedRopeKVCacheDecodeOp:
         rope_config = self.attn_configs.rope_config
         rope_cache = get_rope_cache_once(rope_config, self.attn_configs.max_seq_len)
         assert params.kv_cache_offset is not None
-        assert params.sequence_lengths.is_pinned(), "sequence_lengths is not pinned memory"
+        assert params.sequence_lengths.is_cuda, "sequence_lengths must be a CUDA tensor"
         return decode_fused_rope_kvcache(
             qkv,
             params.position_ids,
@@ -240,8 +238,8 @@ class FusedRopeKVCacheDecodeOp:
 
     def prepare(self, attn_inputs: PyAttentionInputs) -> FusedRopeAttnParams:
         assert (
-            attn_inputs.kv_cache_kernel_block_id is not None
-            and attn_inputs.kv_cache_kernel_block_id.numel() > 0
+            attn_inputs.kv_cache_kernel_block_id_device is not None
+            and attn_inputs.kv_cache_kernel_block_id_device.numel() > 0
         )
         kv_cache_offset = convert_offset_to_block_array(
             attn_inputs.kv_cache_kernel_block_id_device
@@ -252,14 +250,13 @@ class FusedRopeKVCacheDecodeOp:
             kv_cache_offset_h,
             attn_inputs.padding_offset,
             attn_inputs.combo_position_ids,
-            attn_inputs.cu_seqlens_device,
-            attn_inputs.cu_kv_seqlens_device,
+            attn_inputs.cu_seqlens,
+            attn_inputs.cu_kv_seqlens,
             attn_inputs.input_lengths,
             attn_inputs.prefix_lengths,
             attn_inputs.sequence_lengths,
             0,
             0,
-            attn_inputs.context_total_kv_length,
             True,
             get_scalar_type(attn_inputs.dtype),
         )

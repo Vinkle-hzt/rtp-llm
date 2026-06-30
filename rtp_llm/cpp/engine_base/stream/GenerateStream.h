@@ -14,13 +14,16 @@
 #include "rtp_llm/cpp/engine_base/system_prompt/SystemPrompt.h"
 #include "rtp_llm/cpp/models/position_ids/PositionIdsGenerator.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
+#include <atomic>
+#include <condition_variable>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <optional>
 
 namespace rtp_llm {
 
-// WARNGING: buffer in generate stream should all be host to avoid gpu buffer hold more time (except kv cache)
+// GenerateStream-owned buffers stay on host by default; KV cache is the device-side exception.
 
 struct StreamUpdateInfo {
     const torch::Tensor new_tokens;
@@ -45,9 +48,8 @@ struct StreamSpecUpdateInfo {
     int                 draft_token;
     const torch::Tensor draft_hidden_states;
     const torch::Tensor draft_token_probs;
-
-    bool update_remote_generate = true;
-    bool force_update_info      = false;
+    bool                update_remote_generate = true;
+    bool                force_update_info      = false;
 };
 
 struct SpeculativeExecutorStreamOutput {
@@ -245,7 +247,10 @@ public:
     ErrorInfo    statusInfo();
     std::string  stopReason();
 
-    void        setReserveStep(size_t reserve_step);
+    void   setReserveStep(size_t reserve_step);
+    size_t reserveStep() const {
+        return reserve_step_;
+    }
     StreamState moveToNext();
 
     virtual StreamState getStatus() const;
@@ -466,6 +471,50 @@ public:
         return sp_output_buffer_;
     }
 
+    // Count worker claims on this stream's KV resource.
+    // releaseResource waits for zero so worker-side update/specUpdate cannot
+    // write into blocks already returned to the pool.
+    void incPendingAsyncBookkeeping();
+    void decPendingAsyncBookkeepingAndMaybeRelease();
+    bool hasPendingAsyncBookkeeping() const;
+    void waitPendingAsyncBookkeeping();
+    void markDeferredRelease();
+    bool isDeferredReleasePending() const;
+
+    // Normal decode async device state. Normal decode accepts one sampler token
+    // per step, so the next-step state only needs the sampled token and the
+    // committed sequence length after that token.
+    struct NormalAsyncDeviceState {
+        uint64_t      epoch = 0;
+        torch::Tensor last_sample_token_gpu;  // [1] int32
+        torch::Tensor next_seq_len_gpu;       // [1] int32, seqLength after sample
+        // Host seqLength before the sampled token represented by this state.
+        // -1 = unset (first iter / cleared).
+        int last_real_seq_len = -1;
+        // Host mirror of next_seq_len_gpu, computed at publish time so the
+        // scheduler can drive incrKVBlock without racing the async worker.
+        // -1 = unset (first iter / cleared).
+        int next_real_seq_len = -1;
+    };
+
+    uint64_t setNormalAsyncDeviceState(NormalAsyncDeviceState state) {
+        state.epoch         = ++normal_async_epoch_counter_;
+        normal_async_state_ = std::move(state);
+        return normal_async_state_.epoch;
+    }
+    const NormalAsyncDeviceState& getNormalAsyncDeviceState() const {
+        return normal_async_state_;
+    }
+    void markGrpcNormalDeviceStatePending() {
+        grpc_normal_device_state_pending_->store(true, std::memory_order_release);
+    }
+    bool hasGrpcNormalDeviceStatePending() const {
+        return grpc_normal_device_state_pending_->load(std::memory_order_acquire);
+    }
+    bool consumeGrpcNormalDeviceStatePending() {
+        return grpc_normal_device_state_pending_->exchange(false, std::memory_order_acq_rel);
+    }
+
     GenerateStreamPtr getProposeStream() {
         return propose_stream_;
     }
@@ -585,19 +634,9 @@ protected:
     kmonitor::MetricsReporterPtr metrics_reporter_;
     rtp_llm::SpecialTokens       special_tokens_;
 
-    // Shared ownership diamond:
-    //   GenerateStream owns both stream_cache_resource_ and generate_status_ (GenerateStateMachine).
-    //   generate_status_ also holds a shared_ptr to the same StreamCacheResource.
-    //
-    //   GenerateStream ──shared_ptr──> StreamCacheResource
-    //        │                               ^
-    //        └──shared_ptr──> GenerateStateMachine ──shared_ptr──┘
-    //
-    // This is intentional: GenerateStateMachine needs direct access to StreamCacheResource
-    // for state transitions (e.g., loading cache, releasing blocks). Both owners share the
-    // same instance via shared_ptr, so reference counting ensures correct lifetime management.
-    // No circular reference exists because neither StreamCacheResource nor GenerateStateMachine
-    // holds a back-reference to GenerateStream.
+    // GenerateStream and GenerateStateMachine share StreamCacheResource by
+    // shared_ptr; neither resource nor state machine points back here, so no
+    // ownership cycle is created.
 
     torch::Tensor                            cum_log_probs_;
     torch::Tensor                            all_probs_;
@@ -622,6 +661,23 @@ protected:
     bool                               contain_propose_token_ = false;
     int                                mtp_token_index_       = 0;
     SpeculativeExecutorStreamOutputPtr sp_output_buffer_      = nullptr;
+
+    // Separate lock/cv avoids deadlocking releaseResource with worker updates
+    // that need mutex_. Shared ownership preserves the coordinator across
+    // GenerateStream copies captured by async workers.
+    struct AsyncBookkeepingCoordinator {
+        std::atomic<int>        count{0};
+        std::atomic<bool>       defer_release{false};
+        std::mutex              mu;
+        std::condition_variable cv;
+    };
+    std::shared_ptr<AsyncBookkeepingCoordinator> async_bookkeeping_ = std::make_shared<AsyncBookkeepingCoordinator>();
+
+    // Stream-async device-resident state for the next decode step's prepare.
+    // This stays default-constructed until async/sync publishers install state.
+    NormalAsyncDeviceState             normal_async_state_;
+    uint64_t                           normal_async_epoch_counter_       = 0;
+    std::shared_ptr<std::atomic<bool>> grpc_normal_device_state_pending_ = std::make_shared<std::atomic<bool>>(false);
 
     bool return_all_hidden_states_ = false;
 

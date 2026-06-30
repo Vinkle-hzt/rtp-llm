@@ -182,6 +182,9 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
                                         .clone();
         generate_stream->setContextPositionIds(context_position_ids);
     }
+    if (!propose_maga_init_params_) {
+        generate_stream->markGrpcNormalDeviceStatePending();
+    }
     if (propose_maga_init_params_) {
         generate_stream->setReuseLength(generate_stream->seqLength() - 1);
         generate_stream->setSpEditRun(false);
@@ -201,13 +204,12 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
         auto& tensors_holder = sp_output_buffer->tensors_holder;
         tensors_holder.emplace_back(std::move(propose_probs_t));
         tensors_holder.emplace_back(std::move(propose_hidden_t));
-
         generate_stream->setSPOutputBuffer(sp_output_buffer);
     }
 
     generate_stream->resetBeginTime(currentTimeUs());
     RTP_LLM_LOG_DEBUG(
-        "decode init stream[%d]: %s", generate_stream->streamId(), generate_stream->debugString().c_str());
+        "decode init stream[%ld]: %s", generate_stream->streamId(), generate_stream->debugString().c_str());
     engine_->enqueue(generate_stream);
     RTP_LLM_LOG_DEBUG("request [%s] enqueue success", decode_context.request_key.c_str());
     decode_context.error_status =

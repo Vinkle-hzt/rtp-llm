@@ -105,19 +105,34 @@ class XQAImpl(FMHAImplBase):
         return self.fmha_impl.forward(fmha_input, kv_cache, self.fmha_params)
 
     def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
-        common.update_trt_params(
-            self.fmha_impl,
-            self.rope_kvcache_impl,
-            self.fmha_params,
-            self.rope_params,
-            attn_inputs,
-        )
-        # update_trt_params only copies kv_cache_offset. The TRT XQA kernel also
-        # reads sequence_lengths via the captured data_ptr(), so we must update
-        # the data in-place at the address recorded during CUDA graph capture.
         new_seq_lens = attn_inputs.sequence_lengths
         n = min(self._captured_seq_lens.numel(), new_seq_lens.numel())
         self._captured_seq_lens[:n].copy_(new_seq_lens[:n], non_blocking=True)
+
+        update_params = getattr(self.fmha_impl, "update", None)
+        if not callable(update_params):
+            common.update_trt_params(
+                self.fmha_impl,
+                self.rope_kvcache_impl,
+                self.fmha_params,
+                self.rope_params,
+                attn_inputs,
+            )
+            return
+
+        update_params(self.fmha_params, attn_inputs)
+        update_offset = getattr(self.fmha_impl, "update_kv_cache_offset", None)
+        if callable(update_offset):
+            update_offset(
+                self.rope_params.kv_cache_offset,
+                attn_inputs.kv_cache_kernel_block_id_device,
+            )
+        else:
+            new_rope_params = self.rope_kvcache_impl.prepare(attn_inputs)
+            common.copy_kv_cache_offset(
+                self.rope_params.kv_cache_offset, new_rope_params.kv_cache_offset
+            )
+        self.rope_params.sequence_lengths = attn_inputs.sequence_lengths
 
 
 class XQADecodeImpl(FMHAImplBase):
@@ -223,7 +238,7 @@ class XQAWrapper:
     ):
         self.config = config
         self.attn_inputs = attn_inputs
-        self.cu_qseqlens = attn_inputs.cu_seqlens_device
+        self.cu_qseqlens = attn_inputs.cu_seqlens
         assert not self.attn_inputs.is_prefill, "XQA is not supported"
         self.workspace_buffer = get_xqa_workspace_buffer()
         self.semaphores = torch.zeros(8 * 1024 * 1024, dtype=torch.uint8, device="cuda")
@@ -270,7 +285,7 @@ class XQAWrapper:
         )
 
     def _compute_batch_geometry(self, attn_inputs: PyAttentionInputs) -> None:
-        cu_seqlens = attn_inputs.decode_cu_seqlens
+        cu_seqlens = attn_inputs.decode_cu_seqlens_host
         seqlens = torch.diff(cu_seqlens).tolist()
         assert (
             len(set(seqlens)) == 1
