@@ -49,6 +49,10 @@ absl::StatusOr<GptModelInputs> NormalBatchStreamProcessor::gatherModelInput(cons
     return model_input_gatherer_->gather(stream_groups, host_holder);
 }
 
+bool NormalBatchStreamProcessor::canUseNormalAsyncDeviceState() const {
+    return model_input_gatherer_->canUseNormalAsyncDeviceState();
+}
+
 absl::StatusOr<SamplerInputs> NormalBatchStreamProcessor::gatherSamplerInput(
     const StreamGroups& stream_groups, const GptModelInputs& model_inputs, const GptModelOutputs& model_output) const {
     return sampler_input_gatherer_->gather(stream_groups, model_inputs, model_output);

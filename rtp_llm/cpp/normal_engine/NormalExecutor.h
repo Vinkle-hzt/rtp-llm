@@ -58,8 +58,9 @@ protected:
     bool useStreamAsync() const;
 
     // Skip the front-loaded previous-worker sync when DROP_BROAD_SYNC=1.
-    // Host stream state may still be mutating; NormalAsyncDeviceState only
-    // covers sampled token and seq_len for batch-1 decode.
+    // Host stream state may still be mutating; NormalAsyncDeviceState carries
+    // the sampled token and seq_len needed to launch the next normal decode
+    // forward. Sampler still waits for committed host token history.
     bool useDropBroadSync() const;
 
     // Stream-async dispatch. Records sampler_event on the main stream after
@@ -73,18 +74,11 @@ protected:
     void publishNormalDeviceState(const StreamGroups& stream_groups, const SamplerOutput& sampler_output);
     void prepareGrpcNormalDeviceState(const StreamGroups& stream_groups);
 
-    // Mirror the use_normal_device_state condition in processDecodeStreams.
-    // When false, gather falls back to host accessors still mutated by the
-    // worker, so callers must sync before gather.
-    bool gatherCanUseDeviceState(const StreamGroups& stream_groups) const;
+    // Gate the forward-only snapshot path before building StreamGroups; when
+    // false and bookkeeping is pending, process() waits before reading host state.
+    bool canUseDeviceStateBeforeStreamGroups(const std::list<GenerateStreamPtr>& streams) const;
 
-    // Env-gated path that moves metadata tensors to CUDA before tpSyncModelInputs.
-    // This routes them through one GPU packed-buffer broadcast instead of CPU
-    // execBroadcastCpu plus per-rank unpack/copy work.
-    bool useDeviceInput() const;
-    bool checkDeviceInput() const;
     void ensureModelInputsOnCuda(GptModelInputs& model_input, const char* tag);
-    void checkModelInputsOnCuda(const GptModelInputs& model_input, const char* tag) const;
 
 private:
     std::unique_ptr<ModelBase>                                               model_;

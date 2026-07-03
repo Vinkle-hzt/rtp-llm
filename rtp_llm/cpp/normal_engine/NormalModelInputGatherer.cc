@@ -262,6 +262,13 @@ void publishModelInputCoreTensorsToCuda(GptModelInputs& model_input, TensorHolde
 
 NormalModelInputGatherer::NormalModelInputGatherer(const NormalModelInputGathererConfig& config): config_(config) {}
 
+bool NormalModelInputGatherer::canUseNormalAsyncDeviceState() const {
+    // Decode position ids are derived from the seq_len snapshot published in
+    // NormalAsyncDeviceState. That avoids reading GenerateStream::seqLength()
+    // while the async output worker may still be committing the sampled token.
+    return true;
+}
+
 GptModelInputs NormalModelInputGatherer::allocateModelInputBuffers(const StreamGroups& stream_groups) const {
     const size_t current_tokens_size      = stream_groups.modelExecuteTokenSize();
     const size_t total_batch_size         = stream_groups.totalModelBatchSize();
@@ -342,14 +349,23 @@ absl::Status NormalModelInputGatherer::processDecodeStreams(GptModelInputs&     
     RTP_LLM_PROFILE_SCOPE("normal_engine.model_input_gatherer.process_decode_streams");
     auto ctx = createGatherContext(config_, model_input, stream_groups, GatherContextMode::DECODE);
 
-    bool use_normal_device_state = stream_groups.totalContextBatchSize() == 0
-                                   && stream_groups.totalDecodeBatchSize() > 0 && !ctx.need_cal_position_id;
+    bool use_normal_device_state = stream_groups.builtFromNormalAsyncDeviceState()
+                                   && stream_groups.totalContextBatchSize() == 0
+                                   && stream_groups.totalDecodeBatchSize() > 0 && canUseNormalAsyncDeviceState();
     if (use_normal_device_state) {
         for (const auto& stream : stream_groups.decodeStreams()) {
-            const auto& state = stream->getNormalAsyncDeviceState();
-            if (stream->currentBatchSize() != 1 || !state.last_sample_token_gpu.defined()
+            const auto& state      = stream->getNormalAsyncDeviceState();
+            const int   output_len = state.next_real_seq_len - stream->inputLength();
+            const int   batch_size = output_len >= 0 ? stream->batchSize(output_len) : 0;
+            if (stream->hasNumBeams() || batch_size <= 0 || !state.last_sample_token_gpu.defined()
                 || !state.last_sample_token_gpu.is_cuda() || !state.next_seq_len_gpu.defined()
-                || !state.next_seq_len_gpu.is_cuda()) {
+                || !state.next_seq_len_gpu.is_cuda() || state.next_real_seq_len <= 0
+                || state.last_sample_token_gpu.numel() < batch_size || state.next_seq_len_gpu.numel() < batch_size) {
+                use_normal_device_state = false;
+                break;
+            }
+            if (ctx.need_cal_position_id && config_.mm_position_ids_style != PositionIdsStyle::DEFAULT
+                && !stream->getContextPositionIds().defined()) {
                 use_normal_device_state = false;
                 break;
             }
@@ -364,8 +380,18 @@ absl::Status NormalModelInputGatherer::processDecodeStreams(GptModelInputs&     
 
     for (const auto& stream : stream_groups.decodeStreams()) {
         model_input.need_all_logits = model_input.need_all_logits || stream->calculateLoss();
-        auto  current_batch_size    = stream->currentBatchSize();
-        auto& kv_cache              = *stream->kvCachePtr();
+        int current_batch_size;
+        if (use_normal_device_state) {
+            const auto& state  = stream->getNormalAsyncDeviceState();
+            current_batch_size = stream->batchSize(state.next_real_seq_len - stream->inputLength());
+            normal_combo_tokens_gpu.push_back(
+                state.last_sample_token_gpu.reshape({-1}).narrow(0, 0, current_batch_size).to(torch::kInt32));
+            normal_sequence_lengths_gpu.push_back(
+                (state.next_seq_len_gpu.reshape({-1}).narrow(0, 0, current_batch_size) - 1).to(torch::kInt32));
+        } else {
+            current_batch_size = stream->currentBatchSize();
+        }
+        auto& kv_cache = *stream->kvCachePtr();
         RTP_LLM_LOG_DEBUG("decode kv_cache: %s", kv_cache.debugString().c_str());
         RTP_LLM_LOG_DEBUG("decode stream: %s", stream->debugString().c_str());
 
@@ -377,18 +403,21 @@ absl::Status NormalModelInputGatherer::processDecodeStreams(GptModelInputs&     
                 if (asyncDebugEnabled() && stream->hasPendingAsyncBookkeeping()
                     && debug_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
                     RTP_LLM_LOG_WARNING("[async-debug] gather decode with pending bookkeeping: stream=%ld pd_sep=%d "
-                                        "status=%s cpu_seq=%d state_next_real=%d cur_blocks=%zu batch_idx=%d",
+                                        "status=%s state_next_real=%d batch_idx=%d",
                                         stream->streamId(),
                                         stream->queryPdSep(),
                                         StreamStateToString(stream->getStatus()).c_str(),
-                                        stream->seqLength(),
                                         state.next_real_seq_len,
-                                        stream->curBlocksNum(),
                                         ctx.batch_idx);
                 }
-                normal_combo_tokens_gpu.push_back(state.last_sample_token_gpu.reshape({1}));
-                normal_sequence_lengths_gpu.push_back((state.next_seq_len_gpu - 1).to(torch::kInt32).reshape({1}));
                 ctx.input_lengths[ctx.batch_idx] = stream->inputLength();
+                if (ctx.need_cal_position_id) {
+                    PositionIdsGenerator::generateNextPositionId(ctx.combo_position_ids
+                                                                     + ctx.batch_idx * config_.position_id_len_factor,
+                                                                 state.next_real_seq_len,
+                                                                 config_.mm_position_ids_style,
+                                                                 stream->getContextPositionIds());
+                }
             } else {
                 auto currentTokens = stream->currentExecuteTokens(i);
                 if (currentTokens[0] >= ctx.input_vocab_size) {
@@ -409,7 +438,9 @@ absl::Status NormalModelInputGatherer::processDecodeStreams(GptModelInputs&     
                 model_input, kv_cache, i, ctx.batch_idx, ctx.max_blocks_num, config_.kernel_blocks_per_kv_block);
             ctx.batch_idx += 1;
         }
-        addCacheUpdateCopy(ctx, stream->streamCacheResource().getKVBlockUpdateMapping());
+        if (!use_normal_device_state) {
+            addCacheUpdateCopy(ctx, stream->streamCacheResource().getKVBlockUpdateMapping());
+        }
         stream->step();
     }
 

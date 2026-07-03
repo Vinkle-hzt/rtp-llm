@@ -72,7 +72,7 @@ void PyWrappedModel::releaseBuffers() {
         held_attn_pyobj_ = py::object();
     }
     // TensorHolder release point (PyWrappedModel): advances model-internal
-    // host staging buffers from tensorHoldHostAndToCuda()/holdInputsHostBuffers().
+    // buffers from tensorHoldHostAndToCuda()/holdInputs().
     buffer_holder_.release();
 }
 
@@ -698,7 +698,7 @@ void PyWrappedModel::updateKVCacheKernelBlockId(const GptModelInputs& inputs) {
 GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.forward");
     DevicePerfWrapper wrapper(enable_device_perf_, "py model forward");
-    holdInputsHostBuffers(inputs);
+    holdInputs(inputs);
 
     // RAII guard: ensure prepared_attention_inputs_ is always reset to false on scope exit,
     // even if forward() throws. Without this, an exception after async prepareAttentionInputs
@@ -724,12 +724,11 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         // Direct async H2D for model-bound token tensors. Bypass d2d_copies_ so forward()
         // does not depend on the fused-copy queue — that queue is now an internal detail
         // of prepareAttentionInputs.
-        // Host buffer is already kept alive by holdInputsHostBuffers() above.
+        // Input object is already kept alive by holdInputs() above.
         torch::Tensor token_ids;
         if (inputs.combo_tokens.device().is_cuda()) {
             token_ids = inputs.combo_tokens;
         } else {
-            buffer_holder_.hold_host(inputs.combo_tokens);
             token_ids = inputs.combo_tokens.to(torch::kCUDA, /*non_blocking=*/true);
         }
 
@@ -754,7 +753,6 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         } else if (inputs.combo_position_ids.device().is_cuda()) {
             combo_position_ids = inputs.combo_position_ids;
         } else {
-            buffer_holder_.hold_host(inputs.combo_position_ids);
             combo_position_ids = inputs.combo_position_ids.to(torch::kCUDA, /*non_blocking=*/true);
         }
 
@@ -1244,43 +1242,8 @@ PyWrappedModel::splitInputsIntoMicroBatches(const GptModelInputs& inputs, const 
     return {micro_batch_inputs, token_slice_recipes};
 }
 
-void PyWrappedModel::holdInputsHostBuffers(const GptModelInputs& inputs) {
-    buffer_holder_.hold_host(inputs.combo_tokens);
-    buffer_holder_.hold_host(inputs.input_lengths);
-    buffer_holder_.hold_host(inputs.sequence_lengths);
-    buffer_holder_.hold_host(inputs.lm_output_indexes);
-    buffer_holder_.hold_host(inputs.prefix_lengths);
-
-    buffer_holder_.hold_host(inputs.combo_position_ids);
-    buffer_holder_.hold_host(inputs.combo_tokens_type_ids);
-
-    buffer_holder_.hold_host(inputs.last_hidden_states);
-
-    buffer_holder_.hold_host(inputs.attention_mask);
-    buffer_holder_.hold_host(inputs.kv_cache_block_id);
-    buffer_holder_.hold_host(inputs.kv_cache_layer_to_group);
-    buffer_holder_.hold_host(inputs.kv_cache_group_types);
-    buffer_holder_.hold_host(inputs.kv_cache_update_mapping);
-
-    if (inputs.multimodal_features.has_value()) {
-        for (auto& mm_feature : inputs.multimodal_features.value()) {
-            buffer_holder_.hold_host(mm_feature);
-        }
-    }
-
-    buffer_holder_.hold_host(inputs.text_tokens_mask);
-    buffer_holder_.hold_host(inputs.mm_features_locs);
-
-    if (inputs.input_embeddings.has_value()) {
-        for (auto& input_embedding : inputs.input_embeddings.value()) {
-            buffer_holder_.hold_host(input_embedding);
-        }
-    }
-    buffer_holder_.hold_host(inputs.input_embeddings_locs);
-
-    buffer_holder_.hold_host(inputs.request_id);
-    buffer_holder_.hold_host(inputs.request_pd_separation);
-    buffer_holder_.hold_host(inputs.cache_keys);
+void PyWrappedModel::holdInputs(const GptModelInputs& inputs) {
+    buffer_holder_.hold(inputs);
 }
 
 }  // namespace rtp_llm

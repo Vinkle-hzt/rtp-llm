@@ -95,6 +95,9 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         if (inputs.lm_output_indexes.defined() && inputs.lm_output_indexes.is_cuda()) {
             device_bits |= GptModelInputDeviceBit::kDeviceBitLmOutputIndexes;
         }
+        if (inputs.combo_position_ids.defined() && inputs.combo_position_ids.is_cuda()) {
+            device_bits |= GptModelInputDeviceBit::kDeviceBitComboPositionIds;
+        }
         shape_hints_ptr[GptModelInputIndex::tensorDeviceMap] = static_cast<int32_t>(device_bits);
     }
 
@@ -224,7 +227,9 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
                                                 {(size_t)shape_hints_ptr[GptModelInputIndex::lmOutputIndexes]},
                                             pickAlloc(GptModelInputDeviceBit::kDeviceBitLmOutputIndexes));
         if (combo_position_ids_size) {
-            inputs.combo_position_ids = allocBuf(rtp_llm::DataType::TYPE_INT32, {(size_t)combo_position_ids_size});
+            inputs.combo_position_ids = allocBuf(rtp_llm::DataType::TYPE_INT32,
+                                                 {(size_t)combo_position_ids_size},
+                                                 pickAlloc(GptModelInputDeviceBit::kDeviceBitComboPositionIds));
         }
         if (shape_hints_ptr[GptModelInputIndex::mtpHiddenStates]) {
             auto hidden_states_dim0 = (size_t)shape_hints_ptr[GptModelInputIndex::comboTokens];

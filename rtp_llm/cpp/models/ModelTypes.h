@@ -7,6 +7,7 @@
 #include "rtp_llm/cpp/cache/BufferTypes.h"
 #include "rtp_llm/cpp/cache/Types.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
+#include "rtp_llm/cpp/models/TensorHolder.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
 #include <string>
 #include <utility>
@@ -88,11 +89,12 @@ enum GptModelInputIndex : size_t {
 // Bit positions for `tensorDeviceMap`. Only fields that may arrive on device
 // need a bit; other fields stay CPU.
 enum GptModelInputDeviceBit : uint32_t {
-    kDeviceBitComboTokens     = 1u << 0,
-    kDeviceBitInputLengths    = 1u << 1,
-    kDeviceBitSequenceLengths = 1u << 2,
-    kDeviceBitPrefixLengths   = 1u << 3,
-    kDeviceBitLmOutputIndexes = 1u << 4,
+    kDeviceBitComboTokens      = 1u << 0,
+    kDeviceBitInputLengths     = 1u << 1,
+    kDeviceBitSequenceLengths  = 1u << 2,
+    kDeviceBitPrefixLengths    = 1u << 3,
+    kDeviceBitLmOutputIndexes  = 1u << 4,
+    kDeviceBitComboPositionIds = 1u << 5,
 };
 
 void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallelism_config);
@@ -110,31 +112,6 @@ struct MicroBatchPlan {
 struct TokenSliceInfo {
     size_t offset = 0;
     size_t count  = 0;
-};
-
-struct TensorHolder {
-    std::vector<torch::Tensor> tensors;
-    std::vector<torch::Tensor> clear_tensors;
-
-    void hold_host(const torch::Tensor& tensor) {
-        if (tensor.defined() && tensor.device().is_cpu()) {
-            tensors.push_back(tensor);
-        }
-    }
-
-    void hold(const torch::Tensor& tensor) {
-        if (tensor.defined()) {
-            tensors.push_back(tensor);
-        }
-    }
-
-    void release() {
-        // Move the current hold set into clear_tensors, releasing the previous
-        // clear_tensors set. This keeps async H2D/D2H source tensors alive for
-        // one extra release point without each caller owning a custom holder.
-        clear_tensors = std::move(tensors);
-        tensors.clear();
-    }
 };
 
 class ModelBase {

@@ -291,7 +291,11 @@ bool GenerateStream::returnCumLogProbs() const {
 }
 
 bool GenerateStream::genTimeline() const {
-    return seqLength() <= inputLength() + profileStep() - 1 ? gen_timeline_ : false;
+    return genTimelineForSeqLen(seqLength());
+}
+
+bool GenerateStream::genTimelineForSeqLen(int seq_len) const {
+    return seq_len <= inputLength() + profileStep() - 1 ? gen_timeline_ : false;
 }
 
 void GenerateStream::setGenTimeline(bool gen_timeline) {
