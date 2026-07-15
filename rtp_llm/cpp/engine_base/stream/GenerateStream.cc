@@ -160,9 +160,7 @@ void GenerateStream::decPendingAsyncBookkeepingAndMaybeRelease() {
     int prev = async_bookkeeping_->count.fetch_sub(1, std::memory_order_acq_rel);
     RTP_LLM_CHECK(prev >= 1);
     if (prev == 1) {
-        {
-            std::lock_guard<std::mutex> lk(async_bookkeeping_->mu);
-        }
+        { std::lock_guard<std::mutex> lk(async_bookkeeping_->mu); }
         async_bookkeeping_->cv.notify_all();
         // The last worker performs any deferred release after its update lock
         // has unwound, so releaseResource() can safely re-enter mutex_.
@@ -305,7 +303,11 @@ bool GenerateStream::returnCumLogProbs() const {
 }
 
 bool GenerateStream::genTimeline() const {
-    return seqLength() <= inputLength() + profileStep() - 1 ? gen_timeline_ : false;
+    return genTimelineForSeqLen(seqLength());
+}
+
+bool GenerateStream::genTimelineForSeqLen(int seq_len) const {
+    return seq_len <= inputLength() + profileStep() - 1 ? gen_timeline_ : false;
 }
 
 void GenerateStream::setGenTimeline(bool gen_timeline) {

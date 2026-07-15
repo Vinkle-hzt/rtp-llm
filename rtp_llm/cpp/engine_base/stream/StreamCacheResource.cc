@@ -144,14 +144,21 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
                         .loss              = {},
                         .src_batch_indices = {},
                         .all_hidden_states = {}});
-        if (stream->nextBatchSize() == 1) {
-            const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
-            stream->setNormalAsyncDeviceState(GenerateStream::NormalAsyncDeviceState{
-                .epoch                 = 0,
-                .last_sample_token_gpu = new_tokens.reshape({1}).to(cuda_i32),
-                .next_seq_len_gpu      = torch::full({1}, static_cast<int64_t>(stream->seqLength()), cuda_i32),
-            });
-        }
+        const auto cuda_i32              = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+        const auto current_batch_size    = stream->currentBatchSize();
+        const auto seq_length            = stream->seqLength();
+        auto       last_sample_token_gpu = stream->completeTokenIds()
+                                         .narrow(0, 0, current_batch_size)
+                                         .narrow(1, seq_length - 1, 1)
+                                         .reshape({current_batch_size})
+                                         .to(cuda_i32);
+        stream->setNormalAsyncDeviceState(GenerateStream::NormalAsyncDeviceState{
+            .epoch                 = 0,
+            .last_sample_token_gpu = std::move(last_sample_token_gpu),
+            .next_seq_len_gpu  = torch::full({(int64_t)current_batch_size}, static_cast<int64_t>(seq_length), cuda_i32),
+            .last_real_seq_len = seq_length,
+            .next_real_seq_len = seq_length,
+        });
         RTP_LLM_LOG_DEBUG("applyP2PSideChannel: appended first_token_id=%ld, stream_id=%ld",
                           payload->first_token_id,
                           stream->streamId());

@@ -12,14 +12,31 @@ namespace rtp_llm {
 
 struct StreamGroups {
 public:
-    StreamGroups(const std::list<GenerateStreamPtr>& streams) {
+    enum class BuildMode {
+        DEFAULT,
+        NORMAL_ASYNC_DEVICE_DECODE,
+    };
+
+    StreamGroups(const std::list<GenerateStreamPtr>& streams, BuildMode build_mode = BuildMode::DEFAULT) {
+        built_from_normal_async_device_state_ = build_mode == BuildMode::NORMAL_ASYNC_DEVICE_DECODE;
         for (auto& stream : streams) {
-            auto cur_batch_size  = stream->currentBatchSize();
-            auto next_batch_size = stream->nextBatchSize();
+            const bool normal_async_decode = build_mode == BuildMode::NORMAL_ASYNC_DEVICE_DECODE;
+            int        cur_batch_size;
+            int        next_batch_size;
+            if (normal_async_decode) {
+                const auto& state      = stream->getNormalAsyncDeviceState();
+                const int   output_len = state.next_real_seq_len - stream->inputLength();
+                cur_batch_size         = stream->batchSize(output_len);
+                next_batch_size        = stream->batchSize(output_len + 1);
+            } else {
+                cur_batch_size  = stream->currentBatchSize();
+                next_batch_size = stream->nextBatchSize();
+            }
             if (stream->isFakeStream()) {
                 is_fake_stream_ = true;
             }
-            if (stream->isContextStream()) {
+            const bool is_context_stream = normal_async_decode ? false : stream->isContextStream();
+            if (is_context_stream) {
                 context_streams_.push_back(stream);
                 total_context_batch_size_ += cur_batch_size;
                 max_context_seq_len_ = std::max(max_context_seq_len_, (size_t)stream->contextLength());
@@ -32,24 +49,32 @@ public:
             } else {
                 decode_streams_.push_back(stream);
                 total_decode_batch_size_ += cur_batch_size;
-                if (!has_multimodal_input_ && stream->multimodalFeaturesLength() > 0) {
+                if (!normal_async_decode && !has_multimodal_input_ && stream->multimodalFeaturesLength() > 0) {
                     has_multimodal_input_ = true;
                 }
             }
-            auto block_update_copy_num = stream->streamCacheResource().getKVBlockUpdateMapping().size();
-            if (stream->isContextStream()) {
+            auto block_update_copy_num =
+                normal_async_decode ? 0 : stream->streamCacheResource().getKVBlockUpdateMapping().size();
+            if (is_context_stream) {
                 context_block_update_copy_num_ += block_update_copy_num;
             } else {
                 decode_block_update_copy_num_ += block_update_copy_num;
             }
-            model_execute_token_size_ += stream->currentExecuteTokenSize();
-            total_sampler_batch_size_in_ += stream->needTilingForSampling() ? next_batch_size : cur_batch_size;
+            model_execute_token_size_ += normal_async_decode ? cur_batch_size : stream->currentExecuteTokenSize();
+            const bool need_tiling_for_sampling = normal_async_decode ? false : stream->needTilingForSampling();
+            total_sampler_batch_size_in_ += need_tiling_for_sampling ? next_batch_size : cur_batch_size;
             total_sampler_batch_size_out_ += next_batch_size;
             max_blocks_num_ = std::max(max_blocks_num_, stream->curBlocksNum());
-            max_seq_len_    = std::max(max_seq_len_, (size_t)stream->seqLength());
+            if (normal_async_decode) {
+                const auto& state = stream->getNormalAsyncDeviceState();
+                max_seq_len_      = std::max(max_seq_len_, (size_t)state.next_real_seq_len);
+                gen_timeline_ |= stream->genTimelineForSeqLen(state.next_real_seq_len);
+            } else {
+                max_seq_len_ = std::max(max_seq_len_, (size_t)stream->seqLength());
+                gen_timeline_ |= stream->genTimeline();
+            }
             total_score_batch_size_ += stream->scoreLen();
             adapter_names.push_back(stream->adapterName());
-            gen_timeline_ |= stream->genTimeline();
         }
     }
 
@@ -214,6 +239,10 @@ public:
         return is_fake_stream_;
     }
 
+    bool builtFromNormalAsyncDeviceState() const {
+        return built_from_normal_async_device_state_;
+    }
+
     void setFakeStream(bool is_fake_stream) {
         is_fake_stream_ = is_fake_stream;
     }
@@ -256,23 +285,24 @@ public:
 private:
     std::list<GenerateStreamPtr> context_streams_;
     std::list<GenerateStreamPtr> decode_streams_;
-    size_t                       total_sampler_batch_size_in_   = 0;
-    size_t                       total_sampler_batch_size_out_  = 0;
-    size_t                       total_decode_batch_size_       = 0;
-    size_t                       total_context_batch_size_      = 0;
-    size_t                       decode_block_update_copy_num_  = 0;
-    size_t                       context_block_update_copy_num_ = 0;
-    size_t                       max_blocks_num_                = 0;
-    size_t                       model_execute_token_size_      = 0;
-    size_t                       max_seq_len_                   = 0;
-    size_t                       max_context_seq_len_           = 0;
-    size_t                       max_reuse_length_              = 0;
-    size_t                       cum_context_seq_len_           = 0;
-    size_t                       multimodal_features_len_       = 0;
-    size_t                       total_score_batch_size_        = 0;
-    bool                         has_multimodal_input_          = false;
-    bool                         gen_timeline_                  = false;
-    bool                         is_fake_stream_                = false;
+    size_t                       total_sampler_batch_size_in_          = 0;
+    size_t                       total_sampler_batch_size_out_         = 0;
+    size_t                       total_decode_batch_size_              = 0;
+    size_t                       total_context_batch_size_             = 0;
+    size_t                       decode_block_update_copy_num_         = 0;
+    size_t                       context_block_update_copy_num_        = 0;
+    size_t                       max_blocks_num_                       = 0;
+    size_t                       model_execute_token_size_             = 0;
+    size_t                       max_seq_len_                          = 0;
+    size_t                       max_context_seq_len_                  = 0;
+    size_t                       max_reuse_length_                     = 0;
+    size_t                       cum_context_seq_len_                  = 0;
+    size_t                       multimodal_features_len_              = 0;
+    size_t                       total_score_batch_size_               = 0;
+    bool                         has_multimodal_input_                 = false;
+    bool                         gen_timeline_                         = false;
+    bool                         is_fake_stream_                       = false;
+    bool                         built_from_normal_async_device_state_ = false;
     std::list<std::string>       adapter_names;
 };
 

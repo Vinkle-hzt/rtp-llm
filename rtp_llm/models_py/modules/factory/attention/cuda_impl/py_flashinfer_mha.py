@@ -718,14 +718,6 @@ class PyFlashinferDecodeAttnOp(object):
 
         forbid_realloc: True only when called from prepare_cuda_graph (replay); forbids buffer realloc.
         """
-        # Convert kv_cache_dtype to torch dtype
-        if self.kv_cache_dtype == KvCacheDataType.INT8:
-            kv_datatype = torch.int8
-        elif self.kv_cache_dtype == KvCacheDataType.FP8:
-            kv_datatype = torch.float8_e4m3fn
-        else:  # BASE
-            kv_datatype = get_scalar_type(attn_inputs.dtype)
-
         if self._requires_fa2_cuda_graph_replan():
             # FlashInfer tensor-core decode is routed through the fa2 prefill
             # planner, which reads host-side page-table metadata during plan().

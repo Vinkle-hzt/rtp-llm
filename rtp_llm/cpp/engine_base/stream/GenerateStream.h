@@ -186,6 +186,7 @@ public:
     bool   returnPromptLogits() const;
     bool   returnCumLogProbs() const;
     bool   genTimeline() const;
+    bool   genTimelineForSeqLen(int seq_len) const;
     int    profileStep() const;
     void   setGenTimeline(bool gen_timeline);
     bool   updatePrefix(const std::shared_ptr<SystemPrompt>& system_prompt);
@@ -574,13 +575,13 @@ public:
         mtp_async_state_ = MtpAsyncDeviceState{};
     }
 
-    // Normal decode async device state. Unlike MTP, normal decode accepts one
-    // sampler token per step, so the next-step state only needs the sampled
-    // token and the committed sequence length after that token.
+    // Normal decode async device state. The main thread publishes this before
+    // the async output worker mutates CompleteTokenIds, so the next decode step
+    // can use device tensors plus the host seq_len mirror without waiting.
     struct NormalAsyncDeviceState {
         uint64_t      epoch = 0;
-        torch::Tensor last_sample_token_gpu;  // [1] int32
-        torch::Tensor next_seq_len_gpu;       // [1] int32, seqLength after sample
+        torch::Tensor last_sample_token_gpu;  // [batch_size] int32
+        torch::Tensor next_seq_len_gpu;       // [batch_size] int32, seqLength after sample
         // Host seqLength before the sampled token represented by this state.
         // -1 = unset (first iter / cleared).
         int last_real_seq_len = -1;
