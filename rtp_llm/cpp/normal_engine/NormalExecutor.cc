@@ -27,24 +27,6 @@ bool readEnvFlagOnce(const char* env_name, const char* log_tag, const char* labe
     return on;
 }
 
-void holdSamplerInputHostBuffers(TensorHolder& holder, const SamplerInputs& inputs) {
-    holder.hold_host(inputs.token_ids);
-    holder.hold_host(inputs.input_lengths);
-    holder.hold_host(inputs.sequence_lengths);
-    holder.hold_host(inputs.num_beams_in);
-    holder.hold_host(inputs.num_beams_out);
-    holder.hold_host(inputs.top_k);
-    holder.hold_host(inputs.top_p);
-    holder.hold_host(inputs.temperature);
-    holder.hold_host(inputs.repetition_penalty);
-    holder.hold_host(inputs.presence_penalty);
-    holder.hold_host(inputs.frequency_penalty);
-    holder.hold_host(inputs.no_repeat_ngram_size);
-    holder.hold_host(inputs.do_sample);
-    holder.hold_host(inputs.finished_mask);
-    holder.hold_host(inputs.cum_log_probs);
-}
-
 bool hasPendingAsyncBookkeeping(const std::list<GenerateStreamPtr>& streams) {
     for (const auto& stream : streams) {
         if (stream->hasPendingAsyncBookkeeping()) {
@@ -153,8 +135,16 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
     auto        effective_kv_cache_layer_to_group = kv_cache_layer_to_group;
     if (cache_manager) {
         effective_kv_cache_group_num = static_cast<int32_t>(cache_config.groupNums());
-        effective_kv_cache_layer_to_group.assign(cache_config.layer_to_group_id.begin(),
-                                                 cache_config.layer_to_group_id.end());
+        effective_kv_cache_layer_to_group.clear();
+        effective_kv_cache_layer_to_group.reserve(cache_config.layers.size());
+        for (size_t layer_id = 0; layer_id < cache_config.layers.size(); ++layer_id) {
+            const auto& group_ids = cache_config.layers[layer_id].group_ids;
+            RTP_LLM_CHECK_WITH_INFO(group_ids.size() == 1,
+                                    "normal executor layer %zu owns %zu cache groups; expected exactly one group",
+                                    layer_id,
+                                    group_ids.size());
+            effective_kv_cache_layer_to_group.push_back(static_cast<int32_t>(group_ids.front()));
+        }
     }
 
     GptModelInitParams model_init_params(
@@ -329,7 +319,7 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
 
         CHECK_AND_RETURN_REF(sampler_input,
                              batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
-        holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
+        buffer_holder_.hold(sampler_input);
         sampler_output = std::move(sampler_->forward(sampler_input));
         RTP_LLM_LOG_DEBUG("sampler forward done");
         executor_collector.sample_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;

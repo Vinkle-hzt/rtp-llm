@@ -53,24 +53,6 @@ bool debugTargetVerifyInputEnabled() {
     return enabled;
 }
 
-void holdSamplerInputHostBuffers(TensorHolder& holder, const SamplerInputs& inputs) {
-    holder.hold_host(inputs.token_ids);
-    holder.hold_host(inputs.input_lengths);
-    holder.hold_host(inputs.sequence_lengths);
-    holder.hold_host(inputs.num_beams_in);
-    holder.hold_host(inputs.num_beams_out);
-    holder.hold_host(inputs.top_k);
-    holder.hold_host(inputs.top_p);
-    holder.hold_host(inputs.temperature);
-    holder.hold_host(inputs.repetition_penalty);
-    holder.hold_host(inputs.presence_penalty);
-    holder.hold_host(inputs.frequency_penalty);
-    holder.hold_host(inputs.no_repeat_ngram_size);
-    holder.hold_host(inputs.do_sample);
-    holder.hold_host(inputs.finished_mask);
-    holder.hold_host(inputs.cum_log_probs);
-}
-
 torch::Tensor toCudaWithHostHold(const torch::Tensor& tensor, TensorHolder& holder) {
     if (!tensor.defined() || tensor.is_cuda()) {
         return tensor;
@@ -103,26 +85,10 @@ bool MtpExecutor::isTpRank0() const {
     return tp_rank_ == 0;
 }
 
-bool MtpExecutor::useDeviceInput() const {
-    static const bool enabled = []() {
-        return readEnvFlagOnce("RTP_LLM_DEVICE_INPUT", "mtp-device-input", "enabled");
-    }();
-    return enabled;
-}
-
-bool MtpExecutor::checkDeviceInput() const {
-    static const bool enabled = []() {
-        return readEnvFlagOnce("RTP_LLM_DEVICE_INPUT_CHECK", "mtp-device-input", "enabled");
-    }();
-    return enabled;
-}
-
 void MtpExecutor::ensureModelInputsOnCuda(GptModelInputs& model_input, const char* tag) {
-    if (!useDeviceInput()) {
-        return;
-    }
+    buffer_holder_.hold(model_input);
 
-    auto to_cuda = [this, tag](torch::Tensor& tensor, const char* name) {
+    auto to_cuda = [tag](torch::Tensor& tensor, const char* name) {
         if (!tensor.defined() || tensor.is_cuda()) {
             return;
         }
@@ -136,7 +102,6 @@ void MtpExecutor::ensureModelInputsOnCuda(GptModelInputs& model_input, const cha
             tensor = tensor.to(torch::kCUDA);
             return;
         }
-        buffer_holder_.hold_host(tensor);
         tensor = tensor.to(torch::kCUDA, /*non_blocking=*/true);
     };
 
@@ -146,31 +111,9 @@ void MtpExecutor::ensureModelInputsOnCuda(GptModelInputs& model_input, const cha
     to_cuda(model_input.prefix_lengths, "prefix_lengths");
     to_cuda(model_input.sequence_lengths_plus_1, "sequence_lengths_plus_1");
     to_cuda(model_input.lm_output_indexes, "lm_output_indexes");
-    checkModelInputsOnCuda(model_input, tag);
-}
-
-void MtpExecutor::checkModelInputsOnCuda(const GptModelInputs& model_input, const char* tag) const {
-    if (!checkDeviceInput()) {
-        return;
-    }
-    auto check = [tag](const torch::Tensor& tensor, const char* name) {
-        if (!tensor.defined()) {
-            return;
-        }
-        RTP_LLM_CHECK_WITH_INFO(tensor.is_cuda(),
-                                "[mtp-device-input] %s.%s expected CUDA tensor, got device=%s numel=%ld",
-                                tag,
-                                name,
-                                tensor.device().str().c_str(),
-                                tensor.numel());
-    };
-    check(model_input.combo_tokens, "combo_tokens");
-    check(model_input.input_lengths, "input_lengths");
-    check(model_input.sequence_lengths, "sequence_lengths");
-    check(model_input.prefix_lengths, "prefix_lengths");
-    check(model_input.sequence_lengths_plus_1, "sequence_lengths_plus_1");
-    check(model_input.lm_output_indexes, "lm_output_indexes");
-    RTP_LLM_LOG_DEBUG("[mtp-device-input] %s metadata tensors are CUDA", tag);
+    // TP broadcast must not receive this as a CPU tensor: the generic
+    // callback promotes CPU inputs with a blocking copy and copies them back.
+    to_cuda(model_input.combo_position_ids, "combo_position_ids");
 }
 
 MtpExecutor::AcceptLenMetricsSnapshot MtpExecutor::consumePendingAcceptLenMetrics() {
@@ -469,7 +412,10 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
             model_init_params, params.py_model, false, true));
     }
 
-    is_linear_attention_model_ = target_cache_config.linear_group_num > 0;
+    is_linear_attention_model_ =
+        std::any_of(target_cache_config.groups.begin(), target_cache_config.groups.end(), [](const GroupBase& group) {
+            return group.policy.group_type == CacheGroupType::LINEAR;
+        });
     batch_stream_processor_.reset(new MtpBatchStreamProcessor(params.model_config_,
                                                               params.pd_sep_config,
                                                               params.profiling_debug_logging_config,
@@ -761,7 +707,7 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         } else {
             CHECK_AND_RETURN_REF(sampler_input,
                                  batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
-            holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
+            buffer_holder_.hold(sampler_input);
             sampler_output = std::move(sampler_->forward(sampler_input));
             // Restore the full combo_tokens / input_lengths before the MTP
             // shift logic — under CP both were mutated to rank-local by the
@@ -1038,7 +984,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             CHECK_AND_RETURN_REF(
                 sampler_input,
                 batch_stream_processor_->gatherSpecSamplerInput(stream_groups, model_input, model_output));
-            holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
+            buffer_holder_.hold(sampler_input);
             sampler_output           = std::move(sampler_->forward(sampler_input));
             sampler_output.all_probs = sampler_output.all_probs.reshape(
                 {(int64_t)batch_size, (int64_t)(propose_step_ + 1), (int64_t)vocab_size_});
@@ -1184,7 +1130,6 @@ void MtpExecutor::launchTargetVerifyPrepareAsync(const GptModelInputs& model_inp
                 RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_verify_prepare_wait_input)");
                 input_ready_event->block(cuda_graph::graphGetCurrentStream());
             }
-            checkModelInputsOnCuda(model_input_copy, "decode.target_prepare.forwarded");
             {
                 RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_verify_prepare_model_inputs)");
                 model_->prepareAttentionInputs(model_input_copy);
@@ -1211,7 +1156,6 @@ void MtpExecutor::launchDraftPrefillPrepareAsync(const GptModelInputs& model_inp
         [this, prefill_model, input_ready_event, model_input_copy = std::move(model_input_copy)]() mutable {
             RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_draft_prefill_input)");
             input_ready_event->block(cuda_graph::graphGetCurrentStream());
-            checkModelInputsOnCuda(model_input_copy, "decode.draft_prefill_prepare.forwarded");
             prefill_model->prepareAttentionInputs(model_input_copy);
         });
 }
@@ -1868,10 +1812,6 @@ void MtpExecutor::publishPrefillMtpDeviceState(const StreamGroups& stream_groups
                                                const MergedOutput& prefill_output,
                                                const MergedOutput& draft_prefill_output) {
     RTP_LLM_PROFILE_SCOPE("executor.mtp.prefill_step(publish_mtp_device_state)");
-
-    if (!useDeviceInput()) {
-        return;
-    }
 
     auto all_streams = stream_groups.allStreams();
     if (all_streams.empty()) {

@@ -919,7 +919,7 @@ TEST_F(HybridTypeKVCacheAllocatorTest, IncrMallocRollbackFreesBackfilledExisting
     auto batch_res = makeBatchResource(/*batch_size=*/1,
                                        /*group_nums=*/2,
                                        /*layer_num=*/static_cast<int>(config.layer_all_num),
-                                       /*layer_to_group_id=*/config.layer_to_group_id,
+                                       /*layer_group_ids=*/config.layerGroupIdsSnapshot(),
                                        CacheKeysType{100, 101, 102});
     batch_res->mutableBlockIds(0, gid_linear).assign(BlockIndicesType{seed_blocks[0], NULL_BLOCK_IDX, seed_blocks[1]});
     batch_res->mutableBlockIds(0, gid_full).assign(BlockIndicesType{seed_blocks[2]});

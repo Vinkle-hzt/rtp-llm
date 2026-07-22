@@ -338,7 +338,7 @@ TEST_F(MtpBatchStreamProcessorTest, testPrepareOneStepSpecDecodeModelInputFromDe
     SpeculativeExecutionConfig  sp_config;
     PDSepConfig                 pd_sep_config;
     ProfilingDebugLoggingConfig profiling_debug_logging_config;
-    CacheConfig                 cache_config;
+    CacheConfig                 cache_config = makeProcessorCacheConfig();
 
     model_config.max_seq_len    = 2048;
     model_config.vocab_size     = 4;
@@ -405,8 +405,7 @@ TEST_F(MtpBatchStreamProcessorTest, testPrepareOneStepSpecDecodeModelInputFromDe
 
     auto stream_groups = StreamGroups({stream1, stream2});
 
-    cache_config.group_types = {CacheGroupType::FULL};
-    auto processor           = MtpBatchStreamProcessor(
+    auto processor = MtpBatchStreamProcessor(
         model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
     TensorHolder holder;
     auto         model_input_status = processor.gatherDecodeModelInput(stream_groups, holder);
@@ -809,6 +808,41 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodeDraftModelInputAdvancesCombo
     EXPECT_EQ((vector<int>{6, 8}), toVec<int>(model_input.sequence_lengths));
     EXPECT_EQ((vector<float>{0.1, 0.2, 1.1, 1.2}), toVec<float>(model_input.last_hidden_states));
     EXPECT_EQ((vector<int>{6, 7, 8, 11, 12, 13}), toVec<int>(model_input.combo_position_ids));
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodeDraftModelInputKeepsComboPositionIdsOnCuda) {
+    ModelConfig                 model_config;
+    PDSepConfig                 pd_sep_config;
+    ProfilingDebugLoggingConfig profiling_debug_logging_config;
+    CacheConfig                 cache_config = makeProcessorCacheConfig();
+    SpeculativeExecutionConfig  sp_config;
+
+    model_config.max_seq_len                           = 2048;
+    model_config.vocab_size                            = 4;
+    model_config.num_layers                            = 1;
+    model_config.mm_model_config.mm_position_ids_style = MROPE;
+    model_config.attn_config.rope_config.index_factor  = 3;
+    sp_config.gen_num_per_cycle                        = 2;
+    MtpBatchStreamProcessor processor(
+        model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+
+    GptModelInputs model_input;
+    model_input.combo_tokens       = torch::tensor({11, 21}, torch::kInt32).cuda();
+    model_input.sequence_lengths   = torch::tensor({5, 7}, torch::kInt32).cuda();
+    model_input.combo_position_ids = torch::tensor({5, 6, 7, 10, 11, 12}, torch::kInt32).cuda();
+    const auto previous_position_ids = model_input.combo_position_ids;
+
+    GptModelOutputs model_output;
+    model_output.all_hidden_states =
+        torch::tensor({0.1f, 0.2f, 1.1f, 1.2f}, torch::kFloat32).reshape({2, 2}).cuda();
+    auto draft_token_ids = torch::tensor({12, 22}, torch::kInt32).reshape({2, 1}).cuda();
+
+    TensorHolder holder;
+    processor.updateDecodeDraftModelInput(model_input, model_output, draft_token_ids, holder);
+
+    EXPECT_TRUE(model_input.combo_position_ids.is_cuda());
+    EXPECT_EQ((vector<int>{6, 7, 8, 11, 12, 13}), toVec<int>(model_input.combo_position_ids));
+    EXPECT_EQ((vector<int>{5, 6, 7, 10, 11, 12}), toVec<int>(previous_position_ids));
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testExpandTargetVerifyPositionIdsInitializesNonDriverPlaceholder) {

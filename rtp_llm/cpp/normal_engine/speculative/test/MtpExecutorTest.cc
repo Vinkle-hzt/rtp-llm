@@ -1043,6 +1043,7 @@ TEST_F(MtpExecutorTest, testDraftModelDecodeExpandsTargetVerifyPositionIds) {
     EXPECT_EQ((std::vector<int>{5, 7}), toVec<int>(model_input.prefix_lengths));
     EXPECT_EQ(0, model_input.sequence_lengths.numel());
     EXPECT_EQ((std::vector<int>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}), toVec<int>(model_input.lm_output_indexes));
+    EXPECT_TRUE(model_input.combo_position_ids.is_cuda());
 
     EXPECT_EQ((std::vector<int>{5, 5, 5, 6, 6, 6, 7, 7, 7, 8,  8,  8,  9,  9,  9,
                                 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 11}),

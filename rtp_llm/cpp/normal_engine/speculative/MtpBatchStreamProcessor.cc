@@ -8,9 +8,7 @@
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include <algorithm>
 #include <atomic>
-#include <cstdlib>
 #include <numeric>
-#include <string>
 #include <vector>
 #include <cstring>
 
@@ -72,26 +70,6 @@ bool shouldLogFallback(uint64_t count) {
         return true;
     }
     return count % 1000 == 0;
-}
-
-bool useMtpDeviceInput() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("RTP_LLM_DEVICE_INPUT");
-        bool        on  = (env != nullptr && std::string(env) == "1");
-        RTP_LLM_LOG_INFO("[mtp-device-input] RTP_LLM_DEVICE_INPUT=%s -> processor enabled=%d",
-                         env ? env : "(unset)",
-                         static_cast<int>(on));
-        return on;
-    }();
-    return enabled;
-}
-
-torch::Tensor emptyInt32OnPreferredDevice(std::initializer_list<int64_t> shape) {
-    auto options = torch::TensorOptions().dtype(torch::kInt32).device(useMtpDeviceInput() ? torch::kCUDA : torch::kCPU);
-    if (!useMtpDeviceInput()) {
-        options = options.pinned_memory(true);
-    }
-    return torch::empty(shape, options);
 }
 
 torch::TensorOptions cudaInt32Options() {
@@ -617,31 +595,28 @@ void MtpBatchStreamProcessor::updateDecodeDraftModelInput(GptModelInputs&       
     model_input.combo_tokens = draft_token_ids.reshape({batch_size});
 
     if (model_input.combo_position_ids.defined()) {
-        const size_t position_id_len_factor = model_input_gatherer_config_.position_id_len_factor;
-        auto         next_position_ids =
-            torch::empty({(int64_t)(batch_size * position_id_len_factor)}, torch::kInt32).pin_memory();
-        int* dst_position_ids = next_position_ids.data_ptr<int>();
-        const auto src_position_ids = model_input.combo_position_ids.cpu().contiguous();
-        const int* src              = src_position_ids.data_ptr<int>();
-        for (int64_t i = 0; i < next_position_ids.numel(); ++i) {
-            dst_position_ids[i] = src[i] + 1;
+        if (model_input.combo_position_ids.is_cuda()) {
+            // Keep the draft loop device-only.  Calling .cpu() here copies to
+            // pageable host memory and synchronizes the stream, only for the
+            // next loop iteration to copy the position ids back to CUDA.
+            // Use an out-of-place add because async attention preparation can
+            // still hold a shallow copy of the previous tensor storage.
+            model_input.combo_position_ids = model_input.combo_position_ids + 1;
+        } else {
+            const size_t position_id_len_factor = model_input_gatherer_config_.position_id_len_factor;
+            auto         next_position_ids =
+                torch::empty({(int64_t)(batch_size * position_id_len_factor)}, torch::kInt32).pin_memory();
+            int*       dst_position_ids = next_position_ids.data_ptr<int>();
+            const auto src_position_ids = model_input.combo_position_ids.contiguous();
+            const int* src              = src_position_ids.data_ptr<int>();
+            for (int64_t i = 0; i < next_position_ids.numel(); ++i) {
+                dst_position_ids[i] = src[i] + 1;
+            }
+            model_input.combo_position_ids = std::move(next_position_ids);
         }
-        model_input.combo_position_ids = std::move(next_position_ids);
     }
 
-    if (useMtpDeviceInput() || model_input.sequence_lengths.is_cuda()) {
-        auto seq_lengths_d           = model_input.sequence_lengths.is_cuda() ? model_input.sequence_lengths :
-                                                                                model_input.sequence_lengths.to(torch::kCUDA);
-        model_input.sequence_lengths = (seq_lengths_d + 1).to(torch::kInt32);
-    } else {
-        // Legacy CPU fallback when device input is disabled and the caller has
-        // not already published sequence_lengths on CUDA.
-        auto sequence_lengths_cpu = model_input.sequence_lengths.cpu().clone().pin_memory();
-        for (int i = 0; i < batch_size; i++) {
-            sequence_lengths_cpu.data_ptr<int>()[i]++;
-        }
-        model_input.sequence_lengths = toCudaInt32(sequence_lengths_cpu, host_holder);
-    }
+    model_input.sequence_lengths = toCudaInt32(model_input.sequence_lengths, host_holder) + 1;
 }
 
 void MtpBatchStreamProcessor::updatePrefillPostDraftModelInput(const StreamGroups&    stream_groups,
@@ -733,7 +708,7 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
                                                               torch::Tensor&      draft_token_probs_d_t,
                                                               TensorHolder&       host_holder) {
     const size_t batch_size      = stream_groups.size();
-    auto         draft_token_ids = emptyInt32OnPreferredDevice({(int64_t)batch_size, (int64_t)propose_step_});
+    auto         draft_token_ids = emptyInt32OnCuda({(int64_t)batch_size, (int64_t)propose_step_});
 
     std::vector<torch::Tensor> draft_token_probs_list;
     std::vector<torch::Tensor> draft_token_id_slices;
@@ -756,13 +731,8 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
     }
 
     if (!draft_token_id_slices.empty()) {
-        draft_token_ids = torch::cat(draft_token_id_slices, 0)
-                              .to(torch::kInt32)
+        draft_token_ids = toCudaInt32(torch::cat(draft_token_id_slices, 0), host_holder)
                               .reshape({(int64_t)batch_size, (int64_t)propose_step_});
-        if (useMtpDeviceInput() && !draft_token_ids.is_cuda()) {
-            host_holder.hold_host(draft_token_ids);
-            draft_token_ids = draft_token_ids.to(torch::kCUDA, /*non_blocking=*/true);
-        }
     }
 
     draft_token_probs_d_t          = torch::stack(draft_token_probs_list, 0).contiguous();

@@ -119,10 +119,7 @@ protected:
                           std::vector<torch::Tensor>& draft_probs_list,
                           torch::Tensor&              draft_token_ids_t);
 
-    bool useDeviceInput() const;
-    bool checkDeviceInput() const;
     void ensureModelInputsOnCuda(GptModelInputs& model_input, const char* tag);
-    void checkModelInputsOnCuda(const GptModelInputs& model_input, const char* tag) const;
 
     AcceptLenMetricsSnapshot consumePendingAcceptLenMetrics();
     void
