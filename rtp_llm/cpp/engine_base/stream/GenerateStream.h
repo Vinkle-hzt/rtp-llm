@@ -510,6 +510,11 @@ public:
         // before worker-side specUpdate has written sp_output_buffer fields.
         torch::Tensor last_hidden_states_gpu;
         torch::Tensor draft_all_probs_gpu;
+        // Final physical-block assignments for the next target verify.
+        // Shape: [1, linear_group_num, 4, 2], int32 CUDA. The last
+        // dimension is [physical_block_position, physical_block_id]; a
+        // negative position marks an unused entry.
+        torch::Tensor linear_block_updates_gpu;
         // True host seqLength observed when this state is published. MTP async
         // uses it as the base for the next KV allocation upper bound.
         // -1 = unset (first iter / cleared).

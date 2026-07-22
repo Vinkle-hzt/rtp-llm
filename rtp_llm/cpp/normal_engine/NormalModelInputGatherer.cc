@@ -107,13 +107,14 @@ void copyKvCacheBlocksToModelInput(GptModelInputs&             model_input,
     int32_t*     store_dst_base  = model_input.kv_cache_block_id.data_ptr<int32_t>();
 
     for (int gid = 0; gid < kv_cache.groupNums(); ++gid) {
-        auto&    kernel_blocks = kv_cache.kernelBlocks(stream_batch_idx, gid);
-        int32_t* kernel_dst    = kernel_dst_base
+        BlockIndicesType physical_blocks;
+        BlockIndicesType kernel_blocks;
+        kv_cache.snapshotBlocks(stream_batch_idx, gid, &physical_blocks, &kernel_blocks);
+        int32_t* kernel_dst = kernel_dst_base
                               + (static_cast<size_t>(gid) * batch + static_cast<size_t>(model_batch_idx))
                                     * max_blocks_num * kernel_blocks_per_kv_block;
         std::memcpy(kernel_dst, kernel_blocks.data(), kernel_blocks.size() * sizeof(int32_t));
 
-        auto&    physical_blocks = kv_cache.blocks(stream_batch_idx, gid);
         int32_t* store_dst =
             store_dst_base + (static_cast<size_t>(gid) * batch + static_cast<size_t>(model_batch_idx)) * max_blocks_num;
         std::memcpy(store_dst, physical_blocks.data(), physical_blocks.size() * sizeof(int32_t));
@@ -581,8 +582,9 @@ absl::StatusOr<torch::Tensor> NormalModelInputGatherer::gatherKvCacheKernelBlock
         auto  current_batch_size = stream->currentBatchSize();
         for (int i = 0; i < current_batch_size; ++i) {
             for (int gid = 0; gid < kv_cache.groupNums(); ++gid) {
-                const auto& kernel_blocks = kv_cache.kernelBlocks(i, gid);
-                int32_t*    dst =
+                BlockIndicesType kernel_blocks;
+                kv_cache.snapshotBlocks(i, gid, nullptr, &kernel_blocks);
+                int32_t* dst =
                     dst_base
                     + (static_cast<size_t>(gid) * total_batch_size + static_cast<size_t>(batch_idx)) * per_batch_stride;
                 std::memcpy(dst, kernel_blocks.data(), kernel_blocks.size() * sizeof(int32_t));

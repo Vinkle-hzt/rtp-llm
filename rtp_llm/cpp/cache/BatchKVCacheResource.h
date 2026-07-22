@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -75,6 +76,21 @@ public:
     const BlockIndicesType& kernelBlocks(int batch_id, int group_id = 0) const {
         RTP_LLM_CHECK(batch_id >= 0 && static_cast<size_t>(batch_id) < batch_resource.size());
         return batch_resource[batch_id].kernelBlocks(group_id);
+    }
+
+    void snapshotBlocks(int               batch_id,
+                        int               group_id,
+                        BlockIndicesType* physical_blocks,
+                        BlockIndicesType* kernel_blocks) const {
+        RTP_LLM_CHECK(batch_id >= 0 && static_cast<size_t>(batch_id) < batch_resource.size());
+        std::lock_guard<std::mutex> lock(*block_table_mutex_);
+        const auto&                 resource = batch_resource[batch_id];
+        if (physical_blocks != nullptr) {
+            *physical_blocks = resource.blocks(group_id);
+        }
+        if (kernel_blocks != nullptr) {
+            *kernel_blocks = resource.kernelBlocks(group_id);
+        }
     }
 
     const BlockIndicesType& kernelBlocks(int batch_id, int layer_id, int group_id) const {
@@ -241,11 +257,16 @@ public:
     }
 
     void swapBlocks(int32_t batch_id, size_t group_id, size_t rhs, size_t lhs) {
+        std::lock_guard<std::mutex> lock(*block_table_mutex_);
         batch_resource[batch_id].swapBlocks(group_id, rhs, lhs);
     }
 
 private:
     std::vector<KVCacheResource> batch_resource;  // [batch_size]
+    // The async MTP worker swaps linear block IDs while the main thread builds
+    // the next model input. Keep that mutation and the corresponding snapshot
+    // memcpy race-free without serializing the rest of stream bookkeeping.
+    std::shared_ptr<std::mutex> block_table_mutex_ = std::make_shared<std::mutex>();
 };
 
 using BatchKVCacheResourcePtr = std::shared_ptr<BatchKVCacheResource>;

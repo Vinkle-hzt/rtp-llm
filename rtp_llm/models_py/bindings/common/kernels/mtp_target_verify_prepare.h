@@ -47,4 +47,23 @@ void invokeMtpDispatchStatePrepare(const torch::Tensor& accept_len,
                                    int64_t              batch_size,
                                    MtpPrepareStream     stream);
 
+// Build an idempotent physical-block patch equivalent to the two ordered
+// swaps performed by GenerateStream::specUpdate for linear cache groups.
+// linear_block_updates shape: [batch, linear_group_num, 4, 2].
+void invokeMtpBuildLinearBlockUpdates(const torch::Tensor& accept_len,
+                                      const torch::Tensor& prev_seq_len,
+                                      const torch::Tensor& kv_cache_kernel_block_id,
+                                      const torch::Tensor& linear_group_ids,
+                                      torch::Tensor&       linear_block_updates,
+                                      int32_t              seq_size_per_block,
+                                      int32_t              kernel_blocks_per_kv_block,
+                                      MtpPrepareStream     stream);
+
+// Apply the physical-block patch to the kernel-granularity block table.
+void invokeMtpApplyLinearBlockUpdates(torch::Tensor&       kv_cache_kernel_block_id,
+                                      const torch::Tensor& linear_group_ids,
+                                      const torch::Tensor& linear_block_updates,
+                                      int32_t              kernel_blocks_per_kv_block,
+                                      MtpPrepareStream     stream);
+
 }  // namespace rtp_llm

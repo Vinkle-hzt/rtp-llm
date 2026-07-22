@@ -98,6 +98,8 @@ protected:
     void            launchTargetVerifyPrepareAsync(const GptModelInputs& model_input, size_t batch_size);
     void            launchDraftPrefillPrepareAsync(const GptModelInputs& model_input);
     GptModelOutputs runTargetVerifyForward(GptModelInputs& model_input, const StreamGroups& stream_groups);
+    bool            tryApplyLinearBlockUpdates(GptModelInputs& model_input, const StreamGroups& stream_groups);
+    void            debugCheckLinearBlockUpdates(const GptModelInputs& model_input, const StreamGroups& stream_groups);
     void            debugCheckLinearBlockMapAtKernelRead(const GptModelInputs& model_input,
                                                          const StreamGroups&   stream_groups) const;
     void            broadcastPostRejectionInputs(GptModelInputs& model_input);
@@ -109,6 +111,7 @@ protected:
     absl::Status    dispatchDecodeOutput(const StreamGroups&                          stream_groups,
                                          const std::list<GenerateStreamPtr>&          streams,
                                          const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
+                                         const torch::Tensor&                         target_kv_cache_kernel_block_id,
                                          GptModelOutputs                              draft_prefill_model_output,
                                          SamplerOutput                                draft_prefill_sampler_output,
                                          std::shared_ptr<torch::Event>                rejection_event,
@@ -150,6 +153,7 @@ protected:
     // the main thread.
     absl::Status dispatchDecodeAsync(const StreamGroups&                          stream_groups,
                                      const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                     const torch::Tensor&                         target_kv_cache_kernel_block_id,
                                      MergedOutput                                 draft_prefill_output,
                                      std::shared_ptr<torch::Event>                rejection_event,
                                      std::shared_ptr<torch::Event>                draft_event);
@@ -197,7 +201,11 @@ private:
     // True when any KV-cache group is CacheGroupType::LINEAR (RWKV / Mamba /
     // hybrid linear+full). Per-step state advances every token, so the page
     // table must be re-gathered between draft propose and target verify.
-    bool is_linear_attention_model_ = false;
+    bool                 is_linear_attention_model_ = false;
+    std::vector<int32_t> linear_group_ids_;
+    torch::Tensor        linear_group_ids_gpu_;
+    int32_t              seq_size_per_block_         = 1;
+    int32_t              kernel_blocks_per_kv_block_ = 1;
 
     // group id tensors
     torch::Tensor target_kv_cache_layer_to_group;
