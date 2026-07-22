@@ -524,6 +524,13 @@ TEST_F(MtpExecutorTest, testSingleBatchPrefill) {
 
     // check stream result
     checkOutput(stream1, {0, 1, 2, 3, 1}, {1, 2}, {0.0, 0.0, 1.0, 0.0}, {0.17, 0.18});
+
+    // PDFUSION prefill must seed the first decode iteration from device state.
+    // Otherwise dispatchDecodeAsync falls back to a blocking pageable H2D copy.
+    const auto& next_seq_len_gpu = stream1->getNextSeqLenGpu();
+    ASSERT_TRUE(next_seq_len_gpu.defined());
+    ASSERT_TRUE(next_seq_len_gpu.is_cuda());
+    EXPECT_EQ(std::vector<int>({5}), toVec<int>(next_seq_len_gpu));
 }
 
 TEST_F(MtpExecutorTest, testMultiBatchPrefill) {

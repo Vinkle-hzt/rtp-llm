@@ -1914,7 +1914,7 @@ void MtpExecutor::publishPrefillMtpDeviceState(const StreamGroups& stream_groups
         return;
     }
 
-    if (role_type_ != RoleType::PREFILL) {
+    if (role_type_ != RoleType::PREFILL && role_type_ != RoleType::PDFUSION) {
         return;
     }
 
