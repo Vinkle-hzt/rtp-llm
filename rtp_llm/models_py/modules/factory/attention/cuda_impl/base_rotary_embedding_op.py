@@ -38,13 +38,9 @@ class BaseRotaryEmbeddingOp(ABC):
             cos_sin_cache: Precomputed cos/sin cache for RoPE [max_seq_len, rope_dim].
                           If None and rope_config is provided, will auto-generate using get_rope_cache_once.
             token_per_block: Number of tokens per KV cache block (page size)
-            is_neox_style: RoPE interleave style:
-                          - True (GPT-NeoX/interleave): Rotate adjacent pairs of dimensions together,
-                            i.e., (x[0], x[1]), (x[2], x[3]), ..., (x[d-2], x[d-1])
-                          - False (LLaMA/non-interleave): Rotate first and second halves separately,
-                            i.e., (x[0], x[d/2]), (x[1], x[d/2+1]), ..., (x[d/2-1], x[d-1])
-                          Most modern models (LLaMA, Qwen, DeepSeek, Mistral, etc.) use False.
-                          Only specific models like GPT-NeoX use True.
+            is_neox_style: True rotates the first and second halves together;
+                          False rotates adjacent pairs. FlashInfer calls the latter
+                          layout ``interleave``, so its flag is the inverse of this one.
             rope_config: RoPE configuration for auto-generating cos_sin_cache if not provided (optional)
             max_position_embeddings: Maximum position embeddings for auto-generating cache
         """
@@ -97,7 +93,7 @@ class BaseRotaryEmbeddingOp(ABC):
                 k_rope=key,
                 cos_sin_cache=self.cos_sin_cache,
                 pos_ids=pos_ids,
-                interleave=self.is_neox_style,
+                interleave=not self.is_neox_style,
             )
         else:
             rope_theta = (

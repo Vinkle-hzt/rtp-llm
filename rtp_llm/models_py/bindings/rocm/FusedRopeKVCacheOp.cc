@@ -71,9 +71,9 @@ void prepareInPlace(CKAttn& params, const torch_ext::PyAttentionInputs& attn_inp
         && params.cu_seqlens.data_ptr() != attn_inputs.cu_seqlens.data_ptr()) {
         copyTensorExactInPlace(params.cu_seqlens, attn_inputs.cu_seqlens, "cu_seqlens");
     }
-    if (attn_inputs.cu_kv_seqlens.defined() && params.cu_kv_seqlens.defined()
-        && params.cu_kv_seqlens.data_ptr() != attn_inputs.cu_kv_seqlens.data_ptr()) {
-        copyTensorExactInPlace(params.cu_kv_seqlens, attn_inputs.cu_kv_seqlens, "cu_kv_seqlens");
+    if (attn_inputs.cu_kv_seqlens_device.defined() && params.cu_kv_seqlens.defined()
+        && params.cu_kv_seqlens.data_ptr() != attn_inputs.cu_kv_seqlens_device.data_ptr()) {
+        copyTensorExactInPlace(params.cu_kv_seqlens, attn_inputs.cu_kv_seqlens_device, "cu_kv_seqlens");
     }
     if (attn_inputs.input_lengths.defined() && params.input_lengths.defined()
         && params.input_lengths.data_ptr() != attn_inputs.input_lengths.data_ptr()) {
@@ -145,7 +145,7 @@ CKAttnPtr FusedRopeKVCachePrefillOpBase::prepare(torch_ext::PyAttentionInputs at
     }
     attn_params->attn_type      = torchDTypeToDataType(attn_inputs.dtype);
     attn_params->cu_seqlens     = attn_inputs.cu_seqlens;
-    attn_params->cu_kv_seqlens  = attn_inputs.cu_kv_seqlens;
+    attn_params->cu_kv_seqlens  = attn_inputs.cu_kv_seqlens_device;
     attn_params->input_lengths  = attn_inputs.input_lengths;
     attn_params->max_seq_len    = attn_inputs.input_lengths.max().item<int32_t>();
     attn_params->padding_offset = attn_inputs.padding_offset;
@@ -161,14 +161,14 @@ CKAttnPtr FusedRopeKVCachePrefillOpBase::prepare(torch_ext::PyAttentionInputs at
         attn_params->prefix_lengths = attn_inputs.prefix_lengths;
     }
     attn_params->kv_block_array.cache_type = attn_configs_.kv_cache_dtype;
-    attn_params->position_ids = attn_inputs.combo_position_ids;
+    attn_params->position_ids              = attn_inputs.combo_position_ids;
 
-// Ensure position_ids is on CUDA device (e.g., MROPE position_ids may be on CPU)
+    // Ensure position_ids is on CUDA device (e.g., MROPE position_ids may be on CPU)
     if (attn_params->position_ids.defined() && !attn_params->position_ids.is_cuda()) {
         attn_params->position_ids =
             attn_params->position_ids.to(torch::kCUDA, /*non_blocking=*/false, /*copy=*/true).contiguous();
     }
-    
+
     int max_prefix_length = 0;
     if (has_prefix && attn_params->prefix_lengths.defined() && attn_params->prefix_lengths.numel() > 0) {
         max_prefix_length = attn_params->prefix_lengths.max().item<int32_t>();
@@ -394,7 +394,7 @@ FusedRopeKVCacheDecodeOpNonAsm::FusedRopeKVCacheDecodeOpNonAsm(const AttentionCo
     FusedRopeKVCacheDecodeOpBase(attn_configs) {}
 
 CKAttnPtr FusedRopeKVCacheDecodeOpBase::prepare(torch_ext::PyAttentionInputs attn_inputs) {
-    int           batch_size = attn_inputs.sequence_lengths.size(0);
+    int           batch_size = attn_inputs.sequence_lengths_host.size(0);
     torch::Tensor kv_cache_kernel_block_id_device;
     if (attn_inputs.kv_cache_kernel_block_id_device.defined()
         && attn_inputs.kv_cache_kernel_block_id_device.numel() > 0) {
@@ -406,7 +406,7 @@ CKAttnPtr FusedRopeKVCacheDecodeOpBase::prepare(torch_ext::PyAttentionInputs att
     use_fmha_fp8           = attn_configs_.kv_cache_dtype == KvCacheDataType::FP8;
 
     auto params = PrepareCKAttn(
-        attn_configs_, kv_cache_kernel_block_id_device, attn_inputs.sequence_lengths.size(0), use_fmha_fp8);
+        attn_configs_, kv_cache_kernel_block_id_device, attn_inputs.sequence_lengths_host.size(0), use_fmha_fp8);
     if (!params) {
         throw std::runtime_error("FusedRopeKVCacheDecodeOp::prepare: PrepareCKAttn failed. "
                                  "kv_cache_kernel_block_id_size="
@@ -417,8 +417,8 @@ CKAttnPtr FusedRopeKVCacheDecodeOpBase::prepare(torch_ext::PyAttentionInputs att
     attn_params->decode_plan               = true;
     attn_params->attn_type                 = torchDTypeToDataType(attn_inputs.dtype);
     attn_params->cu_seqlens                = attn_inputs.cu_seqlens;
-    attn_params->cu_kv_seqlens             = attn_inputs.cu_kv_seqlens;
-    attn_params->sequence_lengths          = attn_inputs.sequence_lengths;
+    attn_params->cu_kv_seqlens             = attn_inputs.cu_kv_seqlens_device;
+    attn_params->sequence_lengths          = attn_inputs.sequence_lengths_host;
     attn_params->kv_block_array.cache_type = attn_configs_.kv_cache_dtype;
     attn_params->input_lengths             = attn_inputs.input_lengths;
     attn_params->prefix_lengths            = attn_inputs.prefix_lengths;

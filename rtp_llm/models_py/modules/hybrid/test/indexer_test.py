@@ -221,9 +221,13 @@ class IndexerTest(TestCase):
                 [seq_len] * batch_size, dtype=torch.int32, device=torch.device("cpu")
             )
             attn_inputs.input_lengths = input_lengths
-            attn_inputs.sequence_lengths = torch.tensor(
+            attn_inputs.sequence_lengths_host = torch.tensor(
                 [], dtype=torch.int32, device=torch.device("cpu")
             )
+            attn_inputs.sequence_lengths_device = (
+                attn_inputs.sequence_lengths_host.to(device)
+            )
+            attn_inputs.max_sequence_length = 0
 
             # cu_seqlens: [0, seq_len, 2*seq_len, ...]
             cu_seqlens = torch.arange(
@@ -233,8 +237,8 @@ class IndexerTest(TestCase):
                 dtype=torch.int32,
                 device=device,
             )
-            attn_inputs.cu_seqlens = cu_seqlens
-            attn_inputs.cu_kv_seqlens = cu_seqlens
+            attn_inputs.cu_seqlens_device = cu_seqlens
+            attn_inputs.cu_kv_seqlens_device = cu_seqlens
 
             # Create kv_cache_block_id
             page_size = 64
@@ -250,16 +254,18 @@ class IndexerTest(TestCase):
                     (i + 1) * num_pages,
                     dtype=torch.int32,
                 )
-            attn_inputs.kv_cache_block_id_host = kv_cache_block_id
+            attn_inputs.kv_cache_block_id = kv_cache_block_id
             attn_inputs.kv_cache_block_id_device = kv_cache_block_id.to(device)
-            attn_inputs.kv_cache_kernel_block_id_host = kv_cache_block_id
+            attn_inputs.kv_cache_kernel_block_id = kv_cache_block_id
             attn_inputs.kv_cache_kernel_block_id_device = kv_cache_block_id.to(device)
         else:
             # Decode mode
             sequence_lengths = torch.tensor(
                 [seq_len] * batch_size, dtype=torch.int32, device=torch.device("cpu")
             )
-            attn_inputs.sequence_lengths = sequence_lengths
+            attn_inputs.sequence_lengths_host = sequence_lengths
+            attn_inputs.sequence_lengths_device = sequence_lengths.to(device)
+            attn_inputs.max_sequence_length = seq_len
             attn_inputs.input_lengths = torch.tensor(
                 [], dtype=torch.int32, device=torch.device("cpu")
             )
@@ -272,7 +278,7 @@ class IndexerTest(TestCase):
                 device=device,
             )
             attn_inputs.cu_seqlens = cu_seqlens
-            attn_inputs.decode_cu_seqlens_d = cu_seqlens
+            attn_inputs.decode_cu_seqlens_device = cu_seqlens
 
             # Create kv_cache_block_id for decode
             page_size = 64
@@ -288,9 +294,9 @@ class IndexerTest(TestCase):
                     (i + 1) * num_pages,
                     dtype=torch.int32,
                 )
-            attn_inputs.kv_cache_block_id_host = kv_cache_block_id
+            attn_inputs.kv_cache_block_id = kv_cache_block_id
             attn_inputs.kv_cache_block_id_device = kv_cache_block_id.to(device)
-            attn_inputs.kv_cache_kernel_block_id_host = kv_cache_block_id
+            attn_inputs.kv_cache_kernel_block_id = kv_cache_block_id
             attn_inputs.kv_cache_kernel_block_id_device = kv_cache_block_id.to(device)
 
         attn_inputs.prefix_lengths = torch.zeros(

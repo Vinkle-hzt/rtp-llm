@@ -80,9 +80,9 @@ class MlaFlashInferImplBase(MlaImplBase):
         check_attention_inputs(attn_inputs)
         self.fmha_params.fill_params(
             attn_inputs.prefix_lengths,
-            attn_inputs.sequence_lengths,
+            attn_inputs.sequence_lengths_host,
             attn_inputs.input_lengths,
-            attn_inputs.kv_cache_kernel_block_id_host,
+            attn_inputs.kv_cache_kernel_block_id,
             self.seq_size_per_block,
             forbid_realloc,
         )
@@ -311,9 +311,9 @@ class MlaFlashInferDecodeImpl(MlaFlashInferImplBase):
                 attn_configs.use_mla,
                 attn_configs.is_sparse,
                 weights,
-                max_bs=attn_inputs.sequence_lengths.size(0),
+                max_bs=attn_inputs.sequence_lengths_host.size(0),
                 max_context_len=max_seq_len,
-                num_tokens=int(attn_inputs.sequence_lengths.sum().item()),
+                num_tokens=int(attn_inputs.sequence_lengths_host.sum().item()),
                 is_cuda_graph=is_cuda_graph,
             ),
             (

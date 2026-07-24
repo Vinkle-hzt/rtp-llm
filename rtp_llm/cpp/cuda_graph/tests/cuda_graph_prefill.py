@@ -197,8 +197,8 @@ class TestCudaGraphPrefill(unittest.TestCase):
                 total_seq_len += input_lengths_data[i]
 
         cu_seqlens[batch_size] = total_seq_len
-        attention_inputs.cu_seqlens = cu_seqlens
-        attention_inputs.cu_kv_seqlens = cu_seqlens.clone()
+        attention_inputs.cu_seqlens_device = cu_seqlens
+        attention_inputs.cu_kv_seqlens_device = cu_seqlens.clone()
         attention_inputs.total_tokens = total_seq_len
         if not use_max_padded_mode:
             attention_inputs.padding_offset = self._calculate_padding_offset(
@@ -274,7 +274,8 @@ class TestCudaGraphPrefill(unittest.TestCase):
         ), f"Only {pass_ratio*100:.2f}% elements pass, expected >= 99.99%"
 
     def test_batch_prefill(self):
-        batch_range = [1, 2, 4, 5, 8]
+        # Batch 6 has 210 actual tokens and replays the 278-token capture bucket
+        batch_range = [1, 2, 4, 5, 6, 8]
         for bs in batch_range:
             print(f"start test for batch size: {bs}")
             self._test_single(bs)

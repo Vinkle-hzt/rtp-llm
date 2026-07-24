@@ -87,9 +87,15 @@ TEST(MtpLinearBlockUpdatesTest, MatchesOrderedHostSwapsForMultipleGroups) {
                                      updates,
                                      seq_size_per_block,
                                      kernel_blocks_per_kv_block,
+                                     kernel_blocks_per_kv_block,
                                      MtpPrepareStream{});
     invokeMtpApplyLinearBlockUpdates(
-        block_table, linear_group_ids_gpu, updates, kernel_blocks_per_kv_block, MtpPrepareStream{});
+        block_table,
+        linear_group_ids_gpu,
+        updates,
+        kernel_blocks_per_kv_block,
+        kernel_blocks_per_kv_block,
+        MtpPrepareStream{});
 
     auto expected_tensor = torch::tensor(expand_kernel_blocks(expected), torch::kInt32)
                                .reshape({group_count, batch_size, kernel_block_count});
@@ -97,7 +103,12 @@ TEST(MtpLinearBlockUpdatesTest, MatchesOrderedHostSwapsForMultipleGroups) {
 
     auto once_applied = block_table.clone();
     invokeMtpApplyLinearBlockUpdates(
-        block_table, linear_group_ids_gpu, updates, kernel_blocks_per_kv_block, MtpPrepareStream{});
+        block_table,
+        linear_group_ids_gpu,
+        updates,
+        kernel_blocks_per_kv_block,
+        kernel_blocks_per_kv_block,
+        MtpPrepareStream{});
     EXPECT_TRUE(torch::equal(block_table.cpu(), once_applied.cpu()));
 
     auto updates_cpu = updates.cpu();
@@ -113,6 +124,51 @@ TEST(MtpLinearBlockUpdatesTest, MatchesOrderedHostSwapsForMultipleGroups) {
             }
         }
     }
+}
+
+TEST(MtpLinearBlockUpdatesTest, KeepsLinearRowsAtPhysicalGranularityInPaddedHybridTable) {
+    constexpr int32_t group_count                       = 2;
+    constexpr int32_t batch_size                       = 1;
+    constexpr int32_t physical_block_count             = 8;
+    constexpr int32_t seq_size_per_block               = 2048;
+    constexpr int32_t table_blocks_per_kv_block        = 32;
+    constexpr int32_t linear_blocks_per_kv_block       = 1;
+    constexpr int32_t kernel_block_count = physical_block_count * table_blocks_per_kv_block;
+
+    std::vector<int32_t> table(group_count * batch_size * kernel_block_count, 0);
+    for (int32_t pos = 0; pos < physical_block_count; ++pos) {
+        table[pos] = 100 + pos;
+    }
+
+    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    auto block_table =
+        torch::tensor(table, torch::kInt32).reshape({group_count, batch_size, kernel_block_count}).to(torch::kCUDA);
+    auto accept_len_gpu       = torch::tensor({3}, cuda_i32);
+    auto prev_seq_len_gpu     = torch::tensor({2048}, cuda_i32);
+    auto linear_group_ids_gpu = torch::tensor({0}, cuda_i32);
+    auto updates              = torch::empty({batch_size, 1, 4, 2}, cuda_i32);
+
+    invokeMtpBuildLinearBlockUpdates(accept_len_gpu,
+                                     prev_seq_len_gpu,
+                                     block_table,
+                                     linear_group_ids_gpu,
+                                     updates,
+                                     seq_size_per_block,
+                                     table_blocks_per_kv_block,
+                                     linear_blocks_per_kv_block,
+                                     MtpPrepareStream{});
+    invokeMtpApplyLinearBlockUpdates(block_table,
+                                     linear_group_ids_gpu,
+                                     updates,
+                                     table_blocks_per_kv_block,
+                                     linear_blocks_per_kv_block,
+                                     MtpPrepareStream{});
+
+    auto result = block_table.cpu()[0][0];
+    EXPECT_EQ(result[0].item<int32_t>(), 100);
+    EXPECT_EQ(result[1].item<int32_t>(), 102);
+    EXPECT_EQ(result[2].item<int32_t>(), 101);
+    EXPECT_EQ(result[physical_block_count].item<int32_t>(), 0);
 }
 
 }  // namespace

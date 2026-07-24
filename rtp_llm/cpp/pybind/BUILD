@@ -60,14 +60,19 @@ cc_library(
     deps = [
         "//rtp_llm/cpp/cache:batch_kv_cache_resource",
         "//rtp_llm/cpp/cache:block_info",
-        "//rtp_llm/cpp/distribute:cpu_tp_broadcaster",
+        "//rtp_llm/cpp/cache:cp_slot_mapper",
         "//rtp_llm/cpp/utils:core_utils",
         "//rtp_llm/cpp/utils:debug_utils",
         "//rtp_llm/cpp/utils:device_perf_wrapper",
         "@havenask//aios/autil:base64",
         "@havenask//aios/autil:zlib",
     ] + torch_deps() + select_py_bindings() + select({
-        "@//:using_cuda12": ["//rtp_llm/models_py/bindings/cuda/ops:gpu_base"],
+        "@//:using_cuda12": [
+            "//rtp_llm/cpp/distribute:cpu_tp_broadcaster",
+            "//rtp_llm/cpp/utils:device_pin",
+            "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
+            "//rtp_llm/models_py/bindings/cuda/ops:gpu_base",
+        ],
         "@//:using_rocm": ["//rtp_llm/models_py/bindings/core:exec_ctx_rocm"],
         "//conditions:default": [],
     }) + no_block_copy_link_deps(),

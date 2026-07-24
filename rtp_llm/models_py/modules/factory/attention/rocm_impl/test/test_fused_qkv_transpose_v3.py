@@ -124,9 +124,13 @@ def _make_prefill_inputs(
     attn_inputs.input_lengths = torch.tensor(
         input_lengths, dtype=torch.int32, device="cpu"
     ).pin_memory()
-    attn_inputs.sequence_lengths = torch.tensor(
+    attn_inputs.sequence_lengths_host = torch.tensor(
         input_lengths, dtype=torch.int32, device="cpu"
     ).pin_memory()
+    attn_inputs.sequence_lengths_device = attn_inputs.sequence_lengths_host.to(
+        device, non_blocking=True
+    )
+    attn_inputs.max_sequence_length = max(input_lengths, default=0)
     attn_inputs.prefix_lengths = torch.zeros(
         len(input_lengths), dtype=torch.int32, device="cpu"
     )
@@ -136,7 +140,7 @@ def _make_prefill_inputs(
         cu.append(cu[-1] + sl)
     cu_tensor = torch.tensor(cu, dtype=torch.int32, device=device)
     attn_inputs.cu_seqlens = cu_tensor
-    attn_inputs.cu_kv_seqlens = cu_tensor
+    attn_inputs.cu_kv_seqlens_device = cu_tensor
 
     # Kernel reads padding_offset[t] and computes:
     #   tgt = t + padding_offset[t]
@@ -160,7 +164,7 @@ def _make_prefill_inputs(
         input_lengths, tokens_per_block, device
     )
     attn_inputs.kv_cache_kernel_block_id_device = block_table_dev
-    attn_inputs.kv_cache_kernel_block_id_host = block_table_dev.to(
+    attn_inputs.kv_cache_kernel_block_id = block_table_dev.to(
         "cpu", non_blocking=False
     )
     return attn_inputs, per_batch_block_ids

@@ -20,6 +20,7 @@ from rtp_llm.models_py.modules.factory.attention.cuda_impl.trtllm_gen import (
     _prepare_cg_prefill_kernel,
     _prepare_cg_spec_decode_kernel,
 )
+from rtp_llm.models_py.utils.arch import is_sm10x
 from rtp_llm.test.utils.numeric_util import assert_close_with_mismatch_tolerance
 
 device = torch.device("cuda")
@@ -111,8 +112,7 @@ class FlashInferPythonMHATest(TestCase):
             use_prefill_op: if True, use FlashInferTRTLLMPrefillOp;
                             if False, use FlashInferTRTLLMDecodeOp.
         """
-        is_sm_100 = torch.cuda.get_device_capability()[0] in [10]
-        if not is_sm_100:
+        if not is_sm10x():
             raise SkipTest("FlashInferTRTLLM requires SM_100 (compute capability 10.0)")
 
         config = self._create_config(dtype)
@@ -145,17 +145,19 @@ class FlashInferPythonMHATest(TestCase):
 
         kv_cache = self._init_kv_cache(dtype)
         kv_write_lengths = (
-            attn_inputs.input_lengths if is_prefill else attn_inputs.sequence_lengths
+            attn_inputs.input_lengths
+            if is_prefill
+            else attn_inputs.sequence_lengths_host
         )
         write_kv_cache(
-            k_ref, v_ref, kv_cache, kv_write_lengths, attn_inputs.kv_cache_block_id_host
+            k_ref, v_ref, kv_cache, kv_write_lengths, attn_inputs.kv_cache_block_id
         )
 
         out_ref = attention_prefill_ref(
             q_ref,
             k_ref,
             v_ref,
-            attn_inputs.sequence_lengths,
+            attn_inputs.sequence_lengths_host,
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
@@ -190,7 +192,9 @@ class FlashInferPythonMHATest(TestCase):
             out_ref = out_ref[last_token_idx]
             op = FlashInferTRTLLMDecodeOp(config)
             q = q_ref[last_token_idx]
-            attn_inputs.sequence_lengths -= 1
+            attn_inputs.sequence_lengths_host -= 1
+            attn_inputs.sequence_lengths_device -= 1
+            attn_inputs.max_sequence_length -= 1
             input_params = op.prepare(attn_inputs)
             out_trtllm = op.forward(q, kv_cache, input_params)
 

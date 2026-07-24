@@ -128,19 +128,27 @@ def gen_attention_inputs(
     max_seq_len: int = 0
     if sequence_lengths is not None:
         batch_size = len(sequence_lengths)
-        attention_inputs.sequence_lengths = torch.tensor(
+        attention_inputs.sequence_lengths_host = torch.tensor(
             sequence_lengths, dtype=torch.int32, device=torch.device("cpu")
         ).pin_memory()
-        max_seq_len = attention_inputs.sequence_lengths.max().item()
+        attention_inputs.sequence_lengths_device = (
+            attention_inputs.sequence_lengths_host.cuda(non_blocking=True)
+        )
+        max_seq_len = attention_inputs.sequence_lengths_host.max().item()
+        attention_inputs.max_sequence_length = max_seq_len
         attention_inputs.is_prefill = False
         attention_inputs.prefix_lengths = torch.zeros(batch_size, dtype=torch.int32)
-        attention_inputs.input_lengths = attention_inputs.sequence_lengths
+        attention_inputs.input_lengths = attention_inputs.sequence_lengths_host
     if input_lengths is not None:
         batch_size = len(input_lengths)
         attention_inputs.input_lengths = torch.tensor(
             input_lengths, dtype=torch.int32, device=torch.device("cpu")
         ).pin_memory()
-        attention_inputs.sequence_lengths = attention_inputs.input_lengths
+        attention_inputs.sequence_lengths_host = attention_inputs.input_lengths
+        attention_inputs.sequence_lengths_device = (
+            attention_inputs.sequence_lengths_host.cuda(non_blocking=True)
+        )
+        attention_inputs.max_sequence_length = max(input_lengths)
         attention_inputs.prefix_lengths = torch.zeros(batch_size, dtype=torch.int32)
         attention_inputs.is_prefill = True
     cu_seqlens = torch.zeros(
@@ -150,7 +158,7 @@ def gen_attention_inputs(
     ).pin_memory()
     cu_seqlens[1:] = attention_inputs.input_lengths.cumsum(0)
     attention_inputs.cu_seqlens = cu_seqlens
-    attention_inputs.cu_kv_seqlens = cu_seqlens
+    attention_inputs.cu_kv_seqlens_device = cu_seqlens.cuda(non_blocking=True)
     max_seq_len = attention_inputs.input_lengths.max().item()
     max_block_size = max_seq_len // page_size + 1
     # Ensure we have enough pages in cache
@@ -167,7 +175,7 @@ def gen_attention_inputs(
         .pin_memory()
     )
     attention_inputs.kv_cache_block_id_device = block_tables
-    attention_inputs.kv_cache_block_id_host = block_tables
+    attention_inputs.kv_cache_block_id = block_tables
     attention_inputs.kv_cache_kernel_block_id_device = block_tables
-    attention_inputs.kv_cache_kernel_block_id_host = block_tables
+    attention_inputs.kv_cache_kernel_block_id = block_tables
     return attention_inputs

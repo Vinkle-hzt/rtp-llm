@@ -484,7 +484,7 @@ def prepare_indexer_params(
     # Extract basic information
     is_prefill = attention_inputs.is_prefill
     input_lengths = attention_inputs.input_lengths  # [batch_size]
-    sequence_lengths = attention_inputs.sequence_lengths  # [decode_batch_size]
+    sequence_lengths = attention_inputs.sequence_lengths_device  # [decode_batch_size]
     kv_cache_block_id = (
         attention_inputs.kv_cache_kernel_block_id_device
     )  # [batch_size, max_blocks]

@@ -5,13 +5,18 @@ from typing import Any, Optional, Type
 import torch
 
 from rtp_llm.models_py.modules.factory.attention import common
+from rtp_llm.models_py.modules.factory.attention.cuda_impl.flashinfer_rotary_emb import (
+    MhaRotaryEmbeddingOp,
+)
+from rtp_llm.models_py.modules.factory.attention.cuda_impl.kv_cache_write_op import (
+    KVCacheWriteOp,
+)
 from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import FMHAImplBase
-from rtp_llm.models_py.utils.arch import get_num_device_sms
+from rtp_llm.models_py.utils.arch import get_num_device_sms, get_sm, is_sm12x
 from rtp_llm.ops import (
     AttentionConfigs,
     FMHAConfig,
     FMHAType,
-    KvCacheDataType,
     ParallelismConfig,
 )
 from rtp_llm.ops.compute_ops import (
@@ -19,6 +24,7 @@ from rtp_llm.ops.compute_ops import (
     LayerKVCache,
     PyAttentionInputs,
     XQAAttnOp,
+    rtp_llm_ops,
 )
 
 # Constants
@@ -69,21 +75,59 @@ class XQAImpl(FMHAImplBase):
     ) -> None:
         self.need_rope_kv_cache = attn_configs.need_rope_kv_cache
         self.fmha_impl = XQAAttnOp(attn_configs)
-        self.rope_kvcache_impl = FusedRopeKVCacheDecodeOp(attn_configs)
-
+        self.attn_configs = attn_configs
         self.attn_inputs = attn_inputs
-
         self.fmha_params = self.fmha_impl.prepare(attn_inputs)
-        self.rope_params = self.rope_kvcache_impl.prepare(attn_inputs)
+        self.use_device_rope = (
+            attn_configs.kernel_tokens_per_block != attn_configs.tokens_per_block
+        )
+        if self.use_device_rope:
+            self.rope_impl = MhaRotaryEmbeddingOp(attn_configs)
+            self.kv_cache_write_op = KVCacheWriteOp(
+                num_kv_heads=attn_configs.kv_head_num,
+                head_size=attn_configs.size_per_head,
+                token_per_block=attn_configs.kernel_tokens_per_block,
+            )
+            self.rope_params = rtp_llm_ops.FlashInferMlaAttnParams()
+            self.empty_prefix_lengths = torch.empty(
+                (0,),
+                dtype=torch.int32,
+                device=attn_inputs.sequence_lengths_device.device,
+            )
+            self._prepare_device_rope(attn_inputs, forbid_realloc=False)
+            self.rope_impl.set_params(self.rope_params)
+            self.kv_cache_write_op.set_params(self.rope_params)
+        else:
+            self.rope_kvcache_impl = FusedRopeKVCacheDecodeOp(attn_configs)
+            self.rope_params = self.rope_kvcache_impl.prepare(attn_inputs)
         self.write_cache_store_impl = common.create_write_cache_store_impl(attn_inputs)
         # C++ XQAParams.sequence_lengths shares storage with this tensor.
         # Keep a reference so prepare_cuda_graph can update it in-place.
-        self._captured_seq_lens = attn_inputs.sequence_lengths
+        self._captured_seq_lens = attn_inputs.sequence_lengths_device
+
+    def _prepare_device_rope(
+        self, attn_inputs: PyAttentionInputs, forbid_realloc: bool
+    ) -> None:
+        self.rope_params.fill_params_mha_device(
+            self.empty_prefix_lengths,
+            attn_inputs.sequence_lengths_device,
+            attn_inputs.input_lengths_device,
+            attn_inputs.kv_cache_kernel_block_id_device,
+            self.attn_configs.kernel_tokens_per_block,
+            forbid_realloc,
+        )
 
     @classmethod
     def support(
         cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
     ) -> bool:
+        # XQA cubin covers sm_90 only; sm_120a (Blackwell consumer, e.g.
+        # RTX 5000 Pro) lacks a binding and triggers cudaErrorInvalidSymbol
+        # at first forward. C++ XQAAttnOp.support gate is `>= kSM_90` and
+        # passes sm_120 erroneously — short-circuit here so dispatch falls
+        # through to PyFlashinferPaged. See blockers.md R-4.
+        if is_sm12x():
+            return False
         fmha_impl = XQAAttnOp(attn_configs)
         return fmha_impl.support(attn_inputs)
 
@@ -94,7 +138,13 @@ class XQAImpl(FMHAImplBase):
         layer_idx: int = 0,
     ) -> torch.Tensor:
         if self.need_rope_kv_cache:
-            fmha_input = self.rope_kvcache_impl.forward(qkv, kv_cache, self.rope_params)
+            if self.use_device_rope:
+                fmha_input, key, value = self.rope_impl.forward(qkv)
+                self.kv_cache_write_op.forward(key, value, kv_cache)
+            else:
+                fmha_input = self.rope_kvcache_impl.forward(
+                    qkv, kv_cache, self.rope_params
+                )
         else:
             fmha_input = qkv
 
@@ -105,34 +155,27 @@ class XQAImpl(FMHAImplBase):
         return self.fmha_impl.forward(fmha_input, kv_cache, self.fmha_params)
 
     def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
-        new_seq_lens = attn_inputs.sequence_lengths
-        n = min(self._captured_seq_lens.numel(), new_seq_lens.numel())
-        self._captured_seq_lens[:n].copy_(new_seq_lens[:n], non_blocking=True)
-
-        update_params = getattr(self.fmha_impl, "update", None)
-        if not callable(update_params):
-            common.update_trt_params(
+        if self.use_device_rope:
+            new_fmha_params = self.fmha_impl.prepare(attn_inputs)
+            common.copy_kv_cache_offset(
+                self.fmha_params.kv_cache_offset,
+                new_fmha_params.kv_cache_offset,
+            )
+            self._prepare_device_rope(attn_inputs, forbid_realloc=True)
+        else:
+            common.update_attention_params(
                 self.fmha_impl,
                 self.rope_kvcache_impl,
                 self.fmha_params,
                 self.rope_params,
                 attn_inputs,
             )
-            return
-
-        update_params(self.fmha_params, attn_inputs)
-        update_offset = getattr(self.fmha_impl, "update_kv_cache_offset", None)
-        if callable(update_offset):
-            update_offset(
-                self.rope_params.kv_cache_offset,
-                attn_inputs.kv_cache_kernel_block_id_device,
-            )
-        else:
-            new_rope_params = self.rope_kvcache_impl.prepare(attn_inputs)
-            common.copy_kv_cache_offset(
-                self.rope_params.kv_cache_offset, new_rope_params.kv_cache_offset
-            )
-        self.rope_params.sequence_lengths = attn_inputs.sequence_lengths
+        # update_attention_params only copies kv_cache_offset. XQA also
+        # reads sequence_lengths via the captured data_ptr(), so we must update
+        # the data in-place at the address recorded during CUDA graph capture.
+        new_seq_lens = attn_inputs.sequence_lengths_device
+        n = min(self._captured_seq_lens.numel(), new_seq_lens.numel())
+        self._captured_seq_lens[:n].copy_(new_seq_lens[:n], non_blocking=True)
 
 
 class XQADecodeImpl(FMHAImplBase):
@@ -159,7 +202,16 @@ class XQADecodeImpl(FMHAImplBase):
     ) -> bool:
         if attn_inputs.is_prefill:
             return False
-        if torch.cuda.get_device_capability()[0] not in [9, 10, 12]:
+        if attn_configs.kernel_tokens_per_block != attn_configs.tokens_per_block:
+            return False
+        # sm_120a consumer Blackwell: the FlashInfer xqa() build here rejects
+        # the nb_sub_seq_per_seq kwarg used in forward(), and XQA has no
+        # sm_120a binding anyway. Gate it off so decode dispatch falls through
+        # to PyFlashinferDecodeImpl (the working sm_120 path), mirroring the
+        # XQAImpl.support gate.
+        if is_sm12x():
+            return False
+        if get_sm()[0] not in [9, 10]:
             return False
         group_size = attn_configs.head_num // attn_configs.kv_head_num
         return (
@@ -236,7 +288,7 @@ class XQAWrapper:
     ):
         self.config = config
         self.attn_inputs = attn_inputs
-        self.cu_qseqlens = attn_inputs.cu_seqlens
+        self.cu_qseqlens = attn_inputs.cu_seqlens_device
         assert not self.attn_inputs.is_prefill, "XQA is not supported"
         self.workspace_buffer = get_xqa_workspace_buffer()
         self.semaphores = torch.zeros(8 * 1024 * 1024, dtype=torch.uint8, device="cuda")
@@ -283,7 +335,7 @@ class XQAWrapper:
         )
 
     def _compute_batch_geometry(self, attn_inputs: PyAttentionInputs) -> None:
-        cu_seqlens = attn_inputs.decode_cu_seqlens_host
+        cu_seqlens = attn_inputs.decode_cu_seqlens
         seqlens = torch.diff(cu_seqlens).tolist()
         assert (
             len(set(seqlens)) == 1
@@ -345,7 +397,7 @@ class XQAWrapper:
         self._seq_lens_4d = torch.zeros(bs, 1, dtype=torch.uint32, device=device)
 
     def _update_seq_lens_4d(self, seq_lens: torch.Tensor) -> None:
-        """Update _seq_lens_4d from CPU seq_lens. Must be called OUTSIDE CUDA graph capture."""
+        """Update _seq_lens_4d from device seq_lens outside CUDA graph capture."""
         assert self._seq_lens_4d is not None
         bs = self._batch_size
         new_seq_lens = (seq_lens[:bs] + self._q_len_per_req).to(torch.uint32)
@@ -360,13 +412,9 @@ class XQAWrapper:
     ) -> XQAParams:
         return XQAParams(
             page_table=attn_inputs.kv_cache_kernel_block_id_device,
-            seq_lens=attn_inputs.sequence_lengths,
-            batch_size=attn_inputs.sequence_lengths.size(0),
-            max_seq_len=(
-                attn_inputs.sequence_lengths.max().item() + 1
-                if attn_inputs.sequence_lengths.numel() > 0
-                else 0
-            ),
+            seq_lens=attn_inputs.sequence_lengths_device,
+            batch_size=attn_inputs.sequence_lengths_device.size(0),
+            max_seq_len=attn_inputs.max_sequence_length,
             q_scale=q_scale,
             kv_scale=kv_scale,
             o_scale=o_scale,
@@ -386,11 +434,11 @@ class XQAWrapper:
             self.config.size_per_head,
             self.config.dtype,
         )
-        self._update_seq_lens_4d(attn_inputs.sequence_lengths)
+        self._update_seq_lens_4d(attn_inputs.sequence_lengths_device)
         return self.make_params(attn_inputs, q_scale, kv_scale, o_scale)
 
     def prepare_for_cuda_graph_replay(self, attn_inputs: PyAttentionInputs) -> None:
-        self._update_seq_lens_4d(attn_inputs.sequence_lengths)
+        self._update_seq_lens_4d(attn_inputs.sequence_lengths_device)
 
     def forward(
         self,

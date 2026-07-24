@@ -6,14 +6,21 @@ import triton
 import triton.language as tl
 
 from rtp_llm.models_py.modules.factory.attention import common
-from rtp_llm.models_py.modules.factory.attention.cuda_impl.utils import is_sm_100
+from rtp_llm.models_py.modules.factory.attention.cuda_impl.flashinfer_rotary_emb import (
+    MhaRotaryEmbeddingOp,
+)
+from rtp_llm.models_py.modules.factory.attention.cuda_impl.kv_cache_write_op import (
+    KVCacheWriteOp,
+)
 from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import FMHAImplBase
+from rtp_llm.models_py.utils.arch import is_blackwell, is_sm12x
 from rtp_llm.ops import AttentionConfigs, FMHAType, ParallelismConfig
 from rtp_llm.ops.compute_ops import (
     FusedRopeKVCacheDecodeOp,
     FusedRopeKVCachePrefillOpQOut,
     LayerKVCache,
     PyAttentionInputs,
+    rtp_llm_ops,
 )
 
 # Constants
@@ -331,13 +338,54 @@ class FlashInferTRTLLMPrefillOp(object):
         release_trt_workspace_buffer(self.workspace_buffer)
 
     def support(self, attention_inputs: PyAttentionInputs):
+        # TllmGenFmhaRunner cubin covers sm_90a / sm_100a only; sm_120a
+        # (Blackwell consumer, e.g. RTX 5000 Pro) has no binding and the
+        # runner throws "Unsupported architecture" (fmhaRunner.cuh:37) on
+        # forward. Fall through so dispatch picks the paged
+        # PyFlashinferPagedPrefillImpl instead.
+        if is_sm12x():
+            return False
         return (
-            is_sm_100()
+            is_blackwell()
             and attention_inputs.is_prefill
             and attention_inputs.kv_cache_kernel_block_id_device is not None
         )
 
     def prepare(self, attention_inputs: PyAttentionInputs) -> FlashInferTRTLLMParams:
+        if attention_inputs.disable_flash_infer:
+            batch_size = attention_inputs.input_lengths_device.size(0)
+            input_lengths = attention_inputs.input_lengths_device
+            prefix_lengths = attention_inputs.prefix_lengths_device
+            sequence_lengths = input_lengths + prefix_lengths
+            page_size = self.seq_size_per_block
+            page_per_seq = (sequence_lengths + page_size - 1) // page_size
+            cu_kv_seqlens = torch.zeros(
+                batch_size + 1,
+                device="cuda",
+                dtype=input_lengths.dtype,
+            )
+            cu_kv_seqlens[1:] = torch.cumsum(
+                page_per_seq, dim=0, dtype=torch.int32
+            )
+            max_q_len = max(1, attention_inputs.total_tokens // max(1, batch_size))
+            return FlashInferTRTLLMParams(
+                batch_size=batch_size,
+                max_q_len=max_q_len,
+                max_kv_len=max(
+                    1,
+                    (
+                        attention_inputs.max_sequence_length
+                        if attention_inputs.is_cuda_graph
+                        else attention_inputs.max_sequence_length + max_q_len - 1
+                    ),
+                ),
+                seq_lens=sequence_lengths,
+                input_lens=input_lengths,
+                block_tables=attention_inputs.kv_cache_kernel_block_id_device,
+                cu_seqlens=attention_inputs.cu_seqlens_device,
+                cu_kv_seqlens=cu_kv_seqlens,
+            )
+
         prefix_lengths = torch.zeros_like(
             attention_inputs.input_lengths,
             device="cuda",
@@ -370,7 +418,7 @@ class FlashInferTRTLLMPrefillOp(object):
             seq_lens=sequence_lengths,
             input_lens=attention_inputs.input_lengths,
             block_tables=attention_inputs.kv_cache_kernel_block_id_device,
-            cu_seqlens=attention_inputs.cu_seqlens,
+            cu_seqlens=attention_inputs.cu_seqlens_device,
             cu_kv_seqlens=cu_kv_seqlens,
         )
 
@@ -438,10 +486,21 @@ class FlashInferTRTLLMDecodeOp(object):
         release_trt_workspace_buffer(self.workspace_buffer)
 
     def support(self, attention_inputs: PyAttentionInputs):
-        if not is_sm_100():
+        if not is_blackwell():
+            return False
+        # TllmGenFmhaRunner cubin covers sm_90a / sm_100a only; sm_120a
+        # (Blackwell consumer, e.g. RTX 5000 Pro) has no binding and the
+        # runner throws "Unsupported architecture" (fmhaRunner.cuh:37) on
+        # the first decode forward. Fall through so dispatch picks the
+        # ragged PyFlashinferPaged path instead.
+        if is_sm12x():
             return False
         # Note: this max q length is used for mtp decode verification.
         decode_kernel_max_q_len = 11
+        if attention_inputs.is_prefill and attention_inputs.disable_flash_infer:
+            batch_size = attention_inputs.input_lengths_device.size(0)
+            max_q_len = attention_inputs.total_tokens // max(1, batch_size)
+            return max_q_len < decode_kernel_max_q_len
         if (
             attention_inputs.is_prefill
             and attention_inputs.input_lengths[0] < decode_kernel_max_q_len
@@ -454,22 +513,49 @@ class FlashInferTRTLLMDecodeOp(object):
 
     def prepare(self, attention_inputs: PyAttentionInputs) -> FlashInferTRTLLMParams:
         if not attention_inputs.is_prefill:
+            if attention_inputs.disable_flash_infer:
+                return FlashInferTRTLLMParams(
+                    batch_size=attention_inputs.sequence_lengths_device.size(0),
+                    max_seq_len=max(1, attention_inputs.max_sequence_length),
+                    seq_lens=attention_inputs.sequence_lengths_device + 1,
+                    block_tables=attention_inputs.kv_cache_kernel_block_id_device,
+                )
             # need transfer to cuda, cuda graph can capture the add
             sequence_lengths = torch.ones_like(
-                attention_inputs.sequence_lengths,
+                attention_inputs.sequence_lengths_host,
                 device="cuda",
-                dtype=attention_inputs.sequence_lengths.dtype,
+                dtype=attention_inputs.sequence_lengths_host.dtype,
             )
             sequence_lengths.copy_(
-                attention_inputs.sequence_lengths, non_blocking=True
+                attention_inputs.sequence_lengths_host, non_blocking=True
             ).add_(1)
             return FlashInferTRTLLMParams(
-                batch_size=attention_inputs.sequence_lengths.size(0),
-                max_seq_len=attention_inputs.sequence_lengths.max().item() + 1,
+                batch_size=attention_inputs.sequence_lengths_host.size(0),
+                max_seq_len=attention_inputs.sequence_lengths_host.max().item() + 1,
                 seq_lens=sequence_lengths,
                 block_tables=attention_inputs.kv_cache_kernel_block_id_device,
             )
         else:
+            if attention_inputs.disable_flash_infer:
+                batch_size = attention_inputs.input_lengths_device.size(0)
+                q_len = attention_inputs.total_tokens // max(1, batch_size)
+                sequence_lengths = (
+                    attention_inputs.prefix_lengths_device
+                    + attention_inputs.input_lengths_device
+                )
+                return FlashInferTRTLLMParams(
+                    batch_size=batch_size,
+                    max_seq_len=max(
+                        1,
+                        (
+                            attention_inputs.max_sequence_length
+                            if attention_inputs.is_cuda_graph
+                            else attention_inputs.max_sequence_length + q_len - 1
+                        ),
+                    ),
+                    seq_lens=sequence_lengths,
+                    block_tables=attention_inputs.kv_cache_kernel_block_id_device,
+                )
             q_len = attention_inputs.input_lengths[0].item()
             sequence_lengths = torch.zeros_like(
                 attention_inputs.prefix_lengths,
@@ -588,8 +674,8 @@ class FlashInferTRTLLMPrefillImpl(FMHAImplBase):
     def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
         p = self._cg
         _prepare_cg_prefill_kernel[p.grid](
-            attn_inputs.input_lengths,
-            attn_inputs.prefix_lengths,
+            attn_inputs.input_lengths_device,
+            attn_inputs.prefix_lengths_device,
             p.seq_lens,
             p.cu_kv_seqlens,
             attn_inputs.kv_cache_kernel_block_id_device,
@@ -655,7 +741,7 @@ class FlashInferTRTLLMSpecDecodeImpl(FMHAImplBase):
         p = self._cg
         if not attn_inputs.is_prefill:
             _prepare_cg_decode_kernel[p.grid](
-                attn_inputs.sequence_lengths_plus_1_d,
+                attn_inputs.sequence_lengths_plus_1_device,
                 p.seq_lens,
                 attn_inputs.kv_cache_kernel_block_id_device,
                 p.kv_cache_offset,
@@ -666,8 +752,8 @@ class FlashInferTRTLLMSpecDecodeImpl(FMHAImplBase):
             )
         else:
             _prepare_cg_spec_decode_kernel[p.grid](
-                attn_inputs.prefix_lengths,
-                attn_inputs.input_lengths,
+                attn_inputs.prefix_lengths_device,
+                attn_inputs.input_lengths_device,
                 p.seq_lens,
                 attn_inputs.kv_cache_kernel_block_id_device,
                 p.kv_cache_offset,
@@ -688,18 +774,58 @@ class FlashInferTRTLLMDecodeImpl(FMHAImplBase):
     ) -> None:
         self.need_rope_kv_cache = attn_configs.need_rope_kv_cache
         self.fmha_impl = FlashInferTRTLLMDecodeOp(attn_configs)
-        self.rope_kvcache_impl = FusedRopeKVCacheDecodeOp(attn_configs)
         self.attn_configs = attn_configs
         self.attn_inputs = attn_inputs
         self.fmha_params = self.fmha_impl.prepare(attn_inputs)
-        self.rope_params = self.rope_kvcache_impl.prepare(attn_inputs)
+        self.use_device_rope = (
+            attn_configs.kernel_tokens_per_block != attn_configs.tokens_per_block
+        )
+        if self.use_device_rope:
+            self.rope_impl = MhaRotaryEmbeddingOp(attn_configs)
+            self.kv_cache_write_op = KVCacheWriteOp(
+                num_kv_heads=attn_configs.kv_head_num,
+                head_size=attn_configs.size_per_head,
+                token_per_block=attn_configs.kernel_tokens_per_block,
+            )
+            self.rope_params = rtp_llm_ops.FlashInferMlaAttnParams()
+            self.empty_prefix_lengths = torch.empty(
+                (0,),
+                dtype=torch.int32,
+                device=attn_inputs.sequence_lengths_device.device,
+            )
+            self._prepare_device_rope(attn_inputs, forbid_realloc=False)
+            self.rope_impl.set_params(self.rope_params)
+            self.kv_cache_write_op.set_params(self.rope_params)
+            batch_size = self.fmha_params.batch_size
+            max_blocks = attn_inputs.kv_cache_kernel_block_id_device.shape[1]
+            kv_cache_offset = torch.empty(
+                (batch_size, 2, max_blocks),
+                dtype=torch.int32,
+                device=attn_inputs.kv_cache_kernel_block_id_device.device,
+            )
+        else:
+            self.rope_kvcache_impl = FusedRopeKVCacheDecodeOp(attn_configs)
+            self.rope_params = self.rope_kvcache_impl.prepare(attn_inputs)
+            kv_cache_offset = self.rope_params.kv_cache_offset
         self.write_cache_store_impl = common.create_write_cache_store_impl(attn_inputs)
 
         self._cg = _init_decode_cg_params(
             self.fmha_params.batch_size,
             attn_inputs.kv_cache_kernel_block_id_device,
             self.fmha_params.seq_lens,
-            self.rope_params.kv_cache_offset,
+            kv_cache_offset,
+        )
+
+    def _prepare_device_rope(
+        self, attn_inputs: PyAttentionInputs, forbid_realloc: bool
+    ) -> None:
+        self.rope_params.fill_params_mha_device(
+            self.empty_prefix_lengths,
+            attn_inputs.sequence_lengths_device,
+            attn_inputs.input_lengths_device,
+            attn_inputs.kv_cache_kernel_block_id_device,
+            self.attn_configs.kernel_tokens_per_block,
+            forbid_realloc,
         )
 
     @classmethod
@@ -718,7 +844,13 @@ class FlashInferTRTLLMDecodeImpl(FMHAImplBase):
         layer_idx: int,
     ) -> torch.Tensor:
         if self.need_rope_kv_cache:
-            fmha_input = self.rope_kvcache_impl.forward(qkv, kv_cache, self.rope_params)
+            if self.use_device_rope:
+                fmha_input, key, value = self.rope_impl.forward(qkv)
+                self.kv_cache_write_op.forward(key, value, kv_cache)
+            else:
+                fmha_input = self.rope_kvcache_impl.forward(
+                    qkv, kv_cache, self.rope_params
+                )
         else:
             fmha_input = qkv
 
@@ -730,7 +862,7 @@ class FlashInferTRTLLMDecodeImpl(FMHAImplBase):
     def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
         p = self._cg
         _prepare_cg_decode_kernel[p.grid](
-            attn_inputs.sequence_lengths_plus_1_d,
+            attn_inputs.sequence_lengths_plus_1_device,
             p.seq_lens,
             attn_inputs.kv_cache_kernel_block_id_device,
             p.kv_cache_offset,
@@ -739,3 +871,5 @@ class FlashInferTRTLLMDecodeImpl(FMHAImplBase):
             p.total_bm,
             BLOCK_SIZE=p.BLOCK_SIZE,
         )
+        if self.use_device_rope:
+            self._prepare_device_rope(attn_inputs, forbid_realloc=True)

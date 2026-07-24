@@ -65,24 +65,28 @@ class TestPyFlashinferPrefillPagedAttnOp(BaseAttentionTest):
 
         # sequence_lengths is prefix + input (total KV length)
         sequence_lengths = [p + i for p, i in zip(prefix_lengths, input_lengths)]
-        attn_inputs.sequence_lengths = torch.tensor(
+        attn_inputs.sequence_lengths_host = torch.tensor(
             sequence_lengths, dtype=torch.int32, device="cpu"
         ).pin_memory()
+        attn_inputs.sequence_lengths_device = (
+            attn_inputs.sequence_lengths_host.cuda(non_blocking=True)
+        )
+        attn_inputs.max_sequence_length = max(sequence_lengths)
 
         # Create KV cache block IDs for total sequence
         kv_cache_block_id = self._create_kv_cache_block_ids(
             batch_size, sequence_lengths, seq_size_per_block
         )
-        attn_inputs.kv_cache_block_id_host = kv_cache_block_id
+        attn_inputs.kv_cache_block_id = kv_cache_block_id
         attn_inputs.kv_cache_block_id_device = kv_cache_block_id.to(self.device)
-        attn_inputs.kv_cache_kernel_block_id_host = kv_cache_block_id
+        attn_inputs.kv_cache_kernel_block_id = kv_cache_block_id
         attn_inputs.kv_cache_kernel_block_id_device = kv_cache_block_id.to(self.device)
 
         # Create cu_seqlens (cumulative input lengths, NOT sequence lengths!)
         cu_seqlens = [0]
         for input_len in input_lengths:
             cu_seqlens.append(cu_seqlens[-1] + input_len)
-        attn_inputs.cu_seqlens = torch.tensor(
+        attn_inputs.cu_seqlens_device = torch.tensor(
             cu_seqlens, dtype=torch.int32, device=self.device
         )
 
@@ -169,6 +173,7 @@ class TestPyFlashinferPrefillPagedAttnOp(BaseAttentionTest):
         head_num_kv: int = 8,
         size_per_head: int = 128,
         page_size: int = 64,
+        causal: bool = True,
     ):
         """Test prefill correctness by comparing with flashinfer reference implementation"""
 
@@ -178,6 +183,7 @@ class TestPyFlashinferPrefillPagedAttnOp(BaseAttentionTest):
             size_per_head=size_per_head,
             seq_size_per_block=page_size,
         )
+        config.attn_configs.is_causal = causal
 
         attn_inputs = self._create_prefill_attention_inputs(
             batch_size, sequence_lengths, config.seq_size_per_block
@@ -240,7 +246,7 @@ class TestPyFlashinferPrefillPagedAttnOp(BaseAttentionTest):
 
         # Compute reference outputs using flashinfer's reference
         ref_output = compute_flashinfer_prefill_reference(
-            q, k, v, attn_inputs.cu_seqlens, causal=True
+            q, k, v, attn_inputs.cu_seqlens_device, causal=causal
         )
 
         # Compare outputs
@@ -275,6 +281,17 @@ class TestPyFlashinferPrefillPagedAttnOp(BaseAttentionTest):
             head_num_kv=2,
             size_per_head=64,
             page_size=16,
+        )
+
+    def test_non_causal_prefill(self):
+        self._test_prefill_correctness(
+            batch_size=2,
+            sequence_lengths=[64, 96],
+            head_num=8,
+            head_num_kv=2,
+            size_per_head=64,
+            page_size=16,
+            causal=False,
         )
 
     def test_single_sequence_medium(self):

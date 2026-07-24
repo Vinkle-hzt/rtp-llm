@@ -379,17 +379,19 @@ class TestXQABatchDecode(unittest.TestCase):
 
         attn_inputs = PyAttentionInputs()
         attn_inputs.is_prefill = False
-        attn_inputs.sequence_lengths = in_kv_lens
+        attn_inputs.sequence_lengths_device = in_kv_lens.to(GPU_DEVICE)
+        attn_inputs.sequence_lengths_host = in_kv_lens.cpu().pin_memory()
+        attn_inputs.max_sequence_length = int(in_kv_lens.max().item())
         attn_inputs.input_lengths = q_lens
         attn_inputs.kv_cache_block_id_device = page_table
         attn_inputs.kv_cache_kernel_block_id_device = page_table
-        attn_inputs.kv_cache_kernel_block_id_host = page_table.cpu()
+        attn_inputs.kv_cache_kernel_block_id = page_table.cpu()
         attn_inputs.dtype = get_typemeta(q)
         attn_inputs.total_tokens = q.shape[0]
-        attn_inputs.decode_cu_seqlens_d = generate_cumsum_lens(q_lens)
-        attn_inputs.decode_cu_seqlens_host = generate_cumsum_lens(q_lens).cpu()
+        attn_inputs.decode_cu_seqlens_device = generate_cumsum_lens(q_lens)
+        attn_inputs.decode_cu_seqlens = generate_cumsum_lens(q_lens).cpu()
         attn_inputs.cu_seqlens = generate_cumsum_lens(q_lens).cpu()
-        attn_inputs.cu_kv_seqlens = generate_cumsum_lens(seq_lens).cpu()
+        attn_inputs.cu_kv_seqlens_device = generate_cumsum_lens(seq_lens)
 
         attn_configs = AttentionConfigs()
         attn_configs.head_num = num_qo_heads
@@ -495,19 +497,21 @@ class TestXQABatchDecode(unittest.TestCase):
 
         cap_inputs = PyAttentionInputs()
         cap_inputs.is_prefill = False
-        cap_inputs.sequence_lengths = in_kv_lens_cap
+        cap_inputs.sequence_lengths_device = in_kv_lens_cap.to(GPU_DEVICE)
+        cap_inputs.sequence_lengths_host = in_kv_lens_cap.cpu().pin_memory()
+        cap_inputs.max_sequence_length = int(in_kv_lens_cap.max().item())
         cap_inputs.input_lengths = q_lens_cap
         cap_inputs.kv_cache_block_id_device = page_table_cap
         cap_inputs.kv_cache_kernel_block_id_device = page_table_cap
-        cap_inputs.kv_cache_kernel_block_id_host = page_table_cap.cpu()
+        cap_inputs.kv_cache_kernel_block_id = page_table_cap.cpu()
         cap_inputs.dtype = get_typemeta(
             torch.empty(1, dtype=DTYPE_MAP["bf16"], device=GPU_DEVICE)
         )
         cap_inputs.total_tokens = batch_size * q_len_per_req
-        cap_inputs.decode_cu_seqlens_d = generate_cumsum_lens(q_lens_cap)
-        cap_inputs.decode_cu_seqlens_host = generate_cumsum_lens(q_lens_cap).cpu()
+        cap_inputs.decode_cu_seqlens_device = generate_cumsum_lens(q_lens_cap)
+        cap_inputs.decode_cu_seqlens = generate_cumsum_lens(q_lens_cap).cpu()
         cap_inputs.cu_seqlens = generate_cumsum_lens(q_lens_cap).cpu()
-        cap_inputs.cu_kv_seqlens = generate_cumsum_lens(seq_lens_cap).cpu()
+        cap_inputs.cu_kv_seqlens_device = generate_cumsum_lens(seq_lens_cap)
 
         attn_configs = AttentionConfigs()
         attn_configs.head_num = num_qo_heads
@@ -549,25 +553,29 @@ class TestXQABatchDecode(unittest.TestCase):
 
         rep_inputs = PyAttentionInputs()
         rep_inputs.is_prefill = False
-        rep_inputs.sequence_lengths = in_kv_lens_rep
+        rep_inputs.sequence_lengths_device = in_kv_lens_rep.to(GPU_DEVICE)
+        rep_inputs.sequence_lengths_host = in_kv_lens_rep.cpu().pin_memory()
+        rep_inputs.max_sequence_length = int(in_kv_lens_rep.max().item())
         rep_inputs.input_lengths = q_lens_rep
         rep_inputs.kv_cache_block_id_device = page_table_rep
         rep_inputs.kv_cache_kernel_block_id_device = page_table_rep
-        rep_inputs.kv_cache_kernel_block_id_host = page_table_rep.cpu()
+        rep_inputs.kv_cache_kernel_block_id = page_table_rep.cpu()
         rep_inputs.dtype = get_typemeta(
             torch.empty(1, dtype=DTYPE_MAP["bf16"], device=GPU_DEVICE)
         )
         rep_inputs.total_tokens = batch_size * q_len_per_req
-        rep_inputs.decode_cu_seqlens_d = generate_cumsum_lens(q_lens_rep)
-        rep_inputs.decode_cu_seqlens_host = generate_cumsum_lens(q_lens_rep).cpu()
+        rep_inputs.decode_cu_seqlens_device = generate_cumsum_lens(q_lens_rep)
+        rep_inputs.decode_cu_seqlens = generate_cumsum_lens(q_lens_rep).cpu()
         rep_inputs.cu_seqlens = generate_cumsum_lens(q_lens_rep).cpu()
-        rep_inputs.cu_kv_seqlens = generate_cumsum_lens(seq_lens_rep).cpu()
+        rep_inputs.cu_kv_seqlens_device = generate_cumsum_lens(seq_lens_rep)
 
         xqa_impl.prepare_cuda_graph(rep_inputs)
 
         self.assertEqual(xqa_impl.fmha_params.batch_size, batch_size)
         self.assertTrue(
-            torch.equal(xqa_impl.fmha_params.seq_lens, in_kv_lens_rep),
+            torch.equal(
+                xqa_impl.fmha_params.seq_lens, in_kv_lens_rep.to(GPU_DEVICE)
+            ),
             "sequence_lengths not updated after prepare_cuda_graph",
         )
         self.assertTrue(
@@ -640,19 +648,21 @@ class TestXQABatchDecode(unittest.TestCase):
 
         cap_inputs = PyAttentionInputs()
         cap_inputs.is_prefill = False
-        cap_inputs.sequence_lengths = in_kv_lens_cap
+        cap_inputs.sequence_lengths_device = in_kv_lens_cap.to(GPU_DEVICE)
+        cap_inputs.sequence_lengths_host = in_kv_lens_cap.cpu().pin_memory()
+        cap_inputs.max_sequence_length = int(in_kv_lens_cap.max().item())
         cap_inputs.input_lengths = q_lens_cap
         cap_inputs.kv_cache_block_id_device = page_table_cap
         cap_inputs.kv_cache_kernel_block_id_device = page_table_cap
-        cap_inputs.kv_cache_kernel_block_id_host = page_table_cap.cpu()
+        cap_inputs.kv_cache_kernel_block_id = page_table_cap.cpu()
         cap_inputs.dtype = get_typemeta(
             torch.empty(1, dtype=DTYPE_MAP["bf16"], device=GPU_DEVICE)
         )
         cap_inputs.total_tokens = capture_batch_size * q_len_per_req
-        cap_inputs.decode_cu_seqlens_d = generate_cumsum_lens(q_lens_cap)
-        cap_inputs.decode_cu_seqlens_host = generate_cumsum_lens(q_lens_cap).cpu()
+        cap_inputs.decode_cu_seqlens_device = generate_cumsum_lens(q_lens_cap)
+        cap_inputs.decode_cu_seqlens = generate_cumsum_lens(q_lens_cap).cpu()
         cap_inputs.cu_seqlens = generate_cumsum_lens(q_lens_cap).cpu()
-        cap_inputs.cu_kv_seqlens = generate_cumsum_lens(seq_lens_cap).cpu()
+        cap_inputs.cu_kv_seqlens_device = generate_cumsum_lens(seq_lens_cap)
 
         attn_configs = AttentionConfigs()
         attn_configs.head_num = num_qo_heads
@@ -727,17 +737,21 @@ class TestXQABatchDecode(unittest.TestCase):
 
                 rep_inputs = PyAttentionInputs()
                 rep_inputs.is_prefill = False
-                rep_inputs.sequence_lengths = padded_seq_lens
+                rep_inputs.sequence_lengths_device = padded_seq_lens.to(GPU_DEVICE)
+                rep_inputs.sequence_lengths_host = padded_seq_lens.cpu().pin_memory()
+                rep_inputs.max_sequence_length = int(padded_seq_lens.max().item())
                 rep_inputs.input_lengths = padded_q_lens
                 rep_inputs.kv_cache_block_id_device = padded_page_table
                 rep_inputs.kv_cache_kernel_block_id_device = padded_page_table
-                rep_inputs.kv_cache_kernel_block_id_host = padded_page_table.cpu()
+                rep_inputs.kv_cache_kernel_block_id = padded_page_table.cpu()
                 rep_inputs.dtype = get_typemeta(
                     torch.empty(1, dtype=DTYPE_MAP["bf16"], device=GPU_DEVICE)
                 )
                 rep_inputs.total_tokens = capture_batch_size * q_len_per_req
-                rep_inputs.decode_cu_seqlens_d = generate_cumsum_lens(padded_q_lens)
-                rep_inputs.decode_cu_seqlens_host = generate_cumsum_lens(
+                rep_inputs.decode_cu_seqlens_device = generate_cumsum_lens(
+                    padded_q_lens
+                )
+                rep_inputs.decode_cu_seqlens = generate_cumsum_lens(
                     padded_q_lens
                 ).cpu()
                 rep_inputs.cu_seqlens = generate_cumsum_lens(padded_q_lens).cpu()
@@ -747,9 +761,9 @@ class TestXQABatchDecode(unittest.TestCase):
                         torch.full((pad_size,), q_len_per_req, dtype=torch.int32),
                     ]
                 )
-                rep_inputs.cu_kv_seqlens = generate_cumsum_lens(
+                rep_inputs.cu_kv_seqlens_device = generate_cumsum_lens(
                     padded_full_seq_lens
-                ).cpu()
+                )
 
                 xqa_impl.prepare_cuda_graph(rep_inputs)
 
@@ -759,7 +773,7 @@ class TestXQABatchDecode(unittest.TestCase):
                 self.assertTrue(
                     torch.equal(
                         xqa_impl.fmha_params.seq_lens[:actual_batch_size],
-                        in_kv_lens_real,
+                        in_kv_lens_real.to(GPU_DEVICE),
                     ),
                     "Active seq_lens not updated correctly",
                 )
@@ -848,19 +862,21 @@ class TestXQABatchDecode(unittest.TestCase):
 
         cap_inputs = PyAttentionInputs()
         cap_inputs.is_prefill = False
-        cap_inputs.sequence_lengths = in_kv_lens_cap
+        cap_inputs.sequence_lengths_device = in_kv_lens_cap.to(GPU_DEVICE)
+        cap_inputs.sequence_lengths_host = in_kv_lens_cap.cpu().pin_memory()
+        cap_inputs.max_sequence_length = int(in_kv_lens_cap.max().item())
         cap_inputs.input_lengths = q_lens_cap
         cap_inputs.kv_cache_block_id_device = page_table_cap
         cap_inputs.kv_cache_kernel_block_id_device = page_table_cap
-        cap_inputs.kv_cache_kernel_block_id_host = page_table_cap.cpu()
+        cap_inputs.kv_cache_kernel_block_id = page_table_cap.cpu()
         cap_inputs.dtype = get_typemeta(
             torch.empty(1, dtype=DTYPE_MAP["bf16"], device=GPU_DEVICE)
         )
         cap_inputs.total_tokens = batch_size * q_len_per_req
-        cap_inputs.decode_cu_seqlens_d = generate_cumsum_lens(q_lens_cap)
-        cap_inputs.decode_cu_seqlens_host = generate_cumsum_lens(q_lens_cap).cpu()
+        cap_inputs.decode_cu_seqlens_device = generate_cumsum_lens(q_lens_cap)
+        cap_inputs.decode_cu_seqlens = generate_cumsum_lens(q_lens_cap).cpu()
         cap_inputs.cu_seqlens = generate_cumsum_lens(q_lens_cap).cpu()
-        cap_inputs.cu_kv_seqlens = generate_cumsum_lens(seq_lens_cap).cpu()
+        cap_inputs.cu_kv_seqlens_device = generate_cumsum_lens(seq_lens_cap)
 
         attn_configs = AttentionConfigs()
         attn_configs.head_num = num_qo_heads
@@ -921,19 +937,21 @@ class TestXQABatchDecode(unittest.TestCase):
 
         rep_inputs = PyAttentionInputs()
         rep_inputs.is_prefill = False
-        rep_inputs.sequence_lengths = in_kv_lens_rep
+        rep_inputs.sequence_lengths_device = in_kv_lens_rep.to(GPU_DEVICE)
+        rep_inputs.sequence_lengths_host = in_kv_lens_rep.cpu().pin_memory()
+        rep_inputs.max_sequence_length = int(in_kv_lens_rep.max().item())
         rep_inputs.input_lengths = q_lens_rep
         rep_inputs.kv_cache_block_id_device = page_table_rep
         rep_inputs.kv_cache_kernel_block_id_device = page_table_rep
-        rep_inputs.kv_cache_kernel_block_id_host = page_table_rep.cpu()
+        rep_inputs.kv_cache_kernel_block_id = page_table_rep.cpu()
         rep_inputs.dtype = get_typemeta(
             torch.empty(1, dtype=DTYPE_MAP["bf16"], device=GPU_DEVICE)
         )
         rep_inputs.total_tokens = batch_size * q_len_per_req
-        rep_inputs.decode_cu_seqlens_d = generate_cumsum_lens(q_lens_rep)
-        rep_inputs.decode_cu_seqlens_host = generate_cumsum_lens(q_lens_rep).cpu()
+        rep_inputs.decode_cu_seqlens_device = generate_cumsum_lens(q_lens_rep)
+        rep_inputs.decode_cu_seqlens = generate_cumsum_lens(q_lens_rep).cpu()
         rep_inputs.cu_seqlens = generate_cumsum_lens(q_lens_rep).cpu()
-        rep_inputs.cu_kv_seqlens = generate_cumsum_lens(seq_lens_rep).cpu()
+        rep_inputs.cu_kv_seqlens_device = generate_cumsum_lens(seq_lens_rep)
 
         # Update parameters for replay (in-place update of captured tensors)
         xqa_impl.prepare_cuda_graph(rep_inputs)
@@ -1041,19 +1059,21 @@ class TestXQABatchDecode(unittest.TestCase):
 
         cap_inputs = PyAttentionInputs()
         cap_inputs.is_prefill = False
-        cap_inputs.sequence_lengths = in_kv_lens_cap
+        cap_inputs.sequence_lengths_device = in_kv_lens_cap.to(GPU_DEVICE)
+        cap_inputs.sequence_lengths_host = in_kv_lens_cap.cpu().pin_memory()
+        cap_inputs.max_sequence_length = int(in_kv_lens_cap.max().item())
         cap_inputs.input_lengths = q_lens_cap
         cap_inputs.kv_cache_block_id_device = page_table_fixed
         cap_inputs.kv_cache_kernel_block_id_device = page_table_fixed
-        cap_inputs.kv_cache_kernel_block_id_host = page_table_fixed.cpu()
+        cap_inputs.kv_cache_kernel_block_id = page_table_fixed.cpu()
         cap_inputs.dtype = get_typemeta(
             torch.empty(1, dtype=DTYPE_MAP["bf16"], device=GPU_DEVICE)
         )
         cap_inputs.total_tokens = batch_size * q_len_per_req
-        cap_inputs.decode_cu_seqlens_d = generate_cumsum_lens(q_lens_cap)
-        cap_inputs.decode_cu_seqlens_host = generate_cumsum_lens(q_lens_cap).cpu()
+        cap_inputs.decode_cu_seqlens_device = generate_cumsum_lens(q_lens_cap)
+        cap_inputs.decode_cu_seqlens = generate_cumsum_lens(q_lens_cap).cpu()
         cap_inputs.cu_seqlens = generate_cumsum_lens(q_lens_cap).cpu()
-        cap_inputs.cu_kv_seqlens = generate_cumsum_lens(seq_lens_cap).cpu()
+        cap_inputs.cu_kv_seqlens_device = generate_cumsum_lens(seq_lens_cap)
 
         attn_configs = AttentionConfigs()
         attn_configs.head_num = num_qo_heads
@@ -1117,19 +1137,21 @@ class TestXQABatchDecode(unittest.TestCase):
 
         rep_inputs = PyAttentionInputs()
         rep_inputs.is_prefill = False
-        rep_inputs.sequence_lengths = in_kv_lens_rep
+        rep_inputs.sequence_lengths_device = in_kv_lens_rep.to(GPU_DEVICE)
+        rep_inputs.sequence_lengths_host = in_kv_lens_rep.cpu().pin_memory()
+        rep_inputs.max_sequence_length = int(in_kv_lens_rep.max().item())
         rep_inputs.input_lengths = q_lens_rep
         rep_inputs.kv_cache_block_id_device = page_table_fixed
         rep_inputs.kv_cache_kernel_block_id_device = page_table_fixed
-        rep_inputs.kv_cache_kernel_block_id_host = page_table_fixed.cpu()
+        rep_inputs.kv_cache_kernel_block_id = page_table_fixed.cpu()
         rep_inputs.dtype = get_typemeta(
             torch.empty(1, dtype=DTYPE_MAP["bf16"], device=GPU_DEVICE)
         )
         rep_inputs.total_tokens = batch_size * q_len_per_req
-        rep_inputs.decode_cu_seqlens_d = generate_cumsum_lens(q_lens_rep)
-        rep_inputs.decode_cu_seqlens_host = generate_cumsum_lens(q_lens_rep).cpu()
+        rep_inputs.decode_cu_seqlens_device = generate_cumsum_lens(q_lens_rep)
+        rep_inputs.decode_cu_seqlens = generate_cumsum_lens(q_lens_rep).cpu()
         rep_inputs.cu_seqlens = generate_cumsum_lens(q_lens_rep).cpu()
-        rep_inputs.cu_kv_seqlens = generate_cumsum_lens(seq_lens_rep).cpu()
+        rep_inputs.cu_kv_seqlens_device = generate_cumsum_lens(seq_lens_rep)
 
         xqa_impl.prepare_cuda_graph(rep_inputs)
         xqa_impl.attn_inputs = rep_inputs
@@ -1205,19 +1227,21 @@ class TestXQABatchDecode(unittest.TestCase):
 
         cap_inputs = PyAttentionInputs()
         cap_inputs.is_prefill = False
-        cap_inputs.sequence_lengths = in_kv_lens_cap
+        cap_inputs.sequence_lengths_device = in_kv_lens_cap.to(GPU_DEVICE)
+        cap_inputs.sequence_lengths_host = in_kv_lens_cap.cpu().pin_memory()
+        cap_inputs.max_sequence_length = int(in_kv_lens_cap.max().item())
         cap_inputs.input_lengths = q_lens_cap
         cap_inputs.kv_cache_block_id_device = page_table_cap
         cap_inputs.kv_cache_kernel_block_id_device = page_table_cap
-        cap_inputs.kv_cache_kernel_block_id_host = page_table_cap.cpu()
+        cap_inputs.kv_cache_kernel_block_id = page_table_cap.cpu()
         cap_inputs.dtype = get_typemeta(
             torch.empty(1, dtype=DTYPE_MAP["bf16"], device=GPU_DEVICE)
         )
         cap_inputs.total_tokens = capture_batch_size * q_len_per_req
-        cap_inputs.decode_cu_seqlens_d = generate_cumsum_lens(q_lens_cap)
-        cap_inputs.decode_cu_seqlens_host = generate_cumsum_lens(q_lens_cap).cpu()
+        cap_inputs.decode_cu_seqlens_device = generate_cumsum_lens(q_lens_cap)
+        cap_inputs.decode_cu_seqlens = generate_cumsum_lens(q_lens_cap).cpu()
         cap_inputs.cu_seqlens = generate_cumsum_lens(q_lens_cap).cpu()
-        cap_inputs.cu_kv_seqlens = generate_cumsum_lens(seq_lens_cap).cpu()
+        cap_inputs.cu_kv_seqlens_device = generate_cumsum_lens(seq_lens_cap)
 
         attn_configs = AttentionConfigs()
         attn_configs.head_num = num_qo_heads
@@ -1317,17 +1341,21 @@ class TestXQABatchDecode(unittest.TestCase):
 
                 rep_inputs = PyAttentionInputs()
                 rep_inputs.is_prefill = False
-                rep_inputs.sequence_lengths = padded_seq_lens
+                rep_inputs.sequence_lengths_device = padded_seq_lens.to(GPU_DEVICE)
+                rep_inputs.sequence_lengths_host = padded_seq_lens.cpu().pin_memory()
+                rep_inputs.max_sequence_length = int(padded_seq_lens.max().item())
                 rep_inputs.input_lengths = padded_q_lens
                 rep_inputs.kv_cache_block_id_device = padded_page_table
                 rep_inputs.kv_cache_kernel_block_id_device = padded_page_table
-                rep_inputs.kv_cache_kernel_block_id_host = padded_page_table.cpu()
+                rep_inputs.kv_cache_kernel_block_id = padded_page_table.cpu()
                 rep_inputs.dtype = get_typemeta(
                     torch.empty(1, dtype=DTYPE_MAP["bf16"], device=GPU_DEVICE)
                 )
                 rep_inputs.total_tokens = capture_batch_size * q_len_per_req
-                rep_inputs.decode_cu_seqlens_d = generate_cumsum_lens(padded_q_lens)
-                rep_inputs.decode_cu_seqlens_host = generate_cumsum_lens(
+                rep_inputs.decode_cu_seqlens_device = generate_cumsum_lens(
+                    padded_q_lens
+                )
+                rep_inputs.decode_cu_seqlens = generate_cumsum_lens(
                     padded_q_lens
                 ).cpu()
                 rep_inputs.cu_seqlens = generate_cumsum_lens(padded_q_lens).cpu()
@@ -1337,9 +1365,9 @@ class TestXQABatchDecode(unittest.TestCase):
                         torch.full((pad_size,), q_len_per_req, dtype=torch.int32),
                     ]
                 )
-                rep_inputs.cu_kv_seqlens = generate_cumsum_lens(
+                rep_inputs.cu_kv_seqlens_device = generate_cumsum_lens(
                     padded_full_seq_lens
-                ).cpu()
+                )
 
                 # In-place update captured parameters
                 xqa_impl.prepare_cuda_graph(rep_inputs)
@@ -1441,17 +1469,19 @@ class TestXQABatchDecode(unittest.TestCase):
 
         attn_inputs = PyAttentionInputs()
         attn_inputs.is_prefill = False
-        attn_inputs.sequence_lengths = in_kv_lens
+        attn_inputs.sequence_lengths_device = in_kv_lens.to(GPU_DEVICE)
+        attn_inputs.sequence_lengths_host = in_kv_lens.cpu().pin_memory()
+        attn_inputs.max_sequence_length = int(in_kv_lens.max().item())
         attn_inputs.input_lengths = q_lens
         attn_inputs.kv_cache_block_id_device = page_table
         attn_inputs.kv_cache_kernel_block_id_device = page_table
-        attn_inputs.kv_cache_kernel_block_id_host = page_table.cpu()
+        attn_inputs.kv_cache_kernel_block_id = page_table.cpu()
         attn_inputs.dtype = get_typemeta(q)
         attn_inputs.total_tokens = q.shape[0]
-        attn_inputs.decode_cu_seqlens_d = generate_cumsum_lens(q_lens)
-        attn_inputs.decode_cu_seqlens_host = generate_cumsum_lens(q_lens).cpu()
+        attn_inputs.decode_cu_seqlens_device = generate_cumsum_lens(q_lens)
+        attn_inputs.decode_cu_seqlens = generate_cumsum_lens(q_lens).cpu()
         attn_inputs.cu_seqlens = generate_cumsum_lens(q_lens).cpu()
-        attn_inputs.cu_kv_seqlens = generate_cumsum_lens(seq_lens).cpu()
+        attn_inputs.cu_kv_seqlens_device = generate_cumsum_lens(seq_lens)
 
         attn_configs = AttentionConfigs()
         attn_configs.head_num = num_qo_heads

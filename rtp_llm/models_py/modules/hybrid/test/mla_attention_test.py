@@ -143,13 +143,17 @@ class MLATest(TestCase):
         attn_inputs: PyAttentionInputs = PyAttentionInputs()
         attn_inputs.is_prefill = True
         attn_inputs.prefix_lengths = prefix_lengths_t
-        attn_inputs.sequence_lengths = torch.tensor(
+        attn_inputs.sequence_lengths_host = torch.tensor(
             [], dtype=torch.int32, device=torch.device("cpu")
         )
+        attn_inputs.sequence_lengths_device = attn_inputs.sequence_lengths_host.to(
+            device
+        )
+        attn_inputs.max_sequence_length = 0
         attn_inputs.input_lengths = sequence_lengths_t
-        attn_inputs.kv_cache_block_id_host = kvcache_block_id
+        attn_inputs.kv_cache_block_id = kvcache_block_id
         attn_inputs.kv_cache_block_id_device = kvcache_block_id.to(device)
-        attn_inputs.kv_cache_kernel_block_id_host = kvcache_block_id
+        attn_inputs.kv_cache_kernel_block_id = kvcache_block_id
         attn_inputs.kv_cache_kernel_block_id_device = kvcache_block_id.to(device)
 
         weights = {}

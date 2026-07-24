@@ -154,9 +154,13 @@ class BaseAttentionTest(unittest.TestCase):
 
         # Decode mode
         attn_inputs.is_prefill = False
-        attn_inputs.sequence_lengths = (
+        attn_inputs.sequence_lengths_host = (
             torch.tensor(sequence_lengths, dtype=torch.int32, device="cpu") - 1
         ).pin_memory()
+        attn_inputs.sequence_lengths_device = (
+            attn_inputs.sequence_lengths_host.cuda(non_blocking=True)
+        )
+        attn_inputs.max_sequence_length = max(sequence_lengths, default=0)
 
         # Input lengths for decode are all 1 (generating one token per sequence)
         attn_inputs.input_lengths = torch.ones(
@@ -170,13 +174,13 @@ class BaseAttentionTest(unittest.TestCase):
         kv_cache_block_id = self._create_kv_cache_block_ids(
             batch_size, sequence_lengths, seq_size_per_block
         )
-        attn_inputs.kv_cache_block_id_host = kv_cache_block_id
+        attn_inputs.kv_cache_block_id = kv_cache_block_id
         attn_inputs.kv_cache_block_id_device = kv_cache_block_id.to(self.device)
-        attn_inputs.kv_cache_kernel_block_id_host = kv_cache_block_id
+        attn_inputs.kv_cache_kernel_block_id = kv_cache_block_id
         attn_inputs.kv_cache_kernel_block_id_device = kv_cache_block_id.to(self.device)
 
         # Create cu_seqlens for decode (just counting tokens)
-        attn_inputs.cu_seqlens = torch.arange(
+        attn_inputs.cu_seqlens_device = torch.arange(
             0, batch_size + 1, dtype=torch.int32, device=self.device
         )
 
@@ -191,6 +195,7 @@ class BaseAttentionTest(unittest.TestCase):
         sequence_lengths: List[int],
         seq_size_per_block: int,
         dtype: torch.dtype = torch.float16,
+        with_kv_cache_block_ids: bool = True,
     ) -> PyAttentionInputs:
         """Helper to create PyAttentionInputs for prefill mode
 
@@ -199,6 +204,7 @@ class BaseAttentionTest(unittest.TestCase):
             sequence_lengths: List of sequence lengths for each batch item
             seq_size_per_block: Number of tokens per block (page size)
             dtype: Data type for attention computation (default: torch.float16)
+            with_kv_cache_block_ids: Whether to populate paged KV cache block IDs
 
         Returns:
             PyAttentionInputs configured for prefill mode
@@ -214,29 +220,35 @@ class BaseAttentionTest(unittest.TestCase):
         ).pin_memory()
 
         # sequence_lengths for prefill is same as input_lengths
-        attn_inputs.sequence_lengths = torch.tensor(
+        attn_inputs.sequence_lengths_host = torch.tensor(
             sequence_lengths, dtype=torch.int32, device="cpu"
         ).pin_memory()
+        attn_inputs.sequence_lengths_device = (
+            attn_inputs.sequence_lengths_host.cuda(non_blocking=True)
+        )
+        attn_inputs.max_sequence_length = max(sequence_lengths, default=0)
 
         # prefix_lengths is all zeros for pure prefill (no prefix caching)
         attn_inputs.prefix_lengths = torch.zeros(
             batch_size, dtype=torch.int32, device="cpu"
         )
 
-        # Create KV cache block IDs using the extracted helper
-        kv_cache_block_id = self._create_kv_cache_block_ids(
-            batch_size, sequence_lengths, seq_size_per_block
-        )
-        attn_inputs.kv_cache_block_id_host = kv_cache_block_id
-        attn_inputs.kv_cache_block_id_device = kv_cache_block_id.to(self.device)
-        attn_inputs.kv_cache_kernel_block_id_host = kv_cache_block_id
-        attn_inputs.kv_cache_kernel_block_id_device = kv_cache_block_id.to(self.device)
+        if with_kv_cache_block_ids:
+            kv_cache_block_id = self._create_kv_cache_block_ids(
+                batch_size, sequence_lengths, seq_size_per_block
+            )
+            attn_inputs.kv_cache_block_id = kv_cache_block_id
+            attn_inputs.kv_cache_block_id_device = kv_cache_block_id.to(self.device)
+            attn_inputs.kv_cache_kernel_block_id = kv_cache_block_id
+            attn_inputs.kv_cache_kernel_block_id_device = kv_cache_block_id.to(
+                self.device
+            )
 
         # Create cu_seqlens (cumulative sequence lengths) for ragged tensor
         cu_seqlens = [0]
         for seq_len in sequence_lengths:
             cu_seqlens.append(cu_seqlens[-1] + seq_len)
-        attn_inputs.cu_seqlens = torch.tensor(
+        attn_inputs.cu_seqlens_device = torch.tensor(
             cu_seqlens, dtype=torch.int32, device=self.device
         )
 
@@ -258,22 +270,33 @@ class BaseAttentionTest(unittest.TestCase):
         Note: For HND layout, kv_cache_base should be a 5D tensor:
         [total_blocks, 2, num_kv_heads, seq_size_per_block, head_dim]
         where dimension 1 index 0 is K cache and index 1 is V cache.
+        FP8 caches also include the scale buffer required by fused cache writes.
         """
         kv_cache = LayerKVCache()
 
         # Create combined KV cache with shape [total_blocks, 2, num_kv_heads, seq_size_per_block, head_dim]
         # where dim=1, index=0 is K and index=1 is V
+        is_fp8 = dtype == torch.float8_e4m3fn
         kv_cache_combined = torch.randn(
             total_blocks,
             2,  # K and V
             num_kv_heads,
             seq_size_per_block,
             head_dim,
-            dtype=dtype,
+            dtype=torch.bfloat16 if is_fp8 else dtype,
             device=self.device,
         )
+        if is_fp8:
+            kv_cache_combined = kv_cache_combined.to(dtype)
 
         kv_cache.kv_cache_base = kv_cache_combined
+        if is_fp8:
+            kv_cache.kv_scale_base = torch.ones(
+                total_blocks,
+                2 * num_kv_heads * seq_size_per_block,
+                dtype=torch.float32,
+                device=self.device,
+            )
 
         # Extract separate K and V for reference computation
         k_cache = kv_cache_combined[
@@ -321,6 +344,6 @@ class BaseAttentionTest(unittest.TestCase):
         block_id_list = []
         for i, seq_len in enumerate(sequence_lengths):
             num_blocks = math.ceil(seq_len / seq_size_per_block)
-            block_ids = attn_inputs.kv_cache_block_id_host[i, :num_blocks].tolist()
+            block_ids = attn_inputs.kv_cache_block_id[i, :num_blocks].tolist()
             block_id_list.append(block_ids)
         return block_id_list

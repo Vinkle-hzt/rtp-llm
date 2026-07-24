@@ -54,18 +54,37 @@ class FusedRopeKVCachePrefillOpBase:
         if attn_inputs.context_parallel_info is not None:
             position_ids = attn_inputs.context_parallel_info.prefill_shuffle_indices
 
+        if attn_inputs.disable_flash_infer:
+            batch_size = attn_inputs.input_lengths_device.size(0)
+            input_lengths = attn_inputs.input_lengths_device
+            prefix_lengths = attn_inputs.prefix_lengths_device
+            max_seq_len = max(1, attn_inputs.total_tokens // max(1, batch_size))
+            if attn_inputs.is_cuda_graph:
+                max_prefix_length = (
+                    max(0, attn_inputs.max_sequence_length - max_seq_len)
+                    if attn_inputs.is_target_verify
+                    else 0
+                )
+            else:
+                max_prefix_length = max(0, attn_inputs.max_sequence_length - 1)
+        else:
+            input_lengths = attn_inputs.input_lengths
+            prefix_lengths = attn_inputs.prefix_lengths
+            max_seq_len = attn_inputs.input_lengths.max().item()
+            max_prefix_length = attn_inputs.prefix_lengths.max().item()
+
         return FusedRopeAttnParams(
             kv_cache_offset,
             kv_cache_offset_h,
             attn_inputs.padding_offset,
             position_ids,
-            attn_inputs.cu_seqlens,
-            attn_inputs.cu_kv_seqlens,
-            attn_inputs.input_lengths,
-            attn_inputs.prefix_lengths,
-            attn_inputs.sequence_lengths,
-            attn_inputs.input_lengths.max().item(),
-            attn_inputs.prefix_lengths.max().item(),
+            attn_inputs.cu_seqlens_device,
+            attn_inputs.cu_kv_seqlens_device,
+            input_lengths,
+            prefix_lengths,
+            attn_inputs.sequence_lengths_device,
+            max_seq_len,
+            max_prefix_length,
             False,
             get_scalar_type(attn_inputs.dtype),
         )
@@ -250,11 +269,11 @@ class FusedRopeKVCacheDecodeOp:
             kv_cache_offset_h,
             attn_inputs.padding_offset,
             attn_inputs.combo_position_ids,
-            attn_inputs.cu_seqlens,
-            attn_inputs.cu_kv_seqlens,
+            attn_inputs.cu_seqlens_device,
+            attn_inputs.cu_kv_seqlens_device,
             attn_inputs.input_lengths,
             attn_inputs.prefix_lengths,
-            attn_inputs.sequence_lengths,
+            attn_inputs.sequence_lengths_device,
             0,
             0,
             True,

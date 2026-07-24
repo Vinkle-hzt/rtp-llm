@@ -321,7 +321,8 @@ __global__ void mtpBuildLinearBlockUpdatesKernel(const int32_t* __restrict__ acc
                                                  int32_t linear_group_count,
                                                  int32_t kernel_block_count,
                                                  int32_t seq_size_per_block,
-                                                 int32_t kernel_blocks_per_kv_block) {
+                                                 int32_t table_blocks_per_kv_block,
+                                                 int32_t linear_blocks_per_kv_block) {
     const int32_t work_idx  = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     const int32_t work_size = batch_size * linear_group_count;
     if (work_idx >= work_size) {
@@ -341,7 +342,7 @@ __global__ void mtpBuildLinearBlockUpdatesKernel(const int32_t* __restrict__ acc
         return;
     }
 
-    const int32_t physical_block_count = kernel_block_count / kernel_blocks_per_kv_block;
+    const int32_t physical_block_count = kernel_block_count / table_blocks_per_kv_block;
     const int32_t cur_cached_len       = prev_seq_len[batch_idx] - 1;
     const int32_t nxt_cached_len       = cur_cached_len + accept_len[batch_idx];
 
@@ -368,9 +369,9 @@ __global__ void mtpBuildLinearBlockUpdatesKernel(const int32_t* __restrict__ acc
     int32_t        values[4];
     int32_t        count = 0;
     simulatePhysicalBlockSwap(
-        block_row, cached_src_block_idx, cached_des_block_idx, kernel_blocks_per_kv_block, positions, values, count);
+        block_row, cached_src_block_idx, cached_des_block_idx, linear_blocks_per_kv_block, positions, values, count);
     simulatePhysicalBlockSwap(
-        block_row, src_block_idx, des_block_idx, kernel_blocks_per_kv_block, positions, values, count);
+        block_row, src_block_idx, des_block_idx, linear_blocks_per_kv_block, positions, values, count);
 
     for (int32_t i = 0; i < count; ++i) {
         output[i * 2]     = positions[i];
@@ -385,7 +386,8 @@ __global__ void mtpApplyLinearBlockUpdatesKernel(int32_t* __restrict__ block_tab
                                                  int32_t group_count,
                                                  int32_t linear_group_count,
                                                  int32_t kernel_block_count,
-                                                 int32_t kernel_blocks_per_kv_block) {
+                                                 int32_t table_blocks_per_kv_block,
+                                                 int32_t linear_blocks_per_kv_block) {
     const int32_t work_idx  = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     const int32_t work_size = batch_size * linear_group_count;
     if (work_idx >= work_size) {
@@ -399,7 +401,7 @@ __global__ void mtpApplyLinearBlockUpdatesKernel(int32_t* __restrict__ block_tab
         return;
     }
 
-    const int32_t  physical_block_count = kernel_block_count / kernel_blocks_per_kv_block;
+    const int32_t  physical_block_count = kernel_block_count / table_blocks_per_kv_block;
     int32_t*       block_row            = block_table + (group_id * batch_size + batch_idx) * kernel_block_count;
     const int32_t* input                = updates + work_idx * 8;
     for (int32_t i = 0; i < 4; ++i) {
@@ -411,9 +413,9 @@ __global__ void mtpApplyLinearBlockUpdatesKernel(int32_t* __restrict__ block_tab
         if (physical_pos >= physical_block_count) {
             continue;
         }
-        const int32_t kernel_pos = physical_pos * kernel_blocks_per_kv_block;
-        for (int32_t j = 0; j < kernel_blocks_per_kv_block; ++j) {
-            block_row[kernel_pos + j] = physical_id < 0 ? -1 : physical_id * kernel_blocks_per_kv_block + j;
+        const int32_t kernel_pos = physical_pos * linear_blocks_per_kv_block;
+        for (int32_t j = 0; j < linear_blocks_per_kv_block; ++j) {
+            block_row[kernel_pos + j] = physical_id < 0 ? -1 : physical_id * linear_blocks_per_kv_block + j;
         }
     }
 }
@@ -424,7 +426,8 @@ void invokeMtpBuildLinearBlockUpdates(const torch::Tensor& accept_len,
                                       const torch::Tensor& linear_group_ids,
                                       torch::Tensor&       linear_block_updates,
                                       int32_t              seq_size_per_block,
-                                      int32_t              kernel_blocks_per_kv_block,
+                                      int32_t              table_blocks_per_kv_block,
+                                      int32_t              linear_blocks_per_kv_block,
                                       MtpPrepareStream     stream) {
     checkCudaI32Tensor(kv_cache_kernel_block_id, "kv_cache_kernel_block_id");
     checkCudaI32Tensor(linear_group_ids, "linear_group_ids");
@@ -434,9 +437,12 @@ void invokeMtpBuildLinearBlockUpdates(const torch::Tensor& accept_len,
                                 && linear_block_updates.size(3) == 2,
                             "linear_block_updates must have shape [batch, linear_group_num, 4, 2]");
     RTP_LLM_CHECK_WITH_INFO(seq_size_per_block > 0, "seq_size_per_block must be positive");
-    RTP_LLM_CHECK_WITH_INFO(kernel_blocks_per_kv_block > 0, "kernel_blocks_per_kv_block must be positive");
-    RTP_LLM_CHECK_WITH_INFO(kv_cache_kernel_block_id.size(2) % kernel_blocks_per_kv_block == 0,
-                            "kernel block count must be divisible by kernel_blocks_per_kv_block");
+    RTP_LLM_CHECK_WITH_INFO(table_blocks_per_kv_block > 0, "table_blocks_per_kv_block must be positive");
+    RTP_LLM_CHECK_WITH_INFO(linear_blocks_per_kv_block > 0, "linear_blocks_per_kv_block must be positive");
+    RTP_LLM_CHECK_WITH_INFO(kv_cache_kernel_block_id.size(2) % table_blocks_per_kv_block == 0,
+                            "kernel block count must be divisible by table_blocks_per_kv_block");
+    RTP_LLM_CHECK_WITH_INFO(linear_blocks_per_kv_block <= table_blocks_per_kv_block,
+                            "linear block factor must not exceed table block factor");
 
     const int64_t batch_size       = linear_block_updates.size(0);
     const int64_t linear_group_num = linear_block_updates.size(1);
@@ -468,13 +474,15 @@ void invokeMtpBuildLinearBlockUpdates(const torch::Tensor& accept_len,
         static_cast<int32_t>(linear_group_num),
         static_cast<int32_t>(kv_cache_kernel_block_id.size(2)),
         seq_size_per_block,
-        kernel_blocks_per_kv_block);
+        table_blocks_per_kv_block,
+        linear_blocks_per_kv_block);
 }
 
 void invokeMtpApplyLinearBlockUpdates(torch::Tensor&       kv_cache_kernel_block_id,
                                       const torch::Tensor& linear_group_ids,
                                       const torch::Tensor& linear_block_updates,
-                                      int32_t              kernel_blocks_per_kv_block,
+                                      int32_t              table_blocks_per_kv_block,
+                                      int32_t              linear_blocks_per_kv_block,
                                       MtpPrepareStream     stream) {
     checkCudaI32Tensor(kv_cache_kernel_block_id, "kv_cache_kernel_block_id");
     checkCudaI32Tensor(linear_group_ids, "linear_group_ids");
@@ -483,9 +491,12 @@ void invokeMtpApplyLinearBlockUpdates(torch::Tensor&       kv_cache_kernel_block
     RTP_LLM_CHECK_WITH_INFO(linear_block_updates.dim() == 4 && linear_block_updates.size(2) == 4
                                 && linear_block_updates.size(3) == 2,
                             "linear_block_updates must have shape [batch, linear_group_num, 4, 2]");
-    RTP_LLM_CHECK_WITH_INFO(kernel_blocks_per_kv_block > 0, "kernel_blocks_per_kv_block must be positive");
-    RTP_LLM_CHECK_WITH_INFO(kv_cache_kernel_block_id.size(2) % kernel_blocks_per_kv_block == 0,
-                            "kernel block count must be divisible by kernel_blocks_per_kv_block");
+    RTP_LLM_CHECK_WITH_INFO(table_blocks_per_kv_block > 0, "table_blocks_per_kv_block must be positive");
+    RTP_LLM_CHECK_WITH_INFO(linear_blocks_per_kv_block > 0, "linear_blocks_per_kv_block must be positive");
+    RTP_LLM_CHECK_WITH_INFO(kv_cache_kernel_block_id.size(2) % table_blocks_per_kv_block == 0,
+                            "kernel block count must be divisible by table_blocks_per_kv_block");
+    RTP_LLM_CHECK_WITH_INFO(linear_blocks_per_kv_block <= table_blocks_per_kv_block,
+                            "linear block factor must not exceed table block factor");
 
     const int64_t batch_size       = linear_block_updates.size(0);
     const int64_t linear_group_num = linear_block_updates.size(1);
@@ -512,7 +523,8 @@ void invokeMtpApplyLinearBlockUpdates(torch::Tensor&       kv_cache_kernel_block
         static_cast<int32_t>(kv_cache_kernel_block_id.size(0)),
         static_cast<int32_t>(linear_group_num),
         static_cast<int32_t>(kv_cache_kernel_block_id.size(2)),
-        kernel_blocks_per_kv_block);
+        table_blocks_per_kv_block,
+        linear_blocks_per_kv_block);
 }
 
 }  // namespace rtp_llm

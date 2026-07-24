@@ -43,25 +43,31 @@ class TestPrefillPagedCudaGraph(BaseAttentionTest):
         inp = PyAttentionInputs()
         inp.is_cuda_graph = with_copy_params
         inp.is_prefill = True
-        inp.input_lengths = torch.tensor(
-            input_lengths, dtype=torch.int32, device="cuda"
-        )
+        inp.input_lengths = torch.tensor(input_lengths, dtype=torch.int32).pin_memory()
         inp.prefix_lengths = torch.tensor(
-            prefix_lengths, dtype=torch.int32, device="cuda"
-        )
+            prefix_lengths, dtype=torch.int32
+        ).pin_memory()
         seq_lengths = [p + i for p, i in zip(prefix_lengths, input_lengths)]
-        inp.sequence_lengths = torch.tensor(seq_lengths, dtype=torch.int32).pin_memory()
+        inp.sequence_lengths_host = torch.tensor(
+            seq_lengths, dtype=torch.int32
+        ).pin_memory()
+        inp.sequence_lengths_device = inp.sequence_lengths_host.cuda(
+            non_blocking=True
+        )
+        inp.max_sequence_length = max(seq_lengths)
 
         cu = [0]
         for il in input_lengths:
             cu.append(cu[-1] + il)
 
         if with_copy_params:
-            inp.cu_seqlens = torch.tensor(cu, dtype=torch.int32).pin_memory()
-            inp.cu_kv_seqlens = torch.tensor(cu, dtype=torch.int32).pin_memory()
+            inp.cu_seqlens_device = torch.tensor(cu, dtype=torch.int32).pin_memory()
+            inp.cu_kv_seqlens_device = torch.tensor(cu, dtype=torch.int32).pin_memory()
         else:
-            inp.cu_seqlens = torch.tensor(cu, dtype=torch.int32, device="cuda")
-            inp.cu_kv_seqlens = torch.tensor(cu, dtype=torch.int32, device="cuda")
+            inp.cu_seqlens_device = torch.tensor(cu, dtype=torch.int32, device="cuda")
+            inp.cu_kv_seqlens_device = torch.tensor(
+                cu, dtype=torch.int32, device="cuda"
+            )
 
         max_blocks = max(math.ceil(s / PAGE_SIZE) for s in seq_lengths)
         block_ids = torch.zeros(batch_size, max_blocks, dtype=torch.int32)
@@ -70,7 +76,7 @@ class TestPrefillPagedCudaGraph(BaseAttentionTest):
             nb = math.ceil(s / PAGE_SIZE)
             block_ids[i, :nb] = torch.arange(offset, offset + nb)
             offset += nb
-        inp.kv_cache_kernel_block_id_host = block_ids
+        inp.kv_cache_kernel_block_id = block_ids
 
         if with_copy_params:
             ms = max_seq_len if max_seq_len > 0 else max(input_lengths)
@@ -122,6 +128,8 @@ class TestPrefillPagedCudaGraph(BaseAttentionTest):
         head_num=8,
         head_num_kv=2,
         size_per_head=64,
+        capture_input_lengths=None,
+        capture_prefix_lengths=None,
     ):
         if isinstance(input_lengths, int):
             input_lengths = [input_lengths]
@@ -167,7 +175,11 @@ class TestPrefillPagedCudaGraph(BaseAttentionTest):
         normal_out = normal_op.forward(q, kv_cache)
 
         # CUDA graph path: capture then replay
-        cg_init = self._make_inputs(input_lengths, prefix_lengths, True, max_seq_len)
+        capture_input_lengths = capture_input_lengths or input_lengths
+        capture_prefix_lengths = capture_prefix_lengths or prefix_lengths
+        cg_init = self._make_inputs(
+            capture_input_lengths, capture_prefix_lengths, True, max_seq_len
+        )
         cg_op = PyFlashinferPrefillPagedAttnOp(config.attn_configs, cg_init)
         cg_op.prepare(cg_init)
         cg_replay = self._make_inputs(input_lengths, prefix_lengths, True, max_seq_len)
@@ -210,6 +222,15 @@ class TestPrefillPagedCudaGraph(BaseAttentionTest):
 
     def test_multi_batch_varied_input_and_prefix(self):
         self._test_forward_match([1, 3, 5, 2], [200, 50, 100, 300])
+
+    def test_replay_smaller_batch_with_varied_input(self):
+        self._test_forward_match(
+            [2, 4, 3],
+            [100, 50, 200],
+            max_seq_len=5,
+            capture_input_lengths=[5, 5, 5, 5],
+            capture_prefix_lengths=[200, 200, 200, 200],
+        )
 
     def test_multi_batch_single_tokens(self):
         self._test_forward_match([1, 1, 1], [100, 200, 300])

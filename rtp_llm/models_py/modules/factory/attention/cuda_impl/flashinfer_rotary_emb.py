@@ -33,7 +33,7 @@ class MhaRotaryEmbeddingOp(BaseRotaryEmbeddingOp):
             attn_config.size_per_head,
             cos_sin_cache,
             attn_config.kernel_tokens_per_block,
-            is_neox_style=False,
+            is_neox_style=attn_config.rope_config.is_neox_style,
             rope_config=attn_config.rope_config,
             max_position_embeddings=attn_config.max_seq_len
             + attn_config.gen_num_per_cycle
@@ -86,4 +86,73 @@ class MhaRotaryEmbeddingOp(BaseRotaryEmbeddingOp):
         # Apply RoPE to Q and K
         self._apply_rope(query, key, self.params)
 
+        return query, key, value
+
+
+class MropeRotaryEmbeddingOp:
+    """Device-only interleaved MRoPE used by Qwen3.5 target verification."""
+
+    def __init__(self, attn_config: AttentionConfigs) -> None:
+        self.head_size = attn_config.size_per_head
+        self.num_heads = attn_config.head_num
+        self.num_kv_heads = attn_config.kv_head_num
+        self.rope_dim = attn_config.rope_config.dim
+        self.index_factor = attn_config.rope_config.index_factor
+        self.inv_freq = 1.0 / torch.pow(
+            float(attn_config.rope_config.base),
+            torch.arange(0, self.rope_dim, 2, device="cuda").float()
+            / self.rope_dim,
+        )
+        remaining = [
+            attn_config.rope_config.mrope_dim1,
+            attn_config.rope_config.mrope_dim2,
+            attn_config.rope_config.mrope_dim3,
+        ]
+        axis_indices = []
+        while any(remaining):
+            for axis in range(3):
+                if remaining[axis] > 0:
+                    axis_indices.append(axis)
+                    remaining[axis] -= 1
+        self.axis_indices = torch.tensor(axis_indices, dtype=torch.long, device="cuda")
+        assert self.index_factor == 3
+        assert self.axis_indices.numel() == self.rope_dim // 2
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        position_ids: torch.Tensor,
+        fallback_positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv = qkv.reshape(qkv.shape[0], -1)
+        q_size = self.num_heads * self.head_size
+        kv_size = self.num_kv_heads * self.head_size
+        query, key, value = torch.split(
+            qkv, [q_size, kv_size, kv_size], dim=-1
+        )
+        query = query.view(qkv.shape[0], self.num_heads, self.head_size)
+        key = key.view(qkv.shape[0], self.num_kv_heads, self.head_size)
+        value = value.view(qkv.shape[0], self.num_kv_heads, self.head_size)
+
+        positions = position_ids.narrow(
+            0, 0, qkv.shape[0] * self.index_factor
+        ).view(qkv.shape[0], self.index_factor)
+        fallback = fallback_positions.narrow(0, 0, qkv.shape[0]).unsqueeze(1)
+        positions = torch.where(positions > 0, positions, fallback)
+        selected_positions = positions[:, self.axis_indices].float()
+        angles = selected_positions * self.inv_freq.unsqueeze(0)
+        cos = angles.cos().unsqueeze(1)
+        sin = angles.sin().unsqueeze(1)
+
+        def apply(tensor: torch.Tensor) -> None:
+            rope = tensor[..., : self.rope_dim]
+            first, second = rope.chunk(2, dim=-1)
+            rotated = torch.cat([-second, first], dim=-1)
+            rope.copy_(
+                rope * torch.cat([cos, cos], dim=-1)
+                + rotated * torch.cat([sin, sin], dim=-1)
+            )
+
+        apply(query)
+        apply(key)
         return query, key, value

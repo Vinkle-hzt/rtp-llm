@@ -57,9 +57,9 @@ class TestPyFlashinferDecodeAttnOp(BaseAttentionTest):
         # Call fill_mla_params to get the actual params
         mla_params = fill_mla_params(
             attn_inputs.prefix_lengths,
-            attn_inputs.sequence_lengths,
+            attn_inputs.sequence_lengths_host,
             attn_inputs.input_lengths,
-            attn_inputs.kv_cache_block_id_host,
+            attn_inputs.kv_cache_block_id,
             seq_size_per_block,
         )
 
@@ -315,7 +315,11 @@ class TestPyFlashinferDecodeCudaGraph(BaseAttentionTest):
         attn_inputs.is_cuda_graph = True
 
         seq_t = torch.tensor(sequence_lengths, dtype=torch.int32)
-        attn_inputs.sequence_lengths = (seq_t - 1).pin_memory()
+        attn_inputs.sequence_lengths_host = (seq_t - 1).pin_memory()
+        attn_inputs.sequence_lengths_device = (
+            attn_inputs.sequence_lengths_host.cuda(non_blocking=True)
+        )
+        attn_inputs.max_sequence_length = max(sequence_lengths, default=0)
         attn_inputs.input_lengths = torch.ones(
             batch_size, dtype=torch.int32
         ).pin_memory()
@@ -324,7 +328,7 @@ class TestPyFlashinferDecodeCudaGraph(BaseAttentionTest):
         kv_cache_block_id = self._create_kv_cache_block_ids(
             batch_size, sequence_lengths, seq_size_per_block
         )
-        attn_inputs.kv_cache_kernel_block_id_host = kv_cache_block_id
+        attn_inputs.kv_cache_kernel_block_id = kv_cache_block_id
         attn_inputs.kv_cache_kernel_block_id_device = kv_cache_block_id.cuda()
 
         attn_inputs.cu_seqlens = torch.arange(

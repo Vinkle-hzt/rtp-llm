@@ -56,14 +56,16 @@ void invokeMtpBuildLinearBlockUpdates(const torch::Tensor& accept_len,
                                       const torch::Tensor& linear_group_ids,
                                       torch::Tensor&       linear_block_updates,
                                       int32_t              seq_size_per_block,
-                                      int32_t              kernel_blocks_per_kv_block,
+                                      int32_t              table_blocks_per_kv_block,
+                                      int32_t              linear_blocks_per_kv_block,
                                       MtpPrepareStream     stream);
 
 // Apply the physical-block patch to the kernel-granularity block table.
 void invokeMtpApplyLinearBlockUpdates(torch::Tensor&       kv_cache_kernel_block_id,
                                       const torch::Tensor& linear_group_ids,
                                       const torch::Tensor& linear_block_updates,
-                                      int32_t              kernel_blocks_per_kv_block,
+                                      int32_t              table_blocks_per_kv_block,
+                                      int32_t              linear_blocks_per_kv_block,
                                       MtpPrepareStream     stream);
 
 }  // namespace rtp_llm

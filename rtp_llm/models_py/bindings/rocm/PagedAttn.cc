@@ -24,7 +24,7 @@ bool PagedAttnDecodeOp::support(torch_ext::PyAttentionInputs attn_inputs) {
 }
 
 CKAttnPtr PagedAttnDecodeOp::prepare(torch_ext::PyAttentionInputs attn_inputs) {
-    int batch_size = attn_inputs.sequence_lengths.size(0);
+    int batch_size = attn_inputs.sequence_lengths_host.size(0);
 
     torch::Tensor kv_cache_kernel_block_id_device;
     if (attn_inputs.kv_cache_kernel_block_id_device.defined()
@@ -35,14 +35,14 @@ CKAttnPtr PagedAttnDecodeOp::prepare(torch_ext::PyAttentionInputs attn_inputs) {
     CKAttnPtr attn_params;
     bool      use_fmha_fp8 = attn_configs_.kv_cache_dtype == KvCacheDataType::FP8;
     auto      params       = PrepareCKAttn(
-        attn_configs_, kv_cache_kernel_block_id_device, attn_inputs.sequence_lengths.size(0), use_fmha_fp8);
+        attn_configs_, kv_cache_kernel_block_id_device, attn_inputs.sequence_lengths_host.size(0), use_fmha_fp8);
 
     attn_params                            = CKAttnPtr(params, (CKAttn*)params.get());
     attn_params->decode_plan               = true;
     attn_params->attn_type                 = torchDTypeToDataType(attn_inputs.dtype);
-    attn_params->sequence_lengths          = attn_inputs.sequence_lengths.cuda();
+    attn_params->sequence_lengths          = attn_inputs.sequence_lengths_host.cuda();
     attn_params->kv_block_array.cache_type = attn_configs_.kv_cache_dtype;
-    attn_params->max_seq_len               = attn_inputs.sequence_lengths.max().item<int32_t>();
+    attn_params->max_seq_len               = attn_inputs.sequence_lengths_host.max().item<int32_t>();
 
     return attn_params;
 }

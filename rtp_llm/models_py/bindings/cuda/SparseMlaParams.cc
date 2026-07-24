@@ -421,13 +421,13 @@ void SparseMlaParams::fillParams(torch_ext::PyAttentionInputs attn_inputs,
                                  bool                         forbid_realloc) {
     auto input_lengths_host    = toHostContiguousI32(attn_inputs.input_lengths);
     auto prefix_lengths_host   = toHostContiguousI32(attn_inputs.prefix_lengths);
-    auto sequence_lengths_host = toHostContiguousI32(attn_inputs.sequence_lengths);
+    auto sequence_lengths_host = toHostContiguousI32(attn_inputs.sequence_lengths_host);
 
     // Step 1: Call base class fillParams to fill shared parameters
     FlashInferMlaAttnParams::fillParams(prefix_lengths_host,
                                         sequence_lengths_host,
                                         input_lengths_host,
-                                        attn_inputs.kv_cache_kernel_block_id_host,
+                                        attn_inputs.kv_cache_kernel_block_id,
                                         seq_size_per_block,
                                         forbid_realloc);
 

@@ -17,6 +17,10 @@
 
 namespace rtp_llm {
 
+enum class ModelInputsModelRole;
+
+class ModelInputsLogger;
+
 struct MtpMetricsCollector {
     RtpLLMExecutorMetricsCollector          executor_collector;
     RtpLLMTokenPSMetricsCollector           tps_collector;
@@ -30,10 +34,9 @@ public:
     explicit MtpExecutor(const EngineInitParams&                        params,
                          std::unique_ptr<ProposeModelEngineInitParams>& propose_params,
                          const std::shared_ptr<KVCacheManager>&         cache_manager,
-                         MlaOpsType                                     mla_ops_type            = MlaOpsType::AUTO,
-                         int32_t                                        kv_cache_group_num      = 1,
-                         const std::vector<int32_t>&                    kv_cache_layer_to_group = {},
-                         bool                                           warm_up                 = false);
+                         MlaOpsType                                     mla_ops_type       = MlaOpsType::AUTO,
+                         int32_t                                        kv_cache_group_num = 1,
+                         bool                                           warm_up            = false);
 
     absl::Status process(const std::list<GenerateStreamPtr>& streams) override;
     bool         updateEplbConfig(const EPLBConfig& config) override;
@@ -170,10 +173,13 @@ protected:
     void releaseAllModelBuffers();
 
 private:
+    GptModelOutputs forwardModel(ModelBase* model, const GptModelInputs& inputs, ModelInputsModelRole role);
+
     std::unique_ptr<ModelBase>               model_;
     std::unique_ptr<Sampler>                 sampler_;
     std::unique_ptr<MtpBatchStreamProcessor> batch_stream_processor_;
     std::shared_ptr<KVCacheManager>          cache_manager_;
+    std::shared_ptr<ModelInputsLogger>       model_inputs_logger_;
     bool                                     enable_ffn_disaggregate_ = false;
     bool                                     enable_detail_log_       = false;
     int                                      tp_rank_                 = 0;
@@ -197,19 +203,15 @@ private:
 
     bool     warm_up_;
     RoleType role_type_;
-
     // True when any KV-cache group is CacheGroupType::LINEAR (RWKV / Mamba /
     // hybrid linear+full). Per-step state advances every token, so the page
     // table must be re-gathered between draft propose and target verify.
     bool                 is_linear_attention_model_ = false;
     std::vector<int32_t> linear_group_ids_;
     torch::Tensor        linear_group_ids_gpu_;
-    int32_t              seq_size_per_block_         = 1;
-    int32_t              kernel_blocks_per_kv_block_ = 1;
-
-    // group id tensors
-    torch::Tensor target_kv_cache_layer_to_group;
-    torch::Tensor draft_kv_cache_layer_to_group;
+    int32_t              seq_size_per_block_                  = 1;
+    int32_t              table_blocks_per_kv_block_           = 1;
+    int32_t              linear_blocks_per_kv_block_          = 1;
 
     torch::Tensor d2t_map_;
 

@@ -12,6 +12,7 @@ from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.config.py_config_modules import PyEnvConfigs
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.flashinfer_rotary_emb import (
     MhaRotaryEmbeddingOp,
+    MropeRotaryEmbeddingOp,
 )
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.kv_cache_write_op import (
     KVCacheWriteOp,
@@ -23,6 +24,7 @@ from rtp_llm.ops.compute_ops import (
     PyAttentionInputs,
     get_typemeta,
     init_exec_ctx,
+    rtp_llm_ops,
 )
 
 
@@ -199,6 +201,194 @@ class TestMhaRotaryEmbeddingOp(unittest.TestCase):
             print(f"Warning: Failed to initialize device: {e}")
             self.device_initialized = False
 
+    def test_device_decode_plan_writes_high_position(self):
+        batch_size = 4
+        seq_len = 12798
+        page_size = 64
+        max_blocks = 200
+        num_heads = 8
+        num_kv_heads = 1
+        head_dim = 256
+
+        attn_config = create_test_attn_config(
+            head_num=num_heads,
+            kv_head_num=num_kv_heads,
+            size_per_head=head_dim,
+            tokens_per_block=page_size,
+            max_seq_len=12800,
+            dtype=torch.bfloat16,
+        )
+        params = rtp_llm_ops.FlashInferMlaAttnParams()
+        empty_prefix = torch.empty(0, dtype=torch.int32, device=self.device)
+        sequence_lengths = torch.full(
+            (batch_size,), seq_len, dtype=torch.int32, device=self.device
+        )
+        input_lengths = torch.ones(
+            batch_size, dtype=torch.int32, device=self.device
+        )
+        block_table = torch.arange(
+            batch_size * max_blocks, dtype=torch.int32, device=self.device
+        ).reshape(batch_size, max_blocks)
+        params.fill_params_mha_device(
+            empty_prefix,
+            sequence_lengths,
+            input_lengths,
+            block_table,
+            page_size,
+            False,
+        )
+
+        rope_op = MhaRotaryEmbeddingOp(
+            attn_config,
+            create_cos_sin_cache(
+                head_dim, max_seq_len=12801, base=10000000, device="cuda"
+            ),
+        )
+        rope_op.set_params(params)
+        write_op = KVCacheWriteOp(num_kv_heads, head_dim, page_size)
+        write_op.set_params(params)
+        qkv = torch.randn(
+            batch_size,
+            (num_heads + 2 * num_kv_heads) * head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        kv_cache = LayerKVCache()
+        kv_cache.kv_cache_base = torch.zeros(
+            batch_size * max_blocks,
+            2,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+
+        _, key, value = rope_op.forward(qkv)
+        write_op.forward(key, value, kv_cache)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            params.positions_d[:batch_size], sequence_lengths
+        )
+        expected_last_page_len = torch.full_like(sequence_lengths, 63)
+        torch.testing.assert_close(
+            params.paged_kv_last_page_len_d, expected_last_page_len
+        )
+        for batch_idx in range(batch_size):
+            page = batch_idx * max_blocks + max_blocks - 1
+            torch.testing.assert_close(
+                kv_cache.kv_cache_base[page, 0, 0, 62], key[batch_idx, 0]
+            )
+            torch.testing.assert_close(
+                kv_cache.kv_cache_base[page, 1, 0, 62], value[batch_idx, 0]
+            )
+
+    def test_device_mrope_matches_fused_mrope(self):
+        token_num = 8
+        num_heads = 8
+        num_kv_heads = 2
+        head_dim = 256
+        rope_dim = 64
+        token_per_block = 16
+
+        attn_config = create_test_attn_config(
+            head_num=num_heads,
+            kv_head_num=num_kv_heads,
+            size_per_head=head_dim,
+            tokens_per_block=token_per_block,
+            dtype=torch.bfloat16,
+        )
+        attn_config.rope_config.style = RopeStyle.Mrope
+        attn_config.rope_config.dim = rope_dim
+        attn_config.rope_config.base = 10000000
+        attn_config.rope_config.index_factor = 3
+        attn_config.rope_config.mrope_dim1 = 11
+        attn_config.rope_config.mrope_dim2 = 11
+        attn_config.rope_config.mrope_dim3 = 10
+
+        qkv = torch.randn(
+            token_num,
+            (num_heads + 2 * num_kv_heads) * head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        position_ids = torch.tensor(
+            [[i, i // 2, i % 3] for i in range(token_num)],
+            dtype=torch.int32,
+            device=self.device,
+        ).flatten()
+        block_ids = torch.zeros((1, 1), dtype=torch.int32, device=self.device)
+
+        attn_inputs = PyAttentionInputs()
+        attn_inputs.is_prefill = True
+        attn_inputs.input_lengths = torch.tensor(
+            [token_num], dtype=torch.int32, device=self.device
+        )
+        attn_inputs.prefix_lengths = torch.zeros(
+            1, dtype=torch.int32, device=self.device
+        )
+        attn_inputs.sequence_lengths_device = attn_inputs.input_lengths.clone()
+        attn_inputs.sequence_lengths_host = (
+            attn_inputs.input_lengths.cpu().pin_memory()
+        )
+        attn_inputs.max_sequence_length = token_num
+        attn_inputs.cu_seqlens_device = torch.tensor(
+            [0, token_num], dtype=torch.int32, device=self.device
+        )
+        attn_inputs.cu_kv_seqlens_device = attn_inputs.cu_seqlens_device.clone()
+        attn_inputs.kv_cache_kernel_block_id = block_ids.cpu()
+        attn_inputs.kv_cache_kernel_block_id_device = block_ids
+        attn_inputs.combo_position_ids = position_ids
+        attn_inputs.dtype = get_typemeta(qkv)
+
+        fused_cache = LayerKVCache()
+        fused_cache.kv_cache_base = torch.zeros(
+            1,
+            2,
+            num_kv_heads,
+            token_per_block,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        fused_op = FusedRopeKVCachePrefillOpQOut(attn_config)
+        fused_q = fused_op.forward(
+            qkv.clone(), fused_cache, fused_op.prepare(attn_inputs)
+        )
+
+        params = rtp_llm_ops.FlashInferMlaAttnParams()
+        params.fill_params_mha_device(
+            attn_inputs.prefix_lengths,
+            attn_inputs.sequence_lengths_device,
+            attn_inputs.input_lengths,
+            block_ids,
+            token_per_block,
+            False,
+        )
+        device_op = MropeRotaryEmbeddingOp(attn_config)
+        device_cache = LayerKVCache()
+        device_cache.kv_cache_base = torch.zeros_like(fused_cache.kv_cache_base)
+        write_op = KVCacheWriteOp(num_kv_heads, head_dim, token_per_block)
+        write_op.set_params(params)
+        device_q, device_k, device_v = device_op.forward(
+            qkv.clone(), position_ids, params.positions_d
+        )
+        write_op.forward(device_k, device_v, device_cache)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(device_q, fused_q, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(
+            device_cache.kv_cache_base,
+            fused_cache.kv_cache_base,
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        original_q = qkv[:, : num_heads * head_dim].view(
+            token_num, num_heads, head_dim
+        )
+        torch.testing.assert_close(device_q[..., rope_dim:], original_q[..., rope_dim:])
+
     def test_fused_rope_vs_mha_rope(self):
         """Compare FusedRopeKVCachePrefillOpQOut (C++) vs MhaRotaryEmbeddingOp (Python)"""
         if not self.device_initialized:
@@ -333,24 +523,29 @@ class TestMhaRotaryEmbeddingOp(unittest.TestCase):
         attn_inputs.prefix_lengths = torch.zeros(
             batch_size, dtype=torch.int32, device=self.device
         )
-        attn_inputs.sequence_lengths = torch.tensor(
+        attn_inputs.sequence_lengths_device = torch.tensor(
             [num_tokens], dtype=torch.int32, device=self.device
         )
+        attn_inputs.sequence_lengths_host = torch.tensor(
+            [num_tokens], dtype=torch.int32, device="cpu"
+        ).pin_memory()
+        attn_inputs.max_sequence_length = num_tokens
         # Set dtype from qkv tensor
         attn_inputs.dtype = get_typemeta(qkv)
 
         # Create cu_seqlens: cumulative sequence lengths [0, num_tokens]
-        attn_inputs.cu_seqlens = torch.tensor(
+        attn_inputs.cu_seqlens_device = torch.tensor(
             [0, num_tokens], dtype=torch.int32, device=self.device
         )
-        attn_inputs.cu_kv_seqlens = attn_inputs.cu_seqlens.clone()
+        attn_inputs.cu_seqlens = attn_inputs.cu_seqlens_device.cpu().pin_memory()
+        attn_inputs.cu_kv_seqlens_device = attn_inputs.cu_seqlens_device.clone()
 
         # Set KV cache block IDs (shape: [batch_size, max_blocks_per_seq])
         # For batch_size=1, reshape kv_page_indices from [num_pages] to [1, num_pages]
         kv_cache_block_id = kv_page_indices.unsqueeze(0).cpu()  # [1, num_pages]
-        attn_inputs.kv_cache_block_id_host = kv_cache_block_id
+        attn_inputs.kv_cache_block_id = kv_cache_block_id
         attn_inputs.kv_cache_block_id_device = kv_cache_block_id.to(self.device)
-        attn_inputs.kv_cache_kernel_block_id_host = kv_cache_block_id
+        attn_inputs.kv_cache_kernel_block_id = kv_cache_block_id
         attn_inputs.kv_cache_kernel_block_id_device = kv_cache_block_id.to(self.device)
 
         # Prepare params

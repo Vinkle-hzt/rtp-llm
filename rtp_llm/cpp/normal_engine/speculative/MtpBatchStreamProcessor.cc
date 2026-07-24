@@ -13,7 +13,6 @@
 #include <cstring>
 
 namespace rtp_llm {
-
 void MtpBatchStreamProcessor::expandTargetVerifyPositionIds(const StreamGroups& stream_groups,
                                                             GptModelInputs&     model_input) const {
     if (!model_input.combo_position_ids.defined()) {
@@ -21,8 +20,8 @@ void MtpBatchStreamProcessor::expandTargetVerifyPositionIds(const StreamGroups& 
     }
 
     const size_t position_id_len_factor = model_input_gatherer_config_.position_id_len_factor;
-    const size_t batch_size = model_input.combo_position_ids.numel() / position_id_len_factor;
-    auto target_combo_position_ids =
+    const size_t batch_size             = model_input.combo_position_ids.numel() / position_id_len_factor;
+    auto         target_combo_position_ids =
         torch::empty({(int64_t)(batch_size * (propose_step_ + 1) * position_id_len_factor)}, torch::kInt32)
             .pin_memory();
 
@@ -646,12 +645,12 @@ void MtpBatchStreamProcessor::updatePrefillPostDraftModelInput(const StreamGroup
     int* input_lengths = input_lengths_cpu.data_ptr<int>();
     int* combo_tokens  = combo_tokens_cpu.data_ptr<int>();
 
-    int offset = 0;
+    int  offset = 0;
     int* combo_position_ids =
         combo_position_ids_cpu.defined() ? combo_position_ids_cpu.data_ptr<int>() : nullptr;
     const size_t position_id_len_factor = model_input_gatherer_config_.position_id_len_factor;
-    auto all_streams = stream_groups.allStreams();
-    auto stream_it = all_streams.begin();
+    auto         all_streams            = stream_groups.allStreams();
+    auto         stream_it              = all_streams.begin();
     // Speculative decoding rejects num_return_sequences > 1 and beam search before this path.
     for (int i = 0; i < batch_size; i++) {
         // should shift one token for combo_tokens

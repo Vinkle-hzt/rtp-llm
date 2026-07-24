@@ -8,6 +8,7 @@
 #include <string>
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
+#include "rtp_llm/cpp/models/ModelInputsLogger.h"
 #include "rtp_llm/cpp/models/ModelTypes.h"
 #include "rtp_llm/cpp/models/PyWrappedModel.h"
 #include "rtp_llm/cpp/models/Sampler.h"
@@ -69,9 +70,7 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
                                bool                                   warm_up,
                                bool                                   is_propose,
                                int                                    propose_model_index,
-                               MlaOpsType                             mla_ops_type,
-                               int32_t                                kv_cache_group_num,
-                               const std::vector<int32_t>&            kv_cache_layer_to_group):
+                               MlaOpsType                             mla_ops_type):
     Executor(),
     cache_manager_(cache_manager),
     role_type_(params.pd_sep_config.role_type),
@@ -86,6 +85,12 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
     tp_rank_            = params.parallelism_config.tp_rank;
     parallelism_config_ = params.parallelism_config;
     RTP_LLM_LOG_INFO("enable_detail_log_ = %d, tp_rank_ = %d", enable_detail_log_, tp_rank_);
+    if (params.profiling_debug_logging_config.enable_model_inputs_log) {
+        model_inputs_logger_ =
+            std::make_shared<ModelInputsLogger>(params.parallelism_config.world_rank,
+                                                params.profiling_debug_logging_config.log_file_backup_count,
+                                                metrics_reporter_);
+    }
 
     if (params.eplb_config.enable_eplb() && params.model_config_.moe_style != 0) {
         // use first moe layer weight as moe weight type
@@ -116,43 +121,24 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
         static_cast<size_t>(std::max<int64_t>(1, params.runtime_config.max_generate_batch_size));
     sampler_.reset(new Sampler(SamplerInitParams{initial_sampler_batch_size, false}));
 
-    // CacheConfig is the single source of truth for tokens_per_block /
-    // kernel_tokens_per_block. DSV4 promotes seq_size_per_block to a 256-token
-    // physical block while attn_config still reflects the 64-token CLI flag, so
-    // sourcing from attn_config makes the fused compressor index the state
-    // block_table with the wrong stride. During warmup the cache_manager is
-    // null — use zero-initialized block geometry so PyWrappedModel's >0
-    // check catches mis-propagation (CacheConfig default is 1, not 0).
-    // when warmup, cache manager maybe nullptr
-    CacheConfig warmup_sentinel;
-    warmup_sentinel.seq_size_per_block            = 0;
-    warmup_sentinel.kernel_seq_size_per_block     = 0;
-    const auto& cache_config                      = cache_manager ?
-                                                        (is_propose_ ? cache_manager->getMTPModuleCacheConfig(propose_model_index_) :
-                                                                       cache_manager->cacheConfig()) :
-                                                        warmup_sentinel;
-    auto        effective_kv_cache_group_num      = kv_cache_group_num;
-    auto        effective_kv_cache_layer_to_group = kv_cache_layer_to_group;
-    if (cache_manager) {
-        effective_kv_cache_group_num = static_cast<int32_t>(cache_config.groupNums());
-        effective_kv_cache_layer_to_group.clear();
-        effective_kv_cache_layer_to_group.reserve(cache_config.layers.size());
-        for (size_t layer_id = 0; layer_id < cache_config.layers.size(); ++layer_id) {
-            const auto& group_ids = cache_config.layers[layer_id].group_ids;
-            RTP_LLM_CHECK_WITH_INFO(group_ids.size() == 1,
-                                    "normal executor layer %zu owns %zu cache groups; expected exactly one group",
-                                    layer_id,
-                                    group_ids.size());
-            effective_kv_cache_layer_to_group.push_back(static_cast<int32_t>(group_ids.front()));
-        }
-    }
+    const CacheConfig* runtime_cache_config =
+        cache_manager ? &(is_propose_ ? cache_manager->getMTPModuleCacheConfig(propose_model_index_) :
+                                       cache_manager->cacheConfig()) :
+                        nullptr;
+    const size_t runtime_tokens_per_block =
+        runtime_cache_config ? runtime_cache_config->seq_size_per_block :
+                               params.model_config_.attn_config.tokens_per_block;
+    const size_t runtime_kernel_tokens_per_block =
+        runtime_cache_config ? runtime_cache_config->kernel_seq_size_per_block :
+                               params.model_config_.attn_config.kernel_tokens_per_block;
+    const CacheConfig cache_config = runtime_cache_config ? *runtime_cache_config : CacheConfig();
 
     GptModelInitParams model_init_params(
         {params.gpt_weights,
          genModelDescription(params.model_config_, params.parallelism_config, params.eplb_config, params.moe_config),
          cache_manager ?
-             std::make_optional(is_propose_ ? cache_manager->getMTPModuleCacheLayerLayout(propose_model_index_) :
-                                              cache_manager->getMainModelCacheLayerLayout()) :
+             std::make_optional(is_propose_ ? cache_manager->getMTPModuleGroupedCacheLayerLayout(propose_model_index_) :
+                                              cache_manager->getMainModelGroupedCacheLayerLayout()) :
              std::nullopt,
          params.model_id,
          params.parallelism_config,
@@ -165,11 +151,13 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
          mla_ops_type,
          params.model_config_.max_seq_len,
          params.model_config_.hidden_size,
-         static_cast<size_t>(cache_config.seq_size_per_block),
-         static_cast<size_t>(cache_config.kernel_seq_size_per_block),
-         effective_kv_cache_group_num,
-         effective_kv_cache_layer_to_group,
-         cache_manager});
+         runtime_tokens_per_block,
+         runtime_kernel_tokens_per_block,
+         cache_manager,
+         (params.model_config_.mm_model_config.mm_position_ids_style != 0
+              || params.model_config_.has_positional_encoding) ?
+             static_cast<size_t>(params.model_config_.attn_config.rope_config.index_factor) :
+             size_t{0}});
 
     if (params.ffn_disaggregate_config.enable_ffn_disaggregate) {
         RTP_LLM_LOG_INFO("using ffn as service");
@@ -283,7 +271,11 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
                                       stream_groups.totalDecodeBatchSize(),
                                       stream_groups.modelExecuteTokenSize(),
                                       stream_groups.maxSeqLen());
-        int64_t start_time_us               = autil::TimeUtility::currentTimeInMicroSeconds();
+        int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        if (model_inputs_logger_) {
+            const auto role = is_propose_ ? ModelInputsModelRole::DRAFT : ModelInputsModelRole::NORMAL;
+            model_inputs_logger_->log(model_input, role, model_->model_id_);
+        }
         model_output                        = std::move(model_->forward(model_input));
         executor_collector.model_forward_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }

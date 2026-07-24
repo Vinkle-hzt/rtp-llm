@@ -6,6 +6,7 @@
 #include "rtp_llm/cpp/cache/CacheGroupType.h"
 #include "rtp_llm/cpp/utils/KVCacheUtils.h"
 #include "rtp_llm/cpp/utils/ErrorCode.h"
+#include "rtp_llm/cpp/utils/DevicePin.h"
 #include "rtp_llm/cpp/utils/StackTrace.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/ErrorCodeUtil.h"
 #include "autil/StackTracer.h"
@@ -25,7 +26,7 @@
 #include <pybind11/functional.h>
 
 #if USING_CUDA
-using DeviceGuard = at::cuda::CUDAGuard;
+using DeviceGuard = c10::cuda::CUDAGuard;
 #elif USING_ROCM
 using DeviceGuard = c10::hip::HIPGuardMasqueradingAsCUDA;
 #endif
@@ -154,72 +155,79 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
         return;
     }
 
-    // Legacy host path uses data_ptr pointer arithmetic; sync D2H when callers
-    // pass device tensors. TODO(async): consume device tensors directly.
-    auto to_cpu_sync = [](const torch::Tensor& t) -> torch::Tensor {
-        if (!t.defined() || t.device().is_cpu()) {
-            return t;
-        }
-        return t.cpu();
-    };
+    // Wait for the CUDA event before reading pinned-host metadata.
+    // The event was recorded on the main stream AFTER both the async D2H
+    // copies (metadata) and KV cache writes were enqueued, so blocking
+    // here guarantees all pinned buffers are populated.
+    if (cache_store_inputs.pre_created_event) {
+        cache_store_inputs.pre_created_event->synchronize();
+    }
 
-    CacheStoreInputs local             = cache_store_inputs;
-    local.host_kv_cache_offset         = to_cpu_sync(local.host_kv_cache_offset);
-    local.prefix_lengths_host          = to_cpu_sync(local.prefix_lengths_host);
-    local.input_lengths_host           = to_cpu_sync(local.input_lengths_host);
-    local.kv_cache_layer_to_group_host = to_cpu_sync(local.kv_cache_layer_to_group_host);
-    local.kv_cache_group_types_host    = to_cpu_sync(local.kv_cache_group_types_host);
-    local.request_id                   = to_cpu_sync(local.request_id);
-    local.request_pd_separation        = to_cpu_sync(local.request_pd_separation);
-
-    auto& param = local;
+    const auto& param = cache_store_inputs;
 
     RTP_LLM_CHECK_WITH_INFO(param.host_kv_cache_offset.defined(), "failed to get host_kv_cache_offset");
     const int32_t* offset_addr          = nullptr;
     size_t         max_blocks_per_batch = 0;
 
-    const bool   has_group_types = param.kv_cache_group_types_host.defined();
-    const size_t group_num       = has_group_types ? static_cast<size_t>(param.kv_cache_group_types_host.size(0)) : 1;
+    RTP_LLM_CHECK_WITH_INFO(!param.tag.empty(), "cache-store write requires a cache tag for layer=%d", param.layer_id);
+    RTP_LLM_CHECK_WITH_INFO(param.host_kv_cache_offset.dim() == 2,
+                            "cache-store block table for tag=%s must be group-local [batch, blocks], got dim=%ld",
+                            param.tag.c_str(),
+                            param.host_kv_cache_offset.dim());
+    max_blocks_per_batch = param.host_kv_cache_offset.size(1);
+    offset_addr          = param.host_kv_cache_offset.data_ptr<int32_t>();
 
-    int gid = 0;
-    if (param.kv_cache_layer_to_group_host.defined() && param.layer_id >= 0
-        && static_cast<size_t>(param.layer_id) < static_cast<size_t>(param.kv_cache_layer_to_group_host.numel())) {
-        gid = param.kv_cache_layer_to_group_host.data_ptr<int32_t>()[param.layer_id];
+    const auto policy_it = param.kv_cache_group_policies.find(param.tag);
+    RTP_LLM_CHECK_WITH_INFO(policy_it != param.kv_cache_group_policies.end(),
+                            "cache-store metadata has no group policy for tag=%s",
+                            param.tag.c_str());
+    const CacheGroupPolicy group_policy                    = policy_it->second;
+    const bool             use_group_cache_transfer_policy = param.kv_cache_group_policies.size() > 1;
+
+    const auto seq_it = param.tokens_per_block_by_tag.find(param.tag);
+    const auto seq_size_per_block =
+        seq_it != param.tokens_per_block_by_tag.end() ? seq_it->second : param.tokens_per_block;
+    const auto kv_stride_it = param.kv_block_stride_bytes_by_tag.find(param.tag);
+    const auto kv_block_stride_bytes =
+        kv_stride_it != param.kv_block_stride_bytes_by_tag.end() ? kv_stride_it->second : param.kv_block_stride_bytes;
+    const auto scale_stride_it       = param.kv_scale_stride_bytes_by_tag.find(param.tag);
+    const auto kv_scale_stride_bytes = scale_stride_it != param.kv_scale_stride_bytes_by_tag.end() ?
+                                           scale_stride_it->second :
+                                           param.kv_scale_stride_bytes;
+    const auto kv_transfer_it        = param.kv_block_transfer_bytes_by_tag.find(param.tag);
+    const auto kv_block_transfer_bytes =
+        kv_transfer_it != param.kv_block_transfer_bytes_by_tag.end() ? kv_transfer_it->second : kv_block_stride_bytes;
+    const auto scale_transfer_it       = param.kv_scale_transfer_bytes_by_tag.find(param.tag);
+    const auto kv_scale_transfer_bytes = scale_transfer_it != param.kv_scale_transfer_bytes_by_tag.end() ?
+                                             scale_transfer_it->second :
+                                             kv_scale_stride_bytes;
+    RTP_LLM_CHECK_WITH_INFO(seq_size_per_block > 0, "cache-store tag=%s has zero tokens_per_block", param.tag.c_str());
+    RTP_LLM_CHECK_WITH_INFO(
+        kv_block_stride_bytes > 0, "cache-store tag=%s has zero kv block stride", param.tag.c_str());
+    RTP_LLM_CHECK_WITH_INFO(
+        kv_block_transfer_bytes > 0, "cache-store tag=%s has zero kv transfer bytes", param.tag.c_str());
+    RTP_LLM_CHECK_WITH_INFO(kv_block_transfer_bytes <= kv_block_stride_bytes,
+                            "cache-store tag=%s transfer bytes=%zu exceed physical stride=%zu",
+                            param.tag.c_str(),
+                            kv_block_transfer_bytes,
+                            kv_block_stride_bytes);
+    RTP_LLM_CHECK_WITH_INFO(kv_scale_transfer_bytes <= kv_scale_stride_bytes,
+                            "cache-store tag=%s scale transfer bytes=%zu exceed physical stride=%zu",
+                            param.tag.c_str(),
+                            kv_scale_transfer_bytes,
+                            kv_scale_stride_bytes);
+    auto       kv_cache_data  = (uint64_t*)kv_cache.kv_cache_buffer.data_ptr();
+    auto       kv_cache_owner = std::make_shared<torch::Tensor>(kv_cache.kv_cache_buffer);
+    const bool kv_gpu_mem     = kv_cache.kv_cache_buffer.is_cuda();
+    const bool has_kv_scale   = kv_cache.kv_scale_buffer.defined() && kv_cache.kv_scale_buffer.numel() > 0
+                              && kv_scale_stride_bytes > 0 && kv_scale_transfer_bytes > 0;
+    uint64_t*                      kv_scale_data = nullptr;
+    std::shared_ptr<torch::Tensor> kv_scale_owner;
+    if (has_kv_scale) {
+        kv_scale_data  = (uint64_t*)kv_cache.kv_scale_buffer.data_ptr();
+        kv_scale_owner = std::make_shared<torch::Tensor>(kv_cache.kv_scale_buffer);
     }
-
-    RTP_LLM_CHECK_WITH_INFO(gid >= 0 && gid < static_cast<int32_t>(group_num), "invalid kv cache group id [%d]", gid);
-
-    bool is_grouped_layout = has_group_types && group_num > 1;
-    if (param.kv_cache_layer_to_group_host.defined() && group_num > 1) {
-        std::vector<bool> used_groups(group_num, false);
-        size_t            used_group_num = 0;
-        const auto*       layer_to_group = param.kv_cache_layer_to_group_host.data_ptr<int32_t>();
-        for (int64_t layer = 0; layer < param.kv_cache_layer_to_group_host.numel(); ++layer) {
-            const int layer_gid = layer_to_group[layer];
-            RTP_LLM_CHECK_WITH_INFO(layer_gid >= 0 && static_cast<size_t>(layer_gid) < group_num,
-                                    "invalid kv cache group id [%d] at layer [%ld]",
-                                    layer_gid,
-                                    static_cast<long>(layer));
-            if (!used_groups[static_cast<size_t>(layer_gid)]) {
-                used_groups[static_cast<size_t>(layer_gid)] = true;
-                ++used_group_num;
-            }
-        }
-        is_grouped_layout = used_group_num > 1;
-    }
-
-    if (param.host_kv_cache_offset.dim() == 3) {
-        const auto group_offset_view = param.host_kv_cache_offset[static_cast<int64_t>(gid)];
-        max_blocks_per_batch         = group_offset_view.size(1);
-        offset_addr                  = group_offset_view.data_ptr<int32_t>();
-    } else {
-        max_blocks_per_batch = param.host_kv_cache_offset.size(1);
-        offset_addr          = param.host_kv_cache_offset.data_ptr<int32_t>();
-    }
-
-    const auto seq_size_per_block = param.tokens_per_block;
-    auto       kv_cache_data      = (uint64_t*)kv_cache.kv_cache_buffer.data_ptr();
-    auto kv_scale_data = kv_cache.kv_scale_buffer.defined() ? (uint64_t*)kv_cache.kv_scale_buffer.data_ptr() : nullptr;
+    const bool kv_scale_gpu_mem = has_kv_scale && kv_cache.kv_scale_buffer.is_cuda();
 
     RTP_LLM_CHECK_WITH_INFO(param.context_batch_size == static_cast<size_t>(param.request_pd_separation.numel()),
                             "size not same");
@@ -228,98 +236,193 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
 
     RTP_LLM_LOG_DEBUG("write cache store, context_batch_size is %ld", param.context_batch_size);
 
+    // cache_keys is laid out [batch, global_max_blocks]; this stride is INDEPENDENT
+    // of `max_blocks_per_batch` (which is per-group offset stride and may be smaller
+    // for CP-sharded FULL groups whose offset is rank-local-compact).
+    const size_t cache_keys_per_batch =
+        param.context_batch_size > 0 ? (param.cache_keys.size() / param.context_batch_size) : 0;
+
     for (size_t batch_id = 0; batch_id < param.context_batch_size; batch_id++) {
         if (*(param.request_pd_separation.data_ptr<bool>() + batch_id) == false) {
             continue;
         }
         RTP_LLM_CHECK_WITH_INFO(param.prefix_lengths_host.defined() && param.input_lengths_host.defined(),
                                 "failed to get prefix_length_host and input_length_host for cache store");
-        RTP_LLM_CHECK_WITH_INFO(param.prefix_lengths_host.data_ptr<int>()[batch_id] % seq_size_per_block == 0,
-                                "prefix_length %% seq_size_per_block != 0");
-        int reuse_block_num = param.prefix_lengths_host.data_ptr<int>()[batch_id] / seq_size_per_block;
+        const bool uses_cp_canonical_keys = param.cp_size > 1 && group_policy.cp_mapping != CpBlockMappingMode::NONE
+                                            && seq_size_per_block % param.cp_size == 0;
+        const size_t canonical_seq_size_per_block =
+            uses_cp_canonical_keys ? seq_size_per_block / static_cast<size_t>(param.cp_size) : seq_size_per_block;
+        const int prefix_length = param.prefix_lengths_host.data_ptr<int>()[batch_id];
+        RTP_LLM_CHECK_WITH_INFO(prefix_length % static_cast<int>(canonical_seq_size_per_block) == 0,
+                                "cache-store tag=%s prefix_length=%d is not aligned to canonical tokens_per_block=%zu "
+                                "(physical tokens_per_block=%zu, cp_size=%d)",
+                                param.tag.c_str(),
+                                prefix_length,
+                                canonical_seq_size_per_block,
+                                seq_size_per_block,
+                                param.cp_size);
+        int reuse_block_num = prefix_length / seq_size_per_block;
         int block_num =
             (param.input_lengths_host.data_ptr<int>()[param.decoder_batch_size + batch_id] + seq_size_per_block - 1)
             / seq_size_per_block;
+        int canonical_reuse_block_num = prefix_length / canonical_seq_size_per_block;
+        int canonical_block_num       = (param.input_lengths_host.data_ptr<int>()[param.decoder_batch_size + batch_id]
+                                   + canonical_seq_size_per_block - 1)
+                                  / canonical_seq_size_per_block;
         auto request_id     = *(param.request_id.data_ptr<int64_t>() + batch_id);
         auto event          = param.pre_created_event ? param.pre_created_event : runtimeCreateEvent();
         auto request_blocks = std::make_shared<RequestBlockBuffer>(std::to_string(request_id), event);
         RTP_LLM_LOG_DEBUG(
             "write cache store, request id is %ld, blocks num is %ld", request_id, block_num + reuse_block_num);
 
-        CacheGroupType group_type = CacheGroupType::FULL;
-        group_type = static_cast<CacheGroupType>(param.kv_cache_group_types_host.data_ptr<int32_t>()[gid]);
-
-        const int total_blocks = block_num + reuse_block_num;
+        const int canonical_total_blocks = canonical_block_num + canonical_reuse_block_num;
+        const int total_blocks = uses_cp_canonical_keys ? (canonical_total_blocks + param.cp_size - 1) / param.cp_size :
+                                                          block_num + reuse_block_num;
         if (total_blocks <= 0) {
             continue;
         }
 
-        auto addBlock = [&](int index, CacheGroupType group_type) {
-            RTP_LLM_CHECK_WITH_INFO(index >= 0 && index < static_cast<int>(max_blocks_per_batch),
-                                    "invalid block index=%d (max_blocks_per_batch=%zu)",
-                                    index,
+        auto addBlock = [&](int key_index, int offset_index) {
+            RTP_LLM_CHECK_WITH_INFO(offset_index >= 0 && offset_index < static_cast<int>(max_blocks_per_batch),
+                                    "invalid block offset_index=%d (max_blocks_per_batch=%zu)",
+                                    offset_index,
                                     max_blocks_per_batch);
-            auto block_id = *(offset_addr + (param.decoder_batch_size + batch_id) * max_blocks_per_batch + index);
-            std::string cache_key;
-            cache_key =
-                makeCacheKey(param.model_id, param.cache_keys[batch_id * max_blocks_per_batch + index], param.layer_id);
+            RTP_LLM_CHECK_WITH_INFO(key_index >= 0 && key_index < static_cast<int>(cache_keys_per_batch),
+                                    "invalid block key_index=%d (cache_keys_per_batch=%zu)",
+                                    key_index,
+                                    cache_keys_per_batch);
+            std::string cache_key = makeCacheKey(param.model_id,
+                                                 param.cache_keys[batch_id * cache_keys_per_batch + key_index],
+                                                 param.layer_id,
+                                                 param.tag);
+            auto        block_id =
+                *(offset_addr + (param.decoder_batch_size + batch_id) * max_blocks_per_batch + offset_index);
+            // Host block-offset tables use -1 as the null block sentinel.
+            if (block_id == -1) {
+                RTP_LLM_LOG_DEBUG(
+                    "PD_CACHE_KEY_WRITE_SKIP_NULL key=kv_%s request_id=%ld tag=%s layer=%d cp_rank=%d cp_size=%d "
+                    "key_index=%d offset_index=%d block_id=%d",
+                    cache_key.c_str(),
+                    request_id,
+                    param.tag.c_str(),
+                    param.layer_id,
+                    param.cp_rank,
+                    param.cp_size,
+                    key_index,
+                    offset_index,
+                    block_id);
+                return;
+            }
+            const bool has_policy_cp_slice = param.cp_size > 1 && group_policy.cp_slice != CpBlockSliceMode::NONE;
+            if (has_policy_cp_slice) {
+                RTP_LLM_CHECK_WITH_INFO(param.cp_rank >= 0 && param.cp_rank < param.cp_size,
+                                        "cache-store tag=%s invalid cp_rank=%d cp_size=%d",
+                                        param.tag.c_str(),
+                                        param.cp_rank,
+                                        param.cp_size);
+                // The prefill topology already materializes each rank's local
+                // STATE/SWA row. Send that complete local row from offset zero;
+                // decode applies the peer-rank offset in the corresponding
+                // full row. Dividing here would slice an already-sliced row.
+            }
 
-            void*                 kv_addr = (void*)((int8_t*)kv_cache_data + block_id * param.kv_block_stride_bytes);
-            std::shared_ptr<void> kv_block_addr(kv_addr, [](void* p) {});
-
-            if (is_grouped_layout || mla_kvcache) {
-                request_blocks->addBlock("kv_" + cache_key, kv_block_addr, param.kv_block_stride_bytes, true, true);
+            const bool use_opaque_key_prefix =
+                param.use_opaque_kv_cache_store || use_group_cache_transfer_policy || mla_kvcache;
+            void*                 kv_addr = (void*)((int8_t*)kv_cache_data + block_id * kv_block_stride_bytes);
+            std::shared_ptr<void> kv_block_addr(kv_cache_owner, kv_addr);
+            RTP_LLM_LOG_DEBUG("PD_CACHE_KEY_WRITE_BLOCK key=kv_%s request_id=%ld tag=%s layer=%d cp_rank=%d "
+                              "cp_size=%d cp_slice=%d key_index=%d offset_index=%d block_id=%d addr=%p "
+                              "physical_stride=%zu len=%zu",
+                              cache_key.c_str(),
+                              request_id,
+                              param.tag.c_str(),
+                              param.layer_id,
+                              param.cp_rank,
+                              param.cp_size,
+                              static_cast<int>(group_policy.cp_slice),
+                              key_index,
+                              offset_index,
+                              block_id,
+                              kv_addr,
+                              kv_block_stride_bytes,
+                              kv_block_transfer_bytes);
+            if (use_opaque_key_prefix) {
+                request_blocks->addBlock("kv_" + cache_key, kv_block_addr, kv_block_transfer_bytes, kv_gpu_mem, true);
             } else {
-                const uint32_t        kv_half = static_cast<uint32_t>(param.kv_block_stride_bytes / 2);
+                RTP_LLM_CHECK_WITH_INFO(kv_block_transfer_bytes % 2 == 0,
+                                        "KV transfer bytes must split evenly into K/V");
+                const uint32_t        kv_half = static_cast<uint32_t>(kv_block_transfer_bytes / 2);
                 void*                 k_addr  = kv_addr;
                 void*                 v_addr  = (void*)((int8_t*)kv_addr + kv_half);
-                std::shared_ptr<void> k_block_addr(k_addr, [](void* p) {});
-                std::shared_ptr<void> v_block_addr(v_addr, [](void* p) {});
-                request_blocks->addBlock("k_" + cache_key, k_block_addr, kv_half, true, true);
-                request_blocks->addBlock("v_" + cache_key, v_block_addr, kv_half, true, true);
+                std::shared_ptr<void> k_block_addr(kv_cache_owner, k_addr);
+                std::shared_ptr<void> v_block_addr(kv_cache_owner, v_addr);
+                request_blocks->addBlock("k_" + cache_key, k_block_addr, kv_half, kv_gpu_mem, true);
+                request_blocks->addBlock("v_" + cache_key, v_block_addr, kv_half, kv_gpu_mem, true);
             }
 
             if (kv_scale_data) {
-                void* kv_scale_addr = (void*)((int8_t*)kv_scale_data + block_id * param.kv_scale_stride_bytes);
-                std::shared_ptr<void> kv_scale_block_addr(kv_scale_addr, [](void* p) {});
-                if (is_grouped_layout || mla_kvcache) {
+                void* kv_scale_addr = (void*)((int8_t*)kv_scale_data + block_id * kv_scale_stride_bytes);
+
+                std::shared_ptr<void> kv_scale_block_addr(kv_scale_owner, kv_scale_addr);
+                if (use_opaque_key_prefix) {
                     request_blocks->addBlock(
-                        "kv_scale_" + cache_key, kv_scale_block_addr, param.kv_scale_stride_bytes, true, true);
+                        "kv_scale_" + cache_key, kv_scale_block_addr, kv_scale_transfer_bytes, kv_scale_gpu_mem, true);
                 } else {
-                    const uint32_t        sc_half = static_cast<uint32_t>(param.kv_scale_stride_bytes / 2);
+                    RTP_LLM_CHECK_WITH_INFO(kv_scale_transfer_bytes % 2 == 0,
+                                            "scale transfer bytes must split evenly into K/V");
+                    const uint32_t        sc_half = static_cast<uint32_t>(kv_scale_transfer_bytes / 2);
                     void*                 k_sc    = kv_scale_addr;
                     void*                 v_sc    = (void*)((int8_t*)kv_scale_addr + sc_half);
-                    std::shared_ptr<void> k_scale_block_addr(k_sc, [](void* p) {});
-                    std::shared_ptr<void> v_scale_block_addr(v_sc, [](void* p) {});
-                    request_blocks->addBlock("k_scale_" + cache_key, k_scale_block_addr, sc_half, true, true);
-                    request_blocks->addBlock("v_scale_" + cache_key, v_scale_block_addr, sc_half, true, true);
+                    std::shared_ptr<void> k_scale_block_addr(kv_scale_owner, k_sc);
+                    std::shared_ptr<void> v_scale_block_addr(kv_scale_owner, v_sc);
+                    request_blocks->addBlock(
+                        "k_scale_" + cache_key, k_scale_block_addr, sc_half, kv_scale_gpu_mem, true);
+                    request_blocks->addBlock(
+                        "v_scale_" + cache_key, v_scale_block_addr, sc_half, kv_scale_gpu_mem, true);
                 }
             }
         };
 
-        if (group_type == CacheGroupType::LINEAR) {
-            addBlock(total_blocks - 1, group_type);
-        } else {
-            for (int index = 0; index < total_blocks; ++index) {
-                addBlock(index, group_type);
-            }
+        // Under CP sharding, kv_cache_offset can be rank-local-compact while
+        // cache_keys stays in the full logical namespace. The common cache
+        // policy owns the key/offset projection for both legacy and sharded cases.
+        // Clamp by cache_keys_per_batch (global stride) -- NOT max_blocks_per_batch,
+        // which under CP shard is the local-compact stride for FULL groups.
+        const auto block_plan = buildCacheStorePlan(
+            group_policy,
+            static_cast<size_t>(std::min<int>(canonical_total_blocks, static_cast<int>(cache_keys_per_batch))),
+            /*reuse_block_size=*/0,
+            use_group_cache_transfer_policy,
+            param.cp_rank,
+            param.cp_size);
+        for (const auto& pair : block_plan) {
+            addBlock(pair.key_index, pair.offset_index);
         }
 
-        auto storeCallback = [layer_id = param.layer_id, model_id = param.model_id, gid, request_id, request_blocks](
-                                 bool success, CacheStoreErrorCode ec) {
+        auto storeCallback = [layer_id = param.layer_id,
+                              model_id = param.model_id,
+                              tag      = param.tag,
+                              request_id,
+                              request_blocks](bool success, CacheStoreErrorCode ec) {
             if (!success) {
-                RTP_LLM_LOG_WARNING("PD_CACHE_KEY_WRITE_FAILED request_id=%ld model_id=%zu local_layer_id=%d gid=%d "
+                RTP_LLM_LOG_WARNING("PD_CACHE_KEY_WRITE_FAILED request_id=%ld model_id=%zu local_layer_id=%d tag=%s "
                                     "error_code=%d error=%s buffer={%s}",
                                     static_cast<long>(request_id),
                                     model_id,
                                     layer_id,
-                                    gid,
+                                    tag.c_str(),
                                     static_cast<int>(ec),
                                     ErrorCodeToString(transCacheStoreErrorCode(ec)).c_str(),
                                     request_blocks->debugInfo().c_str());
             }
         };
-        cache_store->store(request_blocks, storeCallback);
+        if (request_blocks->getBlocksCount() > 0) {
+            cache_store->store(request_blocks, storeCallback);
+        } else {
+            RTP_LLM_LOG_DEBUG("skip cache store because all selected blocks are null, request id [%ld], layer id [%d]",
+                              request_id,
+                              param.layer_id);
+        }
     }
 }
 
@@ -365,16 +468,12 @@ void cudaCheckLastError() {
 }
 
 void cudaPreRun(int device_id) {
-#if USING_CUDA
-    check_cuda_value(cudaSetDevice(device_id));
-    at::cuda::set_device(device_id);
-    at::cuda::setCurrentCUDAStream(at::cuda::getDefaultCUDAStream(device_id));
-#elif USING_ROCM
-    hipSetDevice(device_id);
-#endif
+    setCurrentThreadDevice(device_id);
 }
 
-// === Profiling ===
+// ============================================================
+// Profiling
+// ============================================================
 
 void cudaProfilerBegin() {
 #if USING_CUDA
@@ -388,7 +487,9 @@ void cudaProfilerEnd() {
 #endif
 }
 
-// === Status queries ===
+// ============================================================
+// Status queries
+// ============================================================
 
 ExecStatus getGpuExecStatus() {
     MemoryStatus mem;
@@ -420,21 +521,14 @@ void setTraceMemory(bool trace_memory) {
 
 // === Copy ops ===
 
-namespace {
-#if USING_CUDA
-at::cuda::CUDAStream& getNoBlockCopyStream() {
-    static thread_local auto stream = at::cuda::getStreamFromPool(/*isHighPriority=*/false);
-    return stream;
-}
-#endif
-}  // anonymous namespace
-
 void execNoBlockCopy(const CopyParams& params) {
     params.check();
     const auto& src = params.src;
     const auto& dst = params.dst;
 #if USING_CUDA
-    auto stream = getNoBlockCopyStream().stream();
+    const auto  copy_device = getCopyDevice(dst, src);
+    DeviceGuard device_guard(copy_device);
+    auto        stream = getNoBlockCopyStream(copy_device).stream();
     check_cuda_value(cudaMemcpyAsync(dst.data_ptr(), src.data_ptr(), src.nbytes(), cudaMemcpyDefault, stream));
     check_cuda_value(cudaStreamSynchronize(stream));
     check_cuda_error();
@@ -501,35 +595,19 @@ void execBroadcast(const BroadcastParams& params) {
 }
 
 void execBroadcastCpu(const BroadcastParams& params) {
-    RTP_LLM_CHECK_WITH_INFO(
-        params.root == 0, "execBroadcastCpu supports only root=0; got %ld", static_cast<long>(params.root));
-    RTP_LLM_CHECK_WITH_INFO(params.mode == ParallelMode::TP,
-                            "execBroadcastCpu supports only ParallelMode::TP; got %d",
-                            static_cast<int>(params.mode));
-
-    auto& bcast = CpuTpBroadcaster::instance();
-    if (bcast.isInitialized()) {
-        // Pure CPU path via UDS (no GPU stream, no Python, no cudaSync).
-        // Caller must guarantee CPU tensors with identical (count, nbytes)
-        // on every rank — see execBroadcastCpu doc in ExecOps.h.
-        for (auto& t : params.buffers) {
-            RTP_LLM_CHECK_WITH_INFO(
-                t.is_cpu(), "execBroadcastCpu requires CPU tensors (got device=%s)", t.device().str().c_str());
-            // Pinned tensors from torch::empty(...).pin_memory() are already
-            // contiguous; .contiguous() is a no-op fast path.
-            auto contig = t.contiguous();
-            bcast.broadcast(contig.data_ptr(), contig.nbytes(), params.root);
-            if (!contig.is_same(t)) {
-                t.copy_(contig);
-            }
-        }
+    auto& broadcaster = CpuTpBroadcaster::instance();
+    if (!broadcaster.isInitialized() || params.mode != ParallelMode::TP || params.overlapped) {
+        execBroadcast(params);
+        execSyncCommunication(false);
+        cudaSyncAndCheck();
         return;
     }
-    // Fallback to NCCL via Python callback, typically for cross-node TP.
-    // Preserve immediate-read semantics with the original sync sequence.
-    execBroadcast(params);
-    execSyncCommunication(false);
-    cudaSyncAndCheck();
+
+    for (const auto& tensor : params.buffers) {
+        RTP_LLM_CHECK_WITH_INFO(tensor.device().is_cpu(), "execBroadcastCpu requires CPU tensors");
+        RTP_LLM_CHECK_WITH_INFO(tensor.is_contiguous(), "execBroadcastCpu requires contiguous tensors");
+        broadcaster.broadcast(tensor.data_ptr(), tensor.nbytes(), static_cast<int>(params.root));
+    }
 }
 
 bool isCpuTpBroadcasterInitialized() {
@@ -576,21 +654,6 @@ void execSyncCommunication(bool timeout) {
 void execSyncCommunication(ParallelMode mode, bool timeout) {
     (void)mode;
     (void)timeout;  // Python ops are synchronous
-}
-
-// === MOE / EPLB ===
-
-OverallExpertStats execCreateMoeExpertStates(const ExpertStatsParams& params) {
-    OverallExpertStats states;
-    states.layer_num               = params.layer_num;
-    states.ep_size                 = params.ep_size;
-    states.log_exp_num             = params.log_exp_num;
-    states.phy_exp_num             = params.phy_exp_num;
-    states.stats_buf.log_stats_buf = torch::zeros({(int64_t)params.layer_num, (int64_t)params.log_exp_num},
-                                                  torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
-    states.stats_buf.gpu_loads_buf = torch::zeros({(int64_t)params.layer_num, (int64_t)params.ep_size},
-                                                  torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
-    return states;
 }
 
 // === CacheStore wrapper ===
@@ -648,6 +711,21 @@ MlaOpsType initRuntime(size_t device_id, bool trace_memory, bool enable_comm_ove
     return resolved_mla_ops_type;
 }
 
+// === MOE / EPLB ===
+
+OverallExpertStats execCreateMoeExpertStates(const ExpertStatsParams& params) {
+    OverallExpertStats states;
+    states.layer_num               = params.layer_num;
+    states.ep_size                 = params.ep_size;
+    states.log_exp_num             = params.log_exp_num;
+    states.phy_exp_num             = params.phy_exp_num;
+    states.stats_buf.log_stats_buf = torch::zeros({(int64_t)params.layer_num, (int64_t)params.log_exp_num},
+                                                  torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
+    states.stats_buf.gpu_loads_buf = torch::zeros({(int64_t)params.layer_num, (int64_t)params.ep_size},
+                                                  torch::TensorOptions(torch::kInt32).device(torch::kCUDA));
+    return states;
+}
+
 // ============================================================
 // Pybind registration
 // ============================================================
@@ -694,27 +772,14 @@ void registerExecCtxOps(pybind11::module& m) {
         },
         "Clear registered Python communication callbacks.");
 
-    m.def(
-        "init_cpu_tp_broadcaster",
-        [](int tp_rank, int tp_size, const std::string& base_path) {
-            // Release GIL while peers block in accept/connect retry.
-            // initialize() touches no Python state.
-            py::gil_scoped_release release;
-            CpuTpBroadcaster::instance().initialize(tp_rank, tp_size, base_path);
-        },
-        py::arg("tp_rank"),
-        py::arg("tp_size"),
-        py::arg("base_path"),
-        "Bootstrap the UDS-backed intra-node TP broadcaster used by tpSyncModelInputs. "
-        "Must be called by every TP rank with the same base_path; rank 0 binds, others connect.");
-
-    m.def(
-        "destroy_cpu_tp_broadcaster",
-        []() {
-            py::gil_scoped_release release;
-            CpuTpBroadcaster::instance().reset();
-        },
-        "Tear down the UDS-backed intra-node TP broadcaster and clear its singleton state.");
+    m.def("init_cpu_tp_broadcaster",
+          [](int tp_rank, int tp_size, const std::string& base_path) {
+              CpuTpBroadcaster::instance().initialize(tp_rank, tp_size, base_path);
+          },
+          py::arg("tp_rank"),
+          py::arg("tp_size"),
+          py::arg("base_path"));
+    m.def("destroy_cpu_tp_broadcaster", []() { CpuTpBroadcaster::instance().reset(); });
 }
 
 }  // namespace rtp_llm

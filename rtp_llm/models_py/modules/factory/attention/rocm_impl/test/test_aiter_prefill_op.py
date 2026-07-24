@@ -124,9 +124,13 @@ def _make_rope_prefill_inputs(
     attn_inputs.input_lengths = torch.tensor(
         input_lengths, dtype=torch.int32, device="cpu"
     ).pin_memory()
-    attn_inputs.sequence_lengths = torch.tensor(
+    attn_inputs.sequence_lengths_host = torch.tensor(
         input_lengths, dtype=torch.int32, device="cpu"
     ).pin_memory()
+    attn_inputs.sequence_lengths_device = attn_inputs.sequence_lengths_host.to(
+        device, non_blocking=True
+    )
+    attn_inputs.max_sequence_length = max(input_lengths, default=0)
     attn_inputs.prefix_lengths = torch.zeros(
         len(input_lengths), dtype=torch.int32, device="cpu"
     )
@@ -136,7 +140,7 @@ def _make_rope_prefill_inputs(
         cu.append(cu[-1] + seq_len)
     cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=device)
     attn_inputs.cu_seqlens = cu_seqlens
-    attn_inputs.cu_kv_seqlens = cu_seqlens
+    attn_inputs.cu_kv_seqlens_device = cu_seqlens
 
     max_seq_len = max(input_lengths)
     padding_offset = []
@@ -1246,7 +1250,7 @@ class TestAiterPrefillImplNoKvRopeRealOp(unittest.TestCase):
             k_rope,
             v,
             attn_inputs.cu_seqlens,
-            attn_inputs.cu_kv_seqlens,
+            attn_inputs.cu_kv_seqlens_device,
             causal=True,
         )
         torch.testing.assert_close(actual, ref, atol=1e-2, rtol=1e-2)

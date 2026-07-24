@@ -180,14 +180,16 @@ def _tp2_worker(rank: int, nccl_port: int, result_queue: mp.Queue) -> None:
         ai = PyAttentionInputs()
         ai.is_prefill = True
         ai.input_lengths = torch.tensor([T], dtype=torch.int32, device=cpu)
-        ai.sequence_lengths = torch.tensor([T], dtype=torch.int32, device=cpu)
+        ai.sequence_lengths_host = torch.tensor([T], dtype=torch.int32, device=cpu)
+        ai.sequence_lengths_device = ai.sequence_lengths_host.to(dev)
+        ai.max_sequence_length = T
         ai.prefix_lengths = torch.tensor([0], dtype=torch.int32, device=cpu)
         ai.context_parallel_info = cp
         block_table_host = _make_block_table(1, T, page, cpu)
         block_table_device = block_table_host.to(dev)
-        ai.kv_cache_block_id_host = block_table_host
+        ai.kv_cache_block_id = block_table_host
         ai.kv_cache_block_id_device = block_table_device
-        ai.kv_cache_kernel_block_id_host = block_table_host
+        ai.kv_cache_kernel_block_id = block_table_host
         ai.kv_cache_kernel_block_id_device = block_table_device
         bt = block_table_device
         mla = rtp_llm_ops.SparseMlaParams()
@@ -337,9 +339,13 @@ class SparseMlaFp8CPOpTest(TestCase):
         attn_inputs.input_lengths = torch.tensor(
             [n_restore], dtype=torch.int32, device=torch.device("cpu")
         )
-        attn_inputs.sequence_lengths = torch.tensor(
+        attn_inputs.sequence_lengths_host = torch.tensor(
             [n_restore], dtype=torch.int32, device=torch.device("cpu")
         )
+        attn_inputs.sequence_lengths_device = attn_inputs.sequence_lengths_host.to(
+            device
+        )
+        attn_inputs.max_sequence_length = n_restore
         attn_inputs.prefix_lengths = torch.tensor(
             [0], dtype=torch.int32, device=torch.device("cpu")
         )
@@ -349,9 +355,9 @@ class SparseMlaFp8CPOpTest(TestCase):
             1, n_restore, page_size, torch.device("cpu")
         )
         block_table_device = block_table_host.to(device)
-        attn_inputs.kv_cache_block_id_host = block_table_host
+        attn_inputs.kv_cache_block_id = block_table_host
         attn_inputs.kv_cache_block_id_device = block_table_device
-        attn_inputs.kv_cache_kernel_block_id_host = block_table_host
+        attn_inputs.kv_cache_kernel_block_id = block_table_host
         attn_inputs.kv_cache_kernel_block_id_device = block_table_device
 
         mla_params = rtp_llm_ops.SparseMlaParams()
@@ -504,9 +510,13 @@ class SparseMlaFp8CPOpTest(TestCase):
         attn_inputs.input_lengths = torch.tensor(
             [n_restore], dtype=torch.int32, device=torch.device("cpu")
         )
-        attn_inputs.sequence_lengths = torch.tensor(
+        attn_inputs.sequence_lengths_host = torch.tensor(
             [n_restore], dtype=torch.int32, device=torch.device("cpu")
         )
+        attn_inputs.sequence_lengths_device = attn_inputs.sequence_lengths_host.to(
+            device
+        )
+        attn_inputs.max_sequence_length = n_restore
         attn_inputs.prefix_lengths = torch.tensor(
             [0], dtype=torch.int32, device=torch.device("cpu")
         )
@@ -515,9 +525,9 @@ class SparseMlaFp8CPOpTest(TestCase):
             1, n_restore, page_size, torch.device("cpu")
         )
         block_table_device = block_table_host.to(device)
-        attn_inputs.kv_cache_block_id_host = block_table_host
+        attn_inputs.kv_cache_block_id = block_table_host
         attn_inputs.kv_cache_block_id_device = block_table_device
-        attn_inputs.kv_cache_kernel_block_id_host = block_table_host
+        attn_inputs.kv_cache_kernel_block_id = block_table_host
         attn_inputs.kv_cache_kernel_block_id_device = block_table_device
 
         mla_params = rtp_llm_ops.SparseMlaParams()
@@ -772,16 +782,20 @@ class SparseMlaFp8CPOpTest(TestCase):
         attn_inputs.input_lengths = torch.tensor(
             [input_tokens], dtype=torch.int32, device=torch.device("cpu")
         )
-        attn_inputs.sequence_lengths = torch.tensor(
+        attn_inputs.sequence_lengths_host = torch.tensor(
             [total_kv_len], dtype=torch.int32, device=torch.device("cpu")
         )
+        attn_inputs.sequence_lengths_device = attn_inputs.sequence_lengths_host.to(
+            device
+        )
+        attn_inputs.max_sequence_length = total_kv_len
         attn_inputs.prefix_lengths = torch.tensor(
             [prefix_length], dtype=torch.int32, device=torch.device("cpu")
         )
         attn_inputs.context_parallel_info = cp_params
-        attn_inputs.kv_cache_block_id_host = block_table_host
+        attn_inputs.kv_cache_block_id = block_table_host
         attn_inputs.kv_cache_block_id_device = block_table_device
-        attn_inputs.kv_cache_kernel_block_id_host = block_table_host
+        attn_inputs.kv_cache_kernel_block_id = block_table_host
         attn_inputs.kv_cache_kernel_block_id_device = block_table_device
 
         mla_params = rtp_llm_ops.SparseMlaParams()
@@ -805,15 +819,19 @@ class SparseMlaFp8CPOpTest(TestCase):
         attn_inputs_write.input_lengths = torch.tensor(
             [total_kv_len], dtype=torch.int32, device=torch.device("cpu")
         )
-        attn_inputs_write.sequence_lengths = torch.tensor(
+        attn_inputs_write.sequence_lengths_host = torch.tensor(
             [total_kv_len], dtype=torch.int32, device=torch.device("cpu")
         )
+        attn_inputs_write.sequence_lengths_device = (
+            attn_inputs_write.sequence_lengths_host.to(device)
+        )
+        attn_inputs_write.max_sequence_length = total_kv_len
         attn_inputs_write.prefix_lengths = torch.tensor(
             [0], dtype=torch.int32, device=torch.device("cpu")
         )
-        attn_inputs_write.kv_cache_block_id_host = block_table_host
+        attn_inputs_write.kv_cache_block_id = block_table_host
         attn_inputs_write.kv_cache_block_id_device = block_table_device
-        attn_inputs_write.kv_cache_kernel_block_id_host = block_table_host
+        attn_inputs_write.kv_cache_kernel_block_id = block_table_host
         attn_inputs_write.kv_cache_kernel_block_id_device = block_table_device
 
         mla_params_write = rtp_llm_ops.SparseMlaParams()
@@ -834,15 +852,19 @@ class SparseMlaFp8CPOpTest(TestCase):
         attn_inputs_ref.input_lengths = torch.tensor(
             [input_tokens], dtype=torch.int32, device=torch.device("cpu")
         )
-        attn_inputs_ref.sequence_lengths = torch.tensor(
+        attn_inputs_ref.sequence_lengths_host = torch.tensor(
             [total_kv_len], dtype=torch.int32, device=torch.device("cpu")
         )
+        attn_inputs_ref.sequence_lengths_device = (
+            attn_inputs_ref.sequence_lengths_host.to(device)
+        )
+        attn_inputs_ref.max_sequence_length = total_kv_len
         attn_inputs_ref.prefix_lengths = torch.tensor(
             [prefix_length], dtype=torch.int32, device=torch.device("cpu")
         )
-        attn_inputs_ref.kv_cache_block_id_host = block_table_host
+        attn_inputs_ref.kv_cache_block_id = block_table_host
         attn_inputs_ref.kv_cache_block_id_device = block_table_device
-        attn_inputs_ref.kv_cache_kernel_block_id_host = block_table_host
+        attn_inputs_ref.kv_cache_kernel_block_id = block_table_host
         attn_inputs_ref.kv_cache_kernel_block_id_device = block_table_device
 
         mla_params_ref = rtp_llm_ops.SparseMlaParams()
@@ -885,15 +907,19 @@ class SparseMlaFp8CPOpTest(TestCase):
         attn_inputs_prefix.input_lengths = torch.tensor(
             [prefix_length], dtype=torch.int32, device=torch.device("cpu")
         )
-        attn_inputs_prefix.sequence_lengths = torch.tensor(
+        attn_inputs_prefix.sequence_lengths_host = torch.tensor(
             [prefix_length], dtype=torch.int32, device=torch.device("cpu")
         )
+        attn_inputs_prefix.sequence_lengths_device = (
+            attn_inputs_prefix.sequence_lengths_host.to(device)
+        )
+        attn_inputs_prefix.max_sequence_length = prefix_length
         attn_inputs_prefix.prefix_lengths = torch.tensor(
             [0], dtype=torch.int32, device=torch.device("cpu")
         )
-        attn_inputs_prefix.kv_cache_block_id_host = block_table_host
+        attn_inputs_prefix.kv_cache_block_id = block_table_host
         attn_inputs_prefix.kv_cache_block_id_device = block_table_device
-        attn_inputs_prefix.kv_cache_kernel_block_id_host = block_table_host
+        attn_inputs_prefix.kv_cache_kernel_block_id = block_table_host
         attn_inputs_prefix.kv_cache_kernel_block_id_device = block_table_device
 
         mla_params_prefix = rtp_llm_ops.SparseMlaParams()

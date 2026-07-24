@@ -179,9 +179,13 @@ def build_cp_attn_inputs(
     inp.input_lengths = torch.tensor(
         cp_chunk_lengths, dtype=torch.int32, device="cpu"
     ).pin_memory()
-    inp.sequence_lengths = torch.tensor(
+    inp.sequence_lengths_host = torch.tensor(
         sequence_lengths, dtype=torch.int32, device="cpu"
     ).pin_memory()
+    inp.sequence_lengths_device = inp.sequence_lengths_host.to(
+        device, non_blocking=True
+    )
+    inp.max_sequence_length = max(sequence_lengths, default=0)
     inp.prefix_lengths = torch.tensor(prefix_lengths, dtype=torch.int32, device="cpu")
 
     cu = [0]
@@ -196,8 +200,8 @@ def build_cp_attn_inputs(
         nb = math.ceil(sl / tokens_per_block)
         block_ids[i, :nb] = torch.arange(offset, offset + nb, dtype=torch.int32)
         offset += nb
-    inp.kv_cache_block_id_host = block_ids
-    inp.kv_cache_kernel_block_id_host = block_ids
+    inp.kv_cache_block_id = block_ids
+    inp.kv_cache_kernel_block_id = block_ids
     inp.kv_cache_block_id_device = block_ids.to(device)
     inp.dtype = get_typemeta(torch.zeros(1, dtype=torch.bfloat16))
 

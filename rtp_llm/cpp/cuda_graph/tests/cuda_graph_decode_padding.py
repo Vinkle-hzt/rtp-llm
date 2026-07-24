@@ -101,17 +101,21 @@ class TestCudaGraphDecodePadding(unittest.TestCase):
         attention_inputs.input_lengths = torch.ones(batch_size, dtype=torch.int32)
 
         # sequence_lengths [batch_size, int32] (decode only), with pin_memory
-        attention_inputs.sequence_lengths = torch.ones(
+        attention_inputs.sequence_lengths_host = torch.ones(
             batch_size, dtype=torch.int32
         ).pin_memory()
+        attention_inputs.sequence_lengths_device = (
+            attention_inputs.sequence_lengths_host.cuda(non_blocking=True)
+        )
+        attention_inputs.max_sequence_length = 1
 
-        # sequence_lengths_plus_1_d [batch_size] int32 on cuda (decode: 1 token per batch -> 2)
-        attention_inputs.sequence_lengths_plus_1_d = torch.full(
+        # sequence_lengths_plus_1_device [batch_size] int32 on cuda (decode: 1 token per batch -> 2)
+        attention_inputs.sequence_lengths_plus_1_device = torch.full(
             (batch_size,), 2, dtype=torch.int32, device="cuda"
         )
 
-        # decode_cu_seqlens_d [batch_size + 1] int32 on cuda, cumulative [0, 1, ..., batch_size]
-        attention_inputs.decode_cu_seqlens_d = torch.arange(
+        # decode_cu_seqlens_device [batch_size + 1] int32 on cuda, cumulative [0, 1, ..., batch_size]
+        attention_inputs.decode_cu_seqlens_device = torch.arange(
             batch_size + 1, dtype=torch.int32, device="cuda"
         )
 
@@ -122,13 +126,11 @@ class TestCudaGraphDecodePadding(unittest.TestCase):
             1, num_blocks + 1, dtype=torch.int32, device="cuda"
         ).view(batch_size, block_num)
         attention_inputs.kv_cache_kernel_block_id_device = block_ids
-        attention_inputs.kv_cache_kernel_block_id_host = block_ids.cpu()
+        attention_inputs.kv_cache_kernel_block_id = block_ids.cpu()
 
         # Keep legacy fields in sync for compatibility with non-cuda-graph paths.
         attention_inputs.kv_cache_block_id_device = block_ids
-        attention_inputs.kv_cache_block_id_host = (
-            attention_inputs.kv_cache_kernel_block_id_host
-        )
+        attention_inputs.kv_cache_block_id = attention_inputs.kv_cache_kernel_block_id
 
         # padding_offset
         attention_inputs.padding_offset = torch.zeros(
@@ -143,8 +145,8 @@ class TestCudaGraphDecodePadding(unittest.TestCase):
         cu_len = batch_size + 1
         cu_seqlens = torch.zeros(cu_len, dtype=torch.int32, device="cuda")
 
-        attention_inputs.cu_seqlens = cu_seqlens
-        attention_inputs.cu_kv_seqlens = cu_seqlens.clone()
+        attention_inputs.cu_seqlens_device = cu_seqlens
+        attention_inputs.cu_kv_seqlens_device = cu_seqlens.clone()
         # For decode mode: each batch has 1 token, so total = batch_size
         attention_inputs.total_tokens = batch_size * num_tokens_per_bs
         inputs.attention_inputs = attention_inputs
