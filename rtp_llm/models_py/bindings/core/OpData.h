@@ -89,6 +89,9 @@ struct GptModelInputs {
     // To select correct inference mode, we need to set this flag manually.
     bool is_target_verify = false;
 
+    // Select a non-FlashInfer attention implementation for this forward only.
+    bool disable_flash_infer = false;
+
     // not sync to other tp rank
     std::vector<std::string> trace_ids;
 

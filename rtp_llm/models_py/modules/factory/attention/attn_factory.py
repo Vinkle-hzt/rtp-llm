@@ -83,17 +83,25 @@ def get_mla_impl(
 
 
 def _is_fmha_impl_disabled(
-    impl_class_name: str, fmha_config: Optional[FMHAConfig]
+    impl_class_name: str,
+    fmha_config: Optional[FMHAConfig],
+    attn_inputs: PyAttentionInputs,
 ) -> bool:
     """Check if a FMHA implementation is disabled in fmha_config.
 
     Args:
         impl_class_name: The implementation class name
         fmha_config: The FMHA config, if None, assume not disabled
+        attn_inputs: Per-forward attention inputs and backend overrides
 
     Returns:
         True if the FMHA implementation is disabled, False otherwise
     """
+    if "FlashInfer" in impl_class_name or "Flashinfer" in impl_class_name:
+        return bool(attn_inputs.disable_flash_infer) or (
+            fmha_config is not None and fmha_config.disable_flash_infer
+        )
+
     if fmha_config is None:
         return False
 
@@ -105,12 +113,6 @@ def _is_fmha_impl_disabled(
         return not fmha_config.enable_trt_fmha
     elif impl_class_name == "TRTPagedMHAImpl":
         return not fmha_config.enable_paged_trt_fmha
-    # FlashInfer TRTLLM implementations
-    elif "FlashInferTRTLLM" in impl_class_name:
-        return fmha_config.disable_flash_infer
-    # FlashInfer implementations
-    elif "FlashInfer" in impl_class_name or "Flashinfer" in impl_class_name:
-        return fmha_config.disable_flash_infer
     # Aiter ASM / Paged prefill
     elif (
         "AiterPrefillImplAsm" in impl_class_name
@@ -155,7 +157,7 @@ def get_fmha_impl(
         impl_class_name = impl.__name__
 
         # Skip if this FMHA implementation is disabled in config
-        if _is_fmha_impl_disabled(impl_class_name, fmha_config):
+        if _is_fmha_impl_disabled(impl_class_name, fmha_config, attn_inputs):
             continue
 
         # Check support before creating instance

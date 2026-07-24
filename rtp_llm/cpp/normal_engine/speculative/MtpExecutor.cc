@@ -1165,6 +1165,7 @@ void MtpExecutor::launchDraftPrefillPrepareAsync(const GptModelInputs& model_inp
     // main-stream mutations cannot affect draft prefill prepare.
     auto* prefill_model    = sp_prefill_draft_model_ ? sp_prefill_draft_model_.get() : draft_model_.get();
     auto  model_input_copy = model_input;
+    model_input_copy.disable_flash_infer     = true;
     model_input_copy.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
     model_input_copy.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
     model_input_copy.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
@@ -1417,6 +1418,7 @@ void MtpExecutor::broadcastPostRejectionInputs(GptModelInputs& model_input) {
 GptModelOutputs MtpExecutor::runDraftPrefillForward(GptModelInputs& model_input) {
     RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(draft_model_forward)");
     maybePrintModelInput(model_input, "decode post draft model");
+    model_input.disable_flash_infer = true;
     ensureModelInputsOnCuda(model_input, "decode.draft_prefill_forward");
     // Use sp_prefill_draft_model_ if CUDA graph is enabled, otherwise use draft_model_.
     GptModelOutputs draft_prefill_model_output;
@@ -1425,6 +1427,7 @@ GptModelOutputs MtpExecutor::runDraftPrefillForward(GptModelInputs& model_input)
     } else {
         draft_prefill_model_output = draft_model_->forward(model_input);
     }
+    model_input.disable_flash_infer = false;
     return draft_prefill_model_output;
 }
 

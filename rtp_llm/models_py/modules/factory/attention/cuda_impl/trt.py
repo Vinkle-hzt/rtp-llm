@@ -2,6 +2,8 @@ from typing import Optional
 
 import torch
 
+from rtp_kernel.fused_rope_kvcache import convert_offset_to_block_array
+
 from rtp_llm.models_py.modules.factory.attention import common
 from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import FMHAImplBase
 from rtp_llm.ops import AttentionConfigs, FMHAType, ParallelismConfig
@@ -179,10 +181,13 @@ class TRTPagedMHAImpl(FMHAImplBase):
             attn_inputs.prefix_lengths = torch.zeros_like(
                 attn_inputs.input_lengths, device=attn_inputs.input_lengths.device
             )
-        common.update_trt_params(
-            self.fmha_impl,
-            self.rope_kvcache_impl,
-            self.fmha_params,
-            self.rope_params,
-            attn_inputs,
-        )
+        block_ids = attn_inputs.kv_cache_kernel_block_id_device
+        if block_ids is None or block_ids.numel() == 0:
+            return
+
+        # Replay only needs refreshed KV offsets. The scalar launch parameters
+        # were captured in the graph and rebuilding them here causes five
+        # device-to-host .item() synchronizations without changing graph nodes.
+        new_offset = convert_offset_to_block_array(block_ids)
+        common.copy_kv_cache_offset(self.fmha_params.kv_cache_offset, new_offset)
+        common.copy_kv_cache_offset(self.rope_params.kv_cache_offset, new_offset)
