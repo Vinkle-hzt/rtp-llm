@@ -1669,6 +1669,8 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     draft_token_columns.push_back(pre_propose_token_t_raw);
 
     // n-1 steps draft model decode
+    const bool previous_disable_flash_infer = model_input.disable_flash_infer;
+    model_input.disable_flash_infer         = true;
     for (int i = 0; i < propose_step_ - 1; i++) {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.draft_model_decode(loop_iter=%d)", i);
         RTP_LLM_LOG_DEBUG("[MTP draftDecode] loop step %d/%d start, batch_size %zu", i, propose_step_ - 1, batch_size);
@@ -1698,6 +1700,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
                 model_input, draft_decode_model_output, draft_token_ids, buffer_holder_);
         }
     }
+    model_input.disable_flash_infer = previous_disable_flash_infer;
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(build_spec_decode_input)");

@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Callable, Dict, List, Optional, Union
 
 from rtp_llm.model_loader.model_weight_info import ModelWeights
@@ -24,6 +25,34 @@ FLASHINFER_TRTLLM_GEN_IMPLS = {
     "FlashInferTRTLLMSpecDecodeImpl",
     "FlashInferTRTLLMDecodeImpl",
 }
+
+_TRACED_ATTENTION_BACKENDS: set[tuple] = set()
+
+
+def _trace_attention_backend(
+    impl_name: str,
+    attn_configs: AttentionConfigs,
+    attn_inputs: PyAttentionInputs,
+    is_cuda_graph: bool,
+) -> None:
+    if os.environ.get("RTP_LLM_TRACE_ATTENTION_BACKEND", "0") != "1":
+        return
+
+    trace = {
+        "impl": impl_name,
+        "is_prefill": attn_inputs.is_prefill,
+        "is_target_verify": attn_inputs.is_target_verify,
+        "disable_flash_infer": attn_inputs.disable_flash_infer,
+        "is_cuda_graph": is_cuda_graph,
+        "head_num": attn_configs.head_num,
+        "kv_head_num": attn_configs.kv_head_num,
+        "head_size": attn_configs.size_per_head,
+    }
+    key = tuple(trace.items())
+    if key in _TRACED_ATTENTION_BACKENDS:
+        return
+    _TRACED_ATTENTION_BACKENDS.add(key)
+    print("*** attention backend selected:", trace, flush=True)
 
 
 def get_mla_impl(
@@ -82,6 +111,9 @@ def get_mla_impl(
             parallelism_config=parallelism_config,
         )
         if not is_cuda_graph or instance.support_cuda_graph():
+            _trace_attention_backend(
+                type(instance).__name__, attn_configs, attn_inputs, is_cuda_graph
+            )
             return instance
     raise Exception(f"can not find mla type")
 
@@ -181,6 +213,9 @@ def get_fmha_impl(
         try:
             instance = impl(attn_configs, attn_inputs, parallelism_config)
             if not is_cuda_graph or instance.support_cuda_graph():
+                _trace_attention_backend(
+                    type(instance).__name__, attn_configs, attn_inputs, is_cuda_graph
+                )
                 return instance
 
         except Exception as e:

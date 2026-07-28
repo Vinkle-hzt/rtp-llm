@@ -229,10 +229,13 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
 
     const size_t graph_idx =
         is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
-    auto&      py_model_inputs_    = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
-    auto       attn_pyobj          = graph_instances_[graph_idx].mem_hold_.attn_pyobj_;
-    const bool has_tagged_cache    = !inputs.attention_inputs_by_tag.empty();
-    const int  captured_batch_size = static_cast<int>(py_model_inputs_.attention_inputs.input_lengths.size(0));
+    auto&      py_model_inputs_ = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
+    auto       attn_pyobj       = graph_instances_[graph_idx].mem_hold_.attn_pyobj_;
+    const bool has_tagged_cache = !inputs.attention_inputs_by_tag.empty();
+    const bool device_only_metadata =
+        (inputs.attention_inputs.disable_flash_infer || inputs.attention_inputs.is_target_verify)
+        && !inputs.attention_inputs.cache_store_inputs.has_value();
+    const int captured_batch_size = static_cast<int>(py_model_inputs_.attention_inputs.input_lengths.size(0));
 
     FusedD2DCopyParams     d2d_copies;
     FusedStridedCopyParams strided_d2d_copies;
@@ -353,40 +356,44 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
         fusedStridedCopy(strided_d2d_copies);
     }
 
-    RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(host_mirror_copy)");
-    optimizedCopyAsync(inputs.attention_inputs.cu_seqlens,
-                       py_model_inputs_.attention_inputs.cu_seqlens,
-                       (state.current_batch_size + 1) * sizeof(int));
-    optimizedCopyAsync(inputs.attention_inputs.input_lengths,
-                       py_model_inputs_.attention_inputs.input_lengths,
-                       state.current_batch_size * sizeof(int));
-    optimizedCopyAsync(inputs.attention_inputs.prefix_lengths,
-                       py_model_inputs_.attention_inputs.prefix_lengths,
-                       state.current_batch_size * sizeof(int));
+    if (!device_only_metadata) {
+        RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(host_mirror_copy)");
+        optimizedCopyAsync(inputs.attention_inputs.cu_seqlens,
+                           py_model_inputs_.attention_inputs.cu_seqlens,
+                           (state.current_batch_size + 1) * sizeof(int));
+        optimizedCopyAsync(inputs.attention_inputs.input_lengths,
+                           py_model_inputs_.attention_inputs.input_lengths,
+                           state.current_batch_size * sizeof(int));
+        optimizedCopyAsync(inputs.attention_inputs.prefix_lengths,
+                           py_model_inputs_.attention_inputs.prefix_lengths,
+                           state.current_batch_size * sizeof(int));
 
-    if (!has_tagged_cache) {
-        py_model_inputs_.attention_inputs.kv_cache_kernel_block_id.fill_(0);
-        copyStridedHost(inputs.attention_inputs.kv_cache_kernel_block_id,
-                        py_model_inputs_.attention_inputs.kv_cache_kernel_block_id);
-    } else {
-        for (const auto& [tag, src_inputs] : inputs.attention_inputs_by_tag) {
-            auto& dst_inputs = py_model_inputs_.attention_inputs_by_tag.at(tag);
-            dst_inputs.kv_cache_kernel_block_id.fill_(0);
-            copyStridedHost(src_inputs.kv_cache_kernel_block_id, dst_inputs.kv_cache_kernel_block_id);
+        if (!has_tagged_cache) {
+            py_model_inputs_.attention_inputs.kv_cache_kernel_block_id.fill_(0);
+            copyStridedHost(inputs.attention_inputs.kv_cache_kernel_block_id,
+                            py_model_inputs_.attention_inputs.kv_cache_kernel_block_id);
+        } else {
+            for (const auto& [tag, src_inputs] : inputs.attention_inputs_by_tag) {
+                auto& dst_inputs = py_model_inputs_.attention_inputs_by_tag.at(tag);
+                dst_inputs.kv_cache_kernel_block_id.fill_(0);
+                copyStridedHost(src_inputs.kv_cache_kernel_block_id, dst_inputs.kv_cache_kernel_block_id);
+            }
+        }
+
+        if (!is_prefill_cuda_graph_mode_) {
+            if (py_model_inputs_.attention_inputs.sequence_lengths_host.defined()) {
+                optimizedCopyAsync(inputs.attention_inputs.sequence_lengths_host,
+                                   py_model_inputs_.attention_inputs.sequence_lengths_host,
+                                   state.current_batch_size * sizeof(int));
+                fillHostInt32(py_model_inputs_.attention_inputs.sequence_lengths_host,
+                              state.current_batch_size,
+                              captured_batch_size,
+                              0);
+            }
         }
     }
 
-    if (!is_prefill_cuda_graph_mode_) {
-        if (py_model_inputs_.attention_inputs.sequence_lengths_host.defined()) {
-            optimizedCopyAsync(inputs.attention_inputs.sequence_lengths_host,
-                               py_model_inputs_.attention_inputs.sequence_lengths_host,
-                               state.current_batch_size * sizeof(int));
-            fillHostInt32(py_model_inputs_.attention_inputs.sequence_lengths_host,
-                          state.current_batch_size,
-                          captured_batch_size,
-                          0);
-        }
-    } else {
+    if (is_prefill_cuda_graph_mode_) {
         if (isEmbeddingStylePrefillCudaGraph()) {
             auto* input_lengths      = inputs.attention_inputs.input_lengths.data_ptr<int32_t>();
             auto* padding_offset     = py_model_inputs_.attention_inputs.padding_offset.data_ptr<int32_t>();
@@ -411,7 +418,7 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
         }
     }
 
-    if (is_prefill_cuda_graph_mode_) {
+    if (is_prefill_cuda_graph_mode_ && !device_only_metadata) {
         fillHostInt32(
             py_model_inputs_.attention_inputs.prefix_lengths, state.current_batch_size, captured_batch_size, 0);
         fillHostInt32(
