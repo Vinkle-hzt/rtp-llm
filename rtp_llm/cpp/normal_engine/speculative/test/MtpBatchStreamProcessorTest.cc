@@ -504,8 +504,9 @@ TEST_F(MtpBatchStreamProcessorTest, testprepareDecodeDraftModelInput) {
     auto         model_input_status = processor.gatherDecodeModelInput(stream_groups, holder);
     EXPECT_TRUE(model_input_status.ok());
 
-    auto& model_input            = model_input_status.value();
-    model_input.sequence_lengths = torch::tensor({1, 2}, torch::kInt32);
+    auto& model_input                = model_input_status.value();
+    model_input.sequence_lengths     = torch::tensor({1, 2}, torch::kInt32);
+    model_input.combo_position_ids   = torch::tensor({1, 2}, torch::kInt32);
 
     processor.prepareDecodeDraftModelInput(stream_groups, model_input, holder);
 
@@ -517,6 +518,32 @@ TEST_F(MtpBatchStreamProcessorTest, testprepareDecodeDraftModelInput) {
     vector<int> expect_lm_output_indexes = {0, 1};
     EXPECT_TRUE(lm_output_indexes.is_cuda());
     EXPECT_EQ(expect_lm_output_indexes, toVec<int>(lm_output_indexes));
+
+    vector<int> expect_prefix_lengths   = {1, 2};
+    vector<int> expect_sequence_lengths = {2, 3};
+    EXPECT_TRUE(model_input.prefix_lengths.is_cuda());
+    EXPECT_EQ(expect_prefix_lengths, toVec<int>(model_input.prefix_lengths));
+    EXPECT_TRUE(model_input.sequence_lengths.is_cuda());
+    EXPECT_EQ(expect_sequence_lengths, toVec<int>(model_input.sequence_lengths));
+    EXPECT_EQ((vector<int>{2, 3}), toVec<int>(model_input.combo_position_ids));
+
+    GenerateStream::MtpAsyncDeviceState state1;
+    state1.propose_tokens_gpu = torch::tensor({{3}}, torch::kInt32).to(torch::kCUDA);
+    state1.next_seq_len_gpu   = torch::tensor({7}, torch::kInt32).to(torch::kCUDA);
+    stream1->setMtpAsyncDeviceState(std::move(state1));
+
+    GenerateStream::MtpAsyncDeviceState state2;
+    state2.propose_tokens_gpu = torch::tensor({{1}}, torch::kInt32).to(torch::kCUDA);
+    state2.next_seq_len_gpu   = torch::tensor({4}, torch::kInt32).to(torch::kCUDA);
+    stream2->setMtpAsyncDeviceState(std::move(state2));
+
+    model_input.sequence_lengths   = torch::tensor({99, 99}, torch::kInt32);
+    model_input.combo_position_ids = torch::tensor({6, 3}, torch::kInt32);
+    processor.prepareDecodeDraftModelInput(stream_groups, model_input, holder);
+
+    EXPECT_EQ((vector<int>{6, 3}), toVec<int>(model_input.prefix_lengths));
+    EXPECT_EQ((vector<int>{7, 4}), toVec<int>(model_input.sequence_lengths));
+    EXPECT_EQ((vector<int>{7, 4}), toVec<int>(model_input.combo_position_ids));
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testUpdatePrefillPostDraftModelInput) {

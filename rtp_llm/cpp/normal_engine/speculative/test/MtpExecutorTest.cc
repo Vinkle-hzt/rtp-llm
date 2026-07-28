@@ -649,19 +649,19 @@ TEST_F(MtpExecutorTest, testSingleBatchDecode) {
 
     draft_input_1.combo_tokens       = torch::tensor({3}, torch::kInt32);
     draft_input_1.input_lengths      = torch::tensor({2}, torch::kInt32);
-    draft_input_1.sequence_lengths   = torch::tensor({2}, torch::kInt32);
+    draft_input_1.sequence_lengths   = torch::tensor({3}, torch::kInt32);
     draft_input_1.lm_output_indexes  = torch::tensor({0}, torch::kInt32);
     draft_input_1.last_hidden_states = stream1_hidden_states;
 
     draft_input_2.combo_tokens       = torch::tensor({2}, torch::kInt32);
     draft_input_2.input_lengths      = torch::tensor({2}, torch::kInt32);
-    draft_input_2.sequence_lengths   = torch::tensor({3}, torch::kInt32);
+    draft_input_2.sequence_lengths   = torch::tensor({4}, torch::kInt32);
     draft_input_2.lm_output_indexes  = torch::tensor({0}, torch::kInt32);
     draft_input_2.last_hidden_states = draft_output_1.all_hidden_states;
 
     draft_input_3.combo_tokens       = torch::tensor({1}, torch::kInt32);
     draft_input_3.input_lengths      = torch::tensor({2}, torch::kInt32);
-    draft_input_3.sequence_lengths   = torch::tensor({4}, torch::kInt32);
+    draft_input_3.sequence_lengths   = torch::tensor({5}, torch::kInt32);
     draft_input_3.lm_output_indexes  = torch::tensor({0}, torch::kInt32);
     draft_input_3.last_hidden_states = draft_output_2.all_hidden_states;
 
@@ -818,19 +818,19 @@ TEST_F(MtpExecutorTest, testMultiBatchDecode) {
 
     draft_input_1.combo_tokens       = torch::tensor({2, 3}, torch::kInt32);
     draft_input_1.input_lengths      = torch::tensor({3, 2}, torch::kInt32);
-    draft_input_1.sequence_lengths   = torch::tensor({3, 2}, torch::kInt32);
+    draft_input_1.sequence_lengths   = torch::tensor({4, 3}, torch::kInt32);
     draft_input_1.lm_output_indexes  = torch::tensor({0, 1}, torch::kInt32);
     draft_input_1.last_hidden_states = torch::tensor({0.03f, 0.04f, 2.1f, 2.12f}).reshape({2, 2});
 
     draft_input_2.combo_tokens       = torch::tensor({1, 0}, torch::kInt32);
     draft_input_2.input_lengths      = torch::tensor({3, 2}, torch::kInt32);
-    draft_input_2.sequence_lengths   = torch::tensor({4, 3}, torch::kInt32);
+    draft_input_2.sequence_lengths   = torch::tensor({5, 4}, torch::kInt32);
     draft_input_2.lm_output_indexes  = torch::tensor({0, 1}, torch::kInt32);
     draft_input_2.last_hidden_states = draft_output_1.all_hidden_states;
 
     draft_input_3.combo_tokens       = torch::tensor({2, 2}, torch::kInt32);
     draft_input_3.input_lengths      = torch::tensor({3, 2}, torch::kInt32);
-    draft_input_3.sequence_lengths   = torch::tensor({5, 4}, torch::kInt32);
+    draft_input_3.sequence_lengths   = torch::tensor({6, 5}, torch::kInt32);
     draft_input_3.lm_output_indexes  = torch::tensor({0, 1}, torch::kInt32);
     draft_input_3.last_hidden_states = draft_output_2.all_hidden_states;
 
@@ -987,10 +987,11 @@ TEST_F(MtpExecutorTest, testDraftModelDecodeExpandsTargetVerifyPositionIds) {
     GptModelInputs model_input;
     model_input.combo_tokens       = torch::tensor({11, 21}, torch::kInt32);
     model_input.input_lengths      = torch::tensor({5, 6}, torch::kInt32);
-    model_input.sequence_lengths   = torch::tensor({5, 7}, torch::kInt32);
+    model_input.sequence_lengths   = torch::tensor({6, 8}, torch::kInt32);
+    model_input.prefix_lengths     = torch::tensor({5, 7}, torch::kInt32);
     model_input.lm_output_indexes  = torch::tensor({0, 1}, torch::kInt32);
     model_input.last_hidden_states = torch::tensor({0.1f, 0.2f, 1.1f, 1.2f}, torch::kFloat32).reshape({2, 2});
-    model_input.combo_position_ids = torch::tensor({5, 5, 5, 7, 7, 7}, torch::kInt32);
+    model_input.combo_position_ids = torch::tensor({6, 6, 6, 8, 8, 8}, torch::kInt32);
 
     auto makeDraftInput = [](std::vector<int> combo_tokens,
                              std::vector<int> sequence_lengths,
@@ -1013,9 +1014,9 @@ TEST_F(MtpExecutorTest, testDraftModelDecodeExpandsTargetVerifyPositionIds) {
     auto draft_output_3 = createRandomGptModelOutputs(batch_size, vocab_size, 2);
 
     components.fake_draft_model->setInputs({
-        makeDraftInput({11, 21}, {5, 7}, model_input.last_hidden_states, {5, 5, 5, 7, 7, 7}),
-        makeDraftInput({12, 22}, {6, 8}, draft_output_1.all_hidden_states, {6, 6, 6, 8, 8, 8}),
-        makeDraftInput({13, 23}, {7, 9}, draft_output_2.all_hidden_states, {7, 7, 7, 9, 9, 9}),
+        makeDraftInput({11, 21}, {6, 8}, model_input.last_hidden_states, {6, 6, 6, 8, 8, 8}),
+        makeDraftInput({12, 22}, {7, 9}, draft_output_1.all_hidden_states, {7, 7, 7, 9, 9, 9}),
+        makeDraftInput({13, 23}, {8, 10}, draft_output_2.all_hidden_states, {8, 8, 8, 10, 10, 10}),
     });
     components.fake_draft_model->setOutputs({draft_output_1, draft_output_2, draft_output_3});
 
