@@ -6,6 +6,7 @@ import torch
 
 from rtp_llm.models_py.modules.factory.attention.cuda_impl import py_flashinfer_mha
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
+    PyFlashinferMropeTargetVerifyImpl,
     PyFlashinferPrefillPagedAttnOp,
     _get_py_flashinfer_prefill_plan_workspace_size_bytes,
     _select_py_flashinfer_prefill_backend,
@@ -101,6 +102,36 @@ def make_fake_op(
 
 
 class TestPyFlashinferWorkspaceSizing(unittest.TestCase):
+    def test_mrope_target_verify_impl_supports_only_sm9x_target_verify(self):
+        attn_configs = types.SimpleNamespace(
+            rope_config=types.SimpleNamespace(style=py_flashinfer_mha.RopeStyle.Mrope)
+        )
+        attn_inputs = types.SimpleNamespace(is_target_verify=True)
+
+        with mock.patch.object(py_flashinfer_mha, "is_sm90", return_value=True):
+            self.assertTrue(
+                PyFlashinferMropeTargetVerifyImpl.support(
+                    attn_configs,
+                    attn_inputs,
+                )
+            )
+            attn_inputs.is_target_verify = False
+            self.assertFalse(
+                PyFlashinferMropeTargetVerifyImpl.support(
+                    attn_configs,
+                    attn_inputs,
+                )
+            )
+
+        attn_inputs.is_target_verify = True
+        with mock.patch.object(py_flashinfer_mha, "is_sm90", return_value=False):
+            self.assertFalse(
+                PyFlashinferMropeTargetVerifyImpl.support(
+                    attn_configs,
+                    attn_inputs,
+                )
+            )
+
     def test_target_verify_selects_fa2_only_on_sm9x(self):
         with mock.patch.object(py_flashinfer_mha, "is_sm90", return_value=True):
             self.assertEqual(

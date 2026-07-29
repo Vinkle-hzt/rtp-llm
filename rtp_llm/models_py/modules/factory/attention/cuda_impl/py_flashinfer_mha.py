@@ -29,6 +29,7 @@ from rtp_llm.ops import (
 )
 from rtp_llm.ops.compute_ops import (
     FusedRopeKVCacheDecodeOp,
+    FusedRopeKVCachePrefillOpQOut,
     LayerKVCache,
     ParamsBase,
     PyAttentionInputs,
@@ -997,6 +998,69 @@ class PyFlashinferPagedPrefillImpl(PyFlashinferPrefillImplBase):
 
     def support_cuda_graph(self) -> bool:
         return True
+
+
+class PyFlashinferMropeTargetVerifyImpl(FMHAImplBase):
+    """SM9x target-verify path using fused MRoPE with FlashInfer FA2."""
+
+    def __init__(
+        self,
+        attn_configs: AttentionConfigs,
+        attn_inputs: PyAttentionInputs,
+        parallelism_config: Optional[ParallelismConfig] = None,
+    ) -> None:
+        self.fmha_impl = PyFlashinferPrefillPagedAttnOp(
+            attn_configs,
+            attn_inputs,
+        )
+        self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
+        self.fmha_impl.set_params(self.fmha_params)
+        self.fmha_impl.prepare(attn_inputs)
+
+        self.rope_kvcache_impl = FusedRopeKVCachePrefillOpQOut(attn_configs)
+        self.rope_params = self.rope_kvcache_impl.prepare(attn_inputs)
+        self.attn_inputs = attn_inputs
+        self.write_cache_store_impl = common.create_write_cache_store_impl(attn_inputs)
+
+    @classmethod
+    def support(
+        cls,
+        attn_configs: AttentionConfigs,
+        attn_inputs: PyAttentionInputs,
+    ) -> bool:
+        return (
+            is_sm90()
+            and attn_inputs.is_target_verify
+            and attn_configs.rope_config.style == RopeStyle.Mrope
+        )
+
+    def support_cuda_graph(self) -> bool:
+        return True
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        kv_cache: Optional[LayerKVCache],
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        query = self.rope_kvcache_impl.forward(qkv, kv_cache, self.rope_params)
+        common.apply_write_cache_store(
+            self.write_cache_store_impl,
+            self.attn_inputs,
+            kv_cache,
+        )
+        return self.fmha_impl.forward(query, kv_cache)
+
+    def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs) -> None:
+        self.fmha_impl.prepare(attn_inputs, forbid_realloc=True)
+        new_kv_cache_offset = self.rope_kvcache_impl.prepare(
+            attn_inputs
+        ).kv_cache_offset
+        if new_kv_cache_offset is not None:
+            common.copy_kv_cache_offset(
+                self.rope_params.kv_cache_offset,
+                new_kv_cache_offset,
+            )
 
 
 class PyFlashinferPrefillImpl(PyFlashinferPrefillImplBase):
